@@ -1,19 +1,19 @@
 # 疾风知硬盘柜管理程序 (JiFengZhi HDD Manager)
 
-[![Gitee Release](https://img.shields.io/badge/Gitee-Download-red)](https://gitee.com/YOUR_USERNAME/JiFengZhiHDDManager/releases)
+[![Gitee Release](https://img.shields.io/badge/Gitee-Download-red)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## 📥 下载与安装 (Download & Install)
 
 **方式一：直接下载成品 (推荐)**
-1.  访问本项目的 [Gitee 发行版页面 (Releases)](https://gitee.com/YOUR_USERNAME/JiFengZhiHDDManager/releases)。
+1.  访问本项目的 [Gitee 发行版页面 (Releases)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)。
 2.  下载最新版本的压缩包（例如 `疾风知硬盘柜管理_v1.3.26.zip`）。
 3.  解压到任意文件夹。
 4.  右键以**管理员身份运行** `疾风知硬盘柜管理.exe`。
 
 **方式二：源码运行**
 ```bash
-git clone https://gitee.com/YOUR_USERNAME/JiFengZhiHDDManager.git
+git clone https://gitee.com/stormforge/JiFengZhiHDDManager.git
 cd JiFengZhiHDDManager
 pip install -r requirements.txt
 python main.py
