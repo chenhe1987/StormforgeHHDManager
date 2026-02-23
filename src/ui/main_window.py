@@ -337,23 +337,6 @@ class MainWindow(QMainWindow):
 
         self.settings_layout.addWidget(self.autostart_checkbox)
         self.sidebar_layout.addWidget(self.settings_container)
-            }
-            QPushButton#RefreshButton:hover {
-                background-color: #88d000;
-            }
-            QPushButton#RefreshButton:pressed {
-                background-color: #5c9100;
-            }
-            QPushButton#RefreshButton:disabled {
-                background-color: #333333;
-                color: #555555;
-            }
-        """)
-        self.refresh_btn.clicked.connect(self.on_refresh_clicked)
-        
-        self.settings_layout.addWidget(self.refresh_btn)
-        self.settings_layout.addWidget(self.autostart_checkbox)
-        self.sidebar_layout.addWidget(self.settings_container)
         
         self.main_layout.addWidget(self.sidebar_container)
         
