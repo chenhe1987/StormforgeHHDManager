@@ -64,6 +64,10 @@ class LogDialog(QDialog):
 NVIDIA_STYLE = """
 QMainWindow {
     background-color: #0c0c0c;
+    font-family: "OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif;
+}
+QWidget {
+    font-family: "OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif;
 }
 QWidget#CentralWidget {
     background-color: #0c0c0c;
@@ -318,18 +322,23 @@ class MainWindow(QMainWindow):
         self.export_logs_btn.setFixedHeight(30)
         self.export_logs_btn.setToolTip("将程序运行日志打包导出，以便排查问题")
         self.export_logs_btn.setStyleSheet("""
-            QPushButton#ExportLogsButton {
+            QPushButton {
                 background-color: #333333;
-                color: #aaaaaa;
+                color: #ffffff;
                 border: 1px solid #444444;
                 border-radius: 4px;
                 font-size: 12px;
-                margin-bottom: 8px;
+                text-align: center;
+                padding: 0px 10px;
+                font-family: "OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif;
             }
-            QPushButton#ExportLogsButton:hover {
+            QPushButton:hover {
                 background-color: #444444;
                 color: #ffffff;
                 border-color: #555555;
+            }
+            QPushButton:pressed {
+                background-color: #222222;
             }
         """)
         self.export_logs_btn.clicked.connect(self.export_logs)

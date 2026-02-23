@@ -48,7 +48,7 @@ def main():
     
     repo_name = "JiFengZhiHDDManager"
     repo_desc = "专为 ASM2074+ASM1153E 芯片方案设计的硬盘柜管理工具，支持智能休眠、安全弹出和 SMART 监控。"
-    release_tag = "v1.3.28"
+    release_tag = "v1.3.29"
     
     repo_url = f"https://gitee.com/stormforge/{repo_name}"
     git_url = f"https://gitee.com/stormforge/{repo_name}.git"
@@ -183,12 +183,13 @@ def main():
              
         return
 
-    print("\n正在创建 Release v1.3.28...")
-    release_name = "疾风知硬盘柜管理 v1.3.28 (修复启动崩溃)"
+    print("\n正在创建 Release v1.3.29...")
+    release_name = "疾风知硬盘柜管理 v1.3.29 (界面优化)"
     release_body = """
     ## 更新日志
-    1. **紧急修复**: 修复 v1.3.27 中因代码缩进错误导致的程序无法启动问题 (IndentationError)。
-    2. **功能包含**: 包含 v1.3.27 的所有新功能（SMART 修复、错误日志导出）。
+    1. **界面优化**: 修复“导出错误日志”按钮文字不显示的问题，优化按钮样式。
+    2. **字体更新**: 全局字体更新为 OPPO Sans (需系统安装，否则回退到 Microsoft YaHei)。
+    3. **功能保持**: 包含 v1.3.27 的所有新功能（SMART 修复、错误日志导出）。
     
     ## 包含文件
     - 疾风知硬盘柜管理程序 (exe)
