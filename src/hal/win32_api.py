@@ -80,6 +80,36 @@ class SCSI_PASS_THROUGH_DIRECT_WITH_SENSE(ctypes.Structure):
         ("sense", ctypes.c_ubyte * 32),
     ]
 
+# ATA PASS THROUGH Structure
+class ATA_PASS_THROUGH_EX(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("AtaFlags", ctypes.c_ushort),
+        ("PathId", ctypes.c_ubyte),
+        ("TargetId", ctypes.c_ubyte),
+        ("Lun", ctypes.c_ubyte),
+        ("ReservedAsUchar", ctypes.c_ubyte),
+        ("DataTransferLength", ctypes.c_ulong),
+        ("TimeOutValue", ctypes.c_ulong),
+        ("ReservedAsUlong", ctypes.c_ulong),
+        ("DataBufferOffset", ctypes.c_void_p),
+        ("PreviousTaskFile", ctypes.c_ubyte * 8),
+        ("CurrentTaskFile", ctypes.c_ubyte * 8),
+    ]
+
+class ATA_PASS_THROUGH_EX_WITH_BUFFER(ctypes.Structure):
+    _fields_ = [
+        ("apt", ATA_PASS_THROUGH_EX),
+        ("Data", ctypes.c_ubyte * 512),
+    ]
+
+ATA_FLAGS_DRDY_REQUIRED = 1
+ATA_FLAGS_DATA_IN = 2
+ATA_FLAGS_DATA_OUT = 4
+ATA_FLAGS_48BIT_COMMAND = 8
+ATA_FLAGS_USE_DMA = 16
+ATA_FLAGS_NO_MULTIPLE = 32
+
 SCSI_IOCTL_DATA_OUT = 0
 SCSI_IOCTL_DATA_IN = 1
 SCSI_IOCTL_DATA_UNSPECIFIED = 2

@@ -4,7 +4,9 @@ from .win32_api import (
     Win32API, SCSI_PASS_THROUGH_DIRECT, IOCTL_SCSI_PASS_THROUGH_DIRECT, 
     SCSI_IOCTL_DATA_IN, SCSI_IOCTL_DATA_OUT, SCSI_PASS_THROUGH_DIRECT_WITH_SENSE,
     IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY, STORAGE_PROTOCOL_SPECIFIC_DATA,
-    STORAGE_PROTOCOL_DATA_DESCRIPTOR, ProtocolTypeNvme, NVMeDataTypeLogPage, NVMeLogPageHealthInfo
+    STORAGE_PROTOCOL_DATA_DESCRIPTOR, ProtocolTypeNvme, NVMeDataTypeLogPage, NVMeLogPageHealthInfo,
+    IOCTL_ATA_PASS_THROUGH, ATA_PASS_THROUGH_EX, ATA_PASS_THROUGH_EX_WITH_BUFFER,
+    ATA_FLAGS_DRDY_REQUIRED, ATA_FLAGS_DATA_IN
 )
 
 class ASMCommander:
@@ -15,7 +17,8 @@ class ASMCommander:
     def __enter__(self):
         self.handle = Win32API.open_physical_drive(self.drive_index)
         if not self.handle:
-            logging.error(f"DEBUG: Failed to open PhysicalDrive{self.drive_index}. Last error: {ctypes.get_last_error()}")
+            err = ctypes.get_last_error()
+            logging.error(f"DEBUG: Failed to open PhysicalDrive{self.drive_index}. Last error: {err} ({hex(err)})")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -69,7 +72,7 @@ class ASMCommander:
         
         return None
 
-    def send_scsi_command(self, cdb, data_buffer=None, data_direction=SCSI_IOCTL_DATA_IN, timeout=5):
+    def send_scsi_command(self, cdb, data_buffer=None, data_direction=SCSI_IOCTL_DATA_IN, timeout=15):
         if not self.handle:
             return False, 0
 
@@ -109,13 +112,68 @@ class ASMCommander:
         )
         
         if not result:
-            logging.error(f"Drive {self.drive_index}: DeviceIoControl failed. Error: {error_code}")
+            logging.error(f"Drive {self.drive_index}: DeviceIoControl (SCSI) failed. Error: {error_code} ({hex(error_code)})")
             return False, 0
         
         if sptdw.sptd.ScsiStatus != 0:
             sense_hex = bytes(sptdw.sense).hex()
             logging.error(f"Drive {self.drive_index}: SCSI Status {sptdw.sptd.ScsiStatus}, Sense: {sense_hex}")
             return False, 0
+            
+        return True, bytes_returned
+    
+    def send_ata_pass_through(self, feature, sector_count, lba_low, lba_mid, lba_high, command, data_buffer=None):
+        """Send ATA command using IOCTL_ATA_PASS_THROUGH (No SCSI Translation)"""
+        if not self.handle:
+            return False, 0
+            
+        apt_buff = ATA_PASS_THROUGH_EX_WITH_BUFFER()
+        apt = apt_buff.apt
+        apt.Length = ctypes.sizeof(ATA_PASS_THROUGH_EX)
+        apt.AtaFlags = ATA_FLAGS_DRDY_REQUIRED | ATA_FLAGS_DATA_IN
+        apt.TimeOutValue = 15
+        
+        # ATA Task File
+        apt.PreviousTaskFile[0] = 0 # Feature / Error
+        apt.PreviousTaskFile[1] = 0 # Sector Count
+        apt.PreviousTaskFile[2] = 0 # LBA Low
+        apt.PreviousTaskFile[3] = 0 # LBA Mid
+        apt.PreviousTaskFile[4] = 0 # LBA High
+        apt.PreviousTaskFile[5] = 0 # Device / Head
+        apt.PreviousTaskFile[6] = 0 # Command / Status
+        apt.PreviousTaskFile[7] = 0 # Reserved
+
+        apt.CurrentTaskFile[0] = feature
+        apt.CurrentTaskFile[1] = sector_count
+        apt.CurrentTaskFile[2] = lba_low
+        apt.CurrentTaskFile[3] = lba_mid
+        apt.CurrentTaskFile[4] = lba_high
+        apt.CurrentTaskFile[5] = 0xE0 # Device (LBA mode)
+        apt.CurrentTaskFile[6] = command
+        apt.CurrentTaskFile[7] = 0
+
+        if data_buffer:
+            apt.DataTransferLength = 512
+            apt.DataBufferOffset = ctypes.sizeof(ATA_PASS_THROUGH_EX)
+        else:
+            apt.DataTransferLength = 0
+            apt.DataBufferOffset = 0
+            
+        result, bytes_returned, error_code = Win32API.device_io_control(
+            self.handle,
+            IOCTL_ATA_PASS_THROUGH,
+            ctypes.byref(apt_buff),
+            ctypes.sizeof(apt_buff),
+            ctypes.byref(apt_buff),
+            ctypes.sizeof(apt_buff)
+        )
+        
+        if not result:
+            logging.warning(f"Drive {self.drive_index}: IOCTL_ATA_PASS_THROUGH failed. Error: {error_code} ({hex(error_code)})")
+            return False, 0
+            
+        if data_buffer:
+            ctypes.memmove(data_buffer, apt_buff.Data, 512)
             
         return True, bytes_returned
 
@@ -147,6 +205,12 @@ class ASMCommander:
         if success:
             return bytes(buffer)
             
+        # Attempt 3: IOCTL_ATA_PASS_THROUGH
+        # Feature=0, SectorCount=1, LBA_Low=0, LBA_Mid=0, LBA_High=0, Command=0xEC
+        success, _ = self.send_ata_pass_through(0, 0x01, 0, 0, 0, 0xEC, buffer)
+        if success:
+            return bytes(buffer)
+
         return None
 
     @staticmethod
@@ -177,11 +241,10 @@ class ASMCommander:
         return model, serial
 
     def get_smart_data(self):
-        """Read 512 bytes of SMART data using SAT (SCSI ATA Translation)"""
+        """Read 512 bytes of SMART data using SAT (SCSI ATA Translation) or ATA Pass-Through"""
         buffer = (ctypes.c_ubyte * 512)()
         
-        # Try SAT-16 with different flags
-        # Attempt 1: SAT-16 Standard
+        # --- Method 1: SAT-16 (SCSI ATA PASS-THROUGH 16) ---
         # SMART READ DATA: Command=B0, Feature=D0, LBA Mid=4F, LBA High=C2
         cdb16 = [0] * 16
         cdb16[0] = 0x85 # ATA PASS-THROUGH (16)
@@ -197,6 +260,35 @@ class ASMCommander:
         success, _ = self.send_scsi_command(cdb16, buffer, SCSI_IOCTL_DATA_IN)
         if success:
             return bytes(buffer)
+            
+        logging.warning(f"Drive {self.drive_index}: SAT-16 SMART query failed, trying SAT-12...")
+
+        # --- Method 2: SAT-12 (SCSI ATA PASS-THROUGH 12) ---
+        cdb12 = [0] * 12
+        cdb12[0] = 0xA1 # ATA PASS-THROUGH (12)
+        cdb12[1] = (4 << 1) # PROTOCOL=4 (PIO Data-In)
+        cdb12[2] = 0x0A # CK_COND=0, T_DIR=1, BYTE_BLOCK=0, T_LENGTH=2
+        cdb12[3] = 0xD0 # Features
+        cdb12[4] = 0x01 # Sector Count
+        # LBA Low = 0
+        cdb12[6] = 0x4F # LBA Mid
+        cdb12[7] = 0xC2 # LBA High
+        cdb12[9] = 0xB0 # Command - SMART
+        
+        success, _ = self.send_scsi_command(cdb12, buffer, SCSI_IOCTL_DATA_IN)
+        if success:
+            return bytes(buffer)
+
+        logging.warning(f"Drive {self.drive_index}: SAT-12 SMART query failed, trying IOCTL_ATA_PASS_THROUGH...")
+
+        # --- Method 3: IOCTL_ATA_PASS_THROUGH (Direct ATA) ---
+        # Feature=0xD0, SectorCount=1, LBA_Low=0, LBA_Mid=0x4F, LBA_High=0xC2, Command=0xB0
+        success, _ = self.send_ata_pass_through(0xD0, 0x01, 0, 0x4F, 0xC2, 0xB0, buffer)
+        if success:
+            return bytes(buffer)
+            
+        logging.error(f"Drive {self.drive_index}: All SMART query methods failed.")
+        return None
 
         # Attempt 2: SAT-12
         cdb12 = [0] * 12

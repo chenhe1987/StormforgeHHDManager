@@ -2,12 +2,15 @@ from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QW
                              QMessageBox, QSystemTrayIcon, QMenu, QApplication, QStyle, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, 
                              QListWidgetItem, QFrame, QScrollArea, QPushButton, QSlider,
-                             QDialog, QTextEdit)
+                             QDialog, QTextEdit, QFileDialog, QCheckBox)
 from PySide6.QtGui import QIcon, QAction, QColor, QFont, QPalette, QPixmap
 from PySide6.QtCore import Qt, Slot, Signal, QSize
 import logging
 import os
 import time
+import zipfile
+import subprocess
+from datetime import datetime
 from src.hal.win32_api import Win32API
 from src.core.monitor_service import MonitorService
 from src.core.device_manager import DeviceManager
@@ -298,6 +301,42 @@ class MainWindow(QMainWindow):
                 font-weight: bold;
                 font-size: 14px;
                 margin-bottom: 12px;
+            }
+            QPushButton#RefreshButton:hover {
+                background-color: #88d000;
+            }
+            QPushButton#RefreshButton:pressed {
+                background-color: #5c9100;
+            }
+        """)
+        self.refresh_btn.clicked.connect(self.on_refresh_clicked)
+        self.settings_layout.addWidget(self.refresh_btn)
+        
+        # Add Export Logs Button
+        self.export_logs_btn = QPushButton("导出错误日志")
+        self.export_logs_btn.setObjectName("ExportLogsButton")
+        self.export_logs_btn.setFixedHeight(30)
+        self.export_logs_btn.setToolTip("将程序运行日志打包导出，以便排查问题")
+        self.export_logs_btn.setStyleSheet("""
+            QPushButton#ExportLogsButton {
+                background-color: #333333;
+                color: #aaaaaa;
+                border: 1px solid #444444;
+                border-radius: 4px;
+                font-size: 12px;
+                margin-bottom: 8px;
+            }
+            QPushButton#ExportLogsButton:hover {
+                background-color: #444444;
+                color: #ffffff;
+                border-color: #555555;
+            }
+        """)
+        self.export_logs_btn.clicked.connect(self.export_logs)
+        self.settings_layout.addWidget(self.export_logs_btn)
+
+        self.settings_layout.addWidget(self.autostart_checkbox)
+        self.sidebar_layout.addWidget(self.settings_container)
             }
             QPushButton#RefreshButton:hover {
                 background-color: #88d000;
@@ -774,6 +813,52 @@ class MainWindow(QMainWindow):
         if msg_box.clickedButton() == btn_logs:
             dialog = LogDialog(logs, self)
             dialog.exec()
+
+    def export_logs(self):
+        """Export logs to a zip file for troubleshooting"""
+        import sys
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_name = f"JiFengZhi_Logs_{timestamp}.zip"
+            
+            # Ask user where to save
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "导出错误日志", 
+                os.path.join(os.path.expanduser("~"), "Desktop", default_name),
+                "Zip Files (*.zip)"
+            )
+            
+            if not file_path:
+                return
+                
+            # Create zip
+            with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                if getattr(sys, 'frozen', False):
+                    base_dir = os.path.dirname(sys.executable)
+                
+                # Add app.log
+                log_path = os.path.join(base_dir, "app.log")
+                if os.path.exists(log_path):
+                    zipf.write(log_path, "app.log")
+                
+                # Add smart_history.json
+                history_path = os.path.join(base_dir, "smart_history.json")
+                if os.path.exists(history_path):
+                    zipf.write(history_path, "smart_history.json")
+                    
+                # Add system info
+                info = f"OS: Windows\nTime: {timestamp}\nApp Version: v1.3.26\n"
+                zipf.writestr("system_info.txt", info)
+                
+            QMessageBox.information(self, "导出成功", f"日志已保存至:\n{file_path}\n\n请将此文件发送给开发者。")
+            
+            # Open folder
+            subprocess.Popen(f'explorer /select,"{file_path}"')
+            
+        except Exception as e:
+            logging.error(f"Failed to export logs: {e}")
+            QMessageBox.critical(self, "导出失败", f"无法导出日志: {str(e)}")
 
     @Slot()
     def on_autostart_changed(self, state):
