@@ -86,6 +86,36 @@ class SmartParser:
     }
 
     @staticmethod
+    def parse_identify_device(data):
+        """Parse IDENTIFY DEVICE data (512 bytes) to get model, serial, firmware"""
+        if len(data) < 512:
+            return {}
+        
+        def get_string(offset, length):
+            try:
+                # Words are big-endian swapped in ATA string fields
+                s = bytearray(data[offset : offset + length])
+                # Swap pairs
+                for i in range(0, length, 2):
+                    s[i], s[i+1] = s[i+1], s[i]
+                return s.decode('ascii', errors='ignore').strip()
+            except:
+                return ""
+
+        # Serial Number: words 10-19 (offset 20, length 20)
+        serial = get_string(20, 20)
+        # Firmware Revision: words 23-26 (offset 46, length 8)
+        firmware = get_string(46, 8)
+        # Model Number: words 27-46 (offset 54, length 40)
+        model = get_string(54, 40)
+        
+        return {
+            "serial": serial,
+            "firmware": firmware,
+            "model": model
+        }
+
+    @staticmethod
     def parse_512(data):
         if len(data) < 512:
             return []

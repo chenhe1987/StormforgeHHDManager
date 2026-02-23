@@ -2,6 +2,7 @@ import time
 import threading
 import logging
 from src.core.device_manager import DeviceManager
+from src.core.device_renamer import DeviceRenamer
 from src.hal.asm_commander import ASMCommander
 from src.utils.smart_parser import SmartParser
 from src.core.event_log_monitor import EventLogMonitor
@@ -205,6 +206,16 @@ class MonitorService(threading.Thread):
                                 disk_info["model"] = real_model
                                 if real_serial and len(real_serial) > 5:
                                     disk_info["serial"] = real_serial
+
+                                # 尝试修复设备管理器中的显示名称 (DeviceRenamer)
+                                try:
+                                    if disk.pnp_id and real_model and real_model != "Unknown":
+                                        current_friendly = DeviceRenamer.get_friendly_name(disk.pnp_id)
+                                        if DeviceRenamer.should_rename(current_friendly, real_model):
+                                            logging.info(f"检测到设备名需更新: '{current_friendly}' -> '{real_model}'")
+                                            DeviceRenamer.set_friendly_name(disk.pnp_id, real_model)
+                                except Exception as e:
+                                    logging.warning(f"自动重命名尝试失败: {e}")
                             
                             raw_data = cmd.get_smart_data()
                             if raw_data:

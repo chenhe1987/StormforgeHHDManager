@@ -2,15 +2,17 @@ import wmi
 import logging
 import os
 from src.hal.win32_api import Win32API
+from src.core.device_renamer import DeviceRenamer
 
 class DiskInfo:
-    def __init__(self, device_id, model, serial_number, index, interface_type=None, is_removable=False):
+    def __init__(self, device_id, model, serial_number, index, interface_type=None, is_removable=False, pnp_id=None):
         self.device_id = device_id
         self.model = model
         self.serial_number = serial_number.strip() if serial_number else "Unknown"
         self.index = index # PhysicalDrive index
         self.interface_type = interface_type
         self.is_removable = is_removable
+        self.pnp_id = pnp_id
 
     def __repr__(self):
         return f"Disk(Index: {self.index}, Model: {self.model}, SN: {self.serial_number}, Interface: {self.interface_type}, Removable: {self.is_removable})"
@@ -21,6 +23,9 @@ class DeviceManager:
         disks = []
         try:
             c = wmi.WMI()
+            # 获取物理磁盘映射 (Index -> PNP ID)
+            device_map = DeviceRenamer.get_device_map()
+            
             # Win32_DiskDrive contains physical drive info
             logging.debug("开始枚举物理磁盘 (WMI Win32_DiskDrive)...")
             for drive in c.Win32_DiskDrive():
@@ -45,13 +50,28 @@ class DeviceManager:
                             if any(k in model_upper for k in ["EXTERNAL", "DOCK", "ENCLOSURE", "ASMT"]):
                                 is_removable = True
 
+                    # 尝试自动重命名设备 (FriendlyName)
+                    try:
+                        pnp_id_full = device_map.get(index)
+                        if pnp_id_full:
+                            current_name = DeviceRenamer.get_friendly_name(pnp_id_full)
+                            model_clean = drive.Model.strip()
+                            if DeviceRenamer.should_rename(current_name, model_clean):
+                                logging.info(f"检测到通用设备名 '{current_name}'，正在更新为 '{model_clean}'...")
+                                if DeviceRenamer.set_friendly_name(pnp_id_full, model_clean):
+                                    logging.info(f"设备重命名成功: {model_clean}")
+                                    # 尝试触发设备管理器刷新 (可选，暂不实现，避免卡顿)
+                    except Exception as e:
+                        logging.warning(f"设备重命名检查失败: {e}")
+
                     disk_info = DiskInfo(
                         device_id=drive.DeviceID,
                         model=drive.Model,
                         serial_number=drive.SerialNumber,
                         index=index,
                         interface_type=drive.InterfaceType,
-                        is_removable=is_removable
+                        is_removable=is_removable,
+                        pnp_id=pnp_id_full
                     )
                     disks.append(disk_info)
                     logging.debug(f"发现磁盘: {disk_info}")

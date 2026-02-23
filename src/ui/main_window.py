@@ -193,7 +193,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
-        self.setWindowTitle("疾风知硬盘柜管理程序")
+        self.setWindowTitle("疾风知硬盘柜管理程序 v1.3.33")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
         

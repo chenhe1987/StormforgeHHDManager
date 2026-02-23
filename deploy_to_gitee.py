@@ -48,7 +48,7 @@ def main():
     
     repo_name = "JiFengZhiHDDManager"
     repo_desc = "专为 ASM2074+ASM1153E 芯片方案设计的硬盘柜管理工具，支持智能休眠、安全弹出和 SMART 监控。"
-    release_tag = "v1.3.29"
+    release_tag = "v1.3.33"
     
     repo_url = f"https://gitee.com/stormforge/{repo_name}"
     git_url = f"https://gitee.com/stormforge/{repo_name}.git"
@@ -183,17 +183,23 @@ def main():
              
         return
 
-    print("\n正在创建 Release v1.3.29...")
-    release_name = "疾风知硬盘柜管理 v1.3.29 (界面优化)"
+    print("\n正在创建 Release v1.3.32...")
+    release_name = f"v1.3.32 Release - 修复设备管理器命名问题"
     release_body = """
-    ## 更新日志
-    1. **界面优化**: 修复“导出错误日志”按钮文字不显示的问题，优化按钮样式。
-    2. **字体更新**: 全局字体更新为 OPPO Sans (需系统安装，否则回退到 Microsoft YaHei)。
-    3. **功能保持**: 包含 v1.3.27 的所有新功能（SMART 修复、错误日志导出）。
-    
-    ## 包含文件
-    - 疾风知硬盘柜管理程序 (exe)
-    - 使用指南
+## v1.3.32 更新日志
+
+### 修复与改进
+1. **[重要] 修复设备管理器命名问题**
+   - 彻底解决了 Windows 设备管理器中硬盘名称显示为通用名 (如 "ASMT 2115 USB Device") 的问题。
+   - 现在会自动读取硬盘固件中的真实型号 (如 "WD Blue SN570") 并强制更新设备管理器显示名称。
+   - 增加了自动提权逻辑，解决了修改注册表时的 "拒绝访问 (Error 5)" 问题。
+2. **修复 PowerShell 调用错误**
+   - 修正了内部调用 PowerShell 获取设备映射时的参数错误，确保设备识别更准确。
+3. **优化启动流程**
+   - 优化了管理员权限检测和提权流程。
+
+### 已知问题
+- 首次运行时可能需要数秒钟扫描硬盘并更新名称，期间界面可能会短暂无响应。
     """
     
     release_data = {
@@ -218,8 +224,22 @@ def main():
         if rel_resp.status_code == 201:
             print(f"✅ Release {release_tag} 创建成功！")
             release_id = rel_resp.json()['id']
-            
-            # 6. 上传附件
+        elif rel_resp.status_code == 400:
+             print(f"⚠️ Release {release_tag} 可能已存在 (400)，尝试获取 ID...")
+             # 获取已存在的 Release ID
+             get_rel_resp = requests.get(f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases/tags/{release_tag}", params={"access_token": token})
+             if get_rel_resp.status_code == 200:
+                 release_id = get_rel_resp.json()['id']
+                 print(f"✅ 获取到 Release ID: {release_id}")
+             else:
+                 print(f"❌ 无法获取 Release ID: {get_rel_resp.status_code}")
+                 return
+        else:
+            print(f"❌ 创建 Release 失败: {rel_resp.status_code} - {rel_resp.text}")
+            return
+
+        # 6. 上传附件 (无论新建还是已存在，都尝试上传)
+        if release_id:
             dist_zip = f"dist/疾风知硬盘柜管理_{release_tag}.zip"
             # 如果 zip 不存在，尝试先压缩
             if not os.path.exists(dist_zip):
@@ -231,6 +251,7 @@ def main():
                 print(f"正在上传附件: {dist_zip}...")
                 # Gitee API 上传附件
                 files = {'file': open(dist_zip, 'rb')}
+                # 注意：Gitee 上传附件 API 是 POST /repos/{owner}/{repo}/releases/{id}/attach_files
                 attach_resp = requests.post(
                     f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases/{release_id}/attach_files",
                     params={"access_token": token},
@@ -242,11 +263,6 @@ def main():
                     print(f"⚠️ 附件上传失败: {attach_resp.status_code} - {attach_resp.text}")
             else:
                 print(f"⚠️ 找不到附件文件: {dist_zip}")
-                
-        elif rel_resp.status_code == 400 and "已存在" in rel_resp.text:
-             print(f"⚠️ Release {release_tag} 已存在，跳过创建。")
-        else:
-            print(f"❌ 创建 Release 失败: {rel_resp.status_code} - {rel_resp.text}")
 
     print("\n=== 全部完成！ ===")
     print(f"项目地址: {repo_url}")

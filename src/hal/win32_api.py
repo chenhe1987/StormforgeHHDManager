@@ -393,12 +393,32 @@ class Win32API:
             
             # 尝试向上查找最多 5 层
             last_veto_reason = "未能找到可弹出的设备节点"
+            
+            # 定义禁止弹出的关键服务名称 (Hub, Controller, PCI Bus, etc.)
+            CRITICAL_SERVICES = [
+                "USBHUB3", "USBHUB", "IUSB3HUB", "ASMTXHCI", "XHCI", "EHCI", "UHCI", 
+                "PCI", "ACPI", "STORAHCI", "IASTORA", "NVME", "ROOT", "VOLMGR", "PARTMGR"
+            ]
+
             for i in range(5):
                 # 获取当前节点的实例 ID 字符串用于日志
                 id_buffer = (ctypes.c_wchar * 260)()
                 cfgmgr32.CM_Get_Device_IDW(current_inst, id_buffer, 260, 0)
                 node_id = id_buffer.value
-                logging.info(f"正在尝试弹出节点 (层级 {i}): {node_id}")
+
+                # 检查服务名称，避免弹出 Hub 或控制器
+                service_name = Win32API._get_devnode_property(current_inst, 0x00000005) # CM_DRP_SERVICE
+                if service_name:
+                    service_upper = service_name.upper()
+                    # 如果服务名称包含任何关键服务关键字，停止向上查找
+                    if any(crit in service_upper for crit in CRITICAL_SERVICES):
+                        logging.warning(f"停止向上遍历：节点 {node_id} 是关键设备 (Service: {service_name})，禁止弹出")
+                        # 如果是第0层就是关键设备，那说明初始设备找错了，直接返回失败
+                        if i == 0:
+                            return False, f"目标设备是关键系统设备 ({service_name})，禁止弹出"
+                        break # 停止循环，不再尝试父节点
+
+                logging.info(f"正在尝试弹出节点 (层级 {i}): {node_id} (Service: {service_name})")
 
                 # 请求弹出
                 res = cfgmgr32.CM_Request_Device_EjectW(
@@ -429,6 +449,34 @@ class Win32API:
         except Exception as e:
             logging.error(f"弹出过程发生异常: {e}")
             return False, str(e)
+
+    @staticmethod
+    def _get_devnode_property(dev_inst, property_id):
+        """Helper to get DevNode registry property"""
+        try:
+            cfgmgr32 = ctypes.WinDLL('cfgmgr32')
+            buffer_size = wintypes.DWORD(0)
+            
+            # First call to get size
+            res = cfgmgr32.CM_Get_DevNode_Registry_PropertyW(
+                dev_inst, property_id, None, None, ctypes.byref(buffer_size), 0
+            )
+            
+            if res != 0x0000001A: # CR_BUFFER_SMALL (or success if size known)
+                 # Wait, usually returns CR_BUFFER_SMALL if buffer is None?
+                 # Actually, let's just allocate a reasonable buffer
+                 buffer_size = wintypes.DWORD(1024)
+
+            buffer = (ctypes.c_byte * buffer_size.value)()
+            res = cfgmgr32.CM_Get_DevNode_Registry_PropertyW(
+                dev_inst, property_id, None, ctypes.byref(buffer), ctypes.byref(buffer_size), 0
+            )
+            
+            if res == 0:
+                return ctypes.cast(buffer, ctypes.c_wchar_p).value
+            return None
+        except Exception:
+            return None
 
     @staticmethod
     def _get_veto_reason_str(veto_type, veto_name):
