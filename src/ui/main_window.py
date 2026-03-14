@@ -2,22 +2,115 @@ from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QW
                              QMessageBox, QSystemTrayIcon, QMenu, QApplication, QStyle, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, 
                              QListWidgetItem, QFrame, QScrollArea, QPushButton, QSlider,
-                             QDialog, QTextEdit, QFileDialog, QCheckBox)
+                             QDialog, QTextEdit, QFileDialog, QCheckBox, QInputDialog)
 from PySide6.QtGui import QIcon, QAction, QColor, QFont, QPalette, QPixmap
-from PySide6.QtCore import Qt, Slot, Signal, QSize
+from PySide6.QtCore import Qt, Slot, Signal, QSize, QThread
 import logging
 import os
 import time
 import zipfile
+import shutil
 import subprocess
+import requests
+import webbrowser
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
+
 from src.hal.win32_api import Win32API
 from src.core.monitor_service import MonitorService
 from src.core.device_manager import DeviceManager
 from src.core.config_manager import ConfigManager
 from src.utils.paths import get_resource_path
+from src.utils.log_reporter import LogReporter
 
 logging.info("Win32API 导入成功")
+
+# Win32 Constants
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", wintypes.POINT),
+#       ("lPrivate", wintypes.DWORD), # Padding sometimes needed
+    ]
+
+class UpdateCheckThread(QThread):
+    """后台线程检查 Gitee 更新"""
+    finished_signal = Signal(dict) # Returns a dict with update info
+
+    def __init__(self, current_version):
+        super().__init__()
+        self.current_version = current_version.lower().lstrip('v')
+        self.repo_url = "https://gitee.com/api/v5/repos/stormforge/JiFengZhiHDDManager/releases/latest"
+
+    def run(self):
+        try:
+            response = requests.get(self.repo_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                latest_tag = data.get("tag_name", "v0.0.0").lower().lstrip('v')
+                
+                # Simple version comparison
+                is_newer = self.compare_versions(latest_tag, self.current_version) > 0
+                
+                self.finished_signal.emit({
+                    "success": True,
+                    "is_newer": is_newer,
+                    "latest_version": data.get("tag_name"),
+                    "changelog": data.get("body", "无更新日志"),
+                    "download_url": data.get("html_url")
+                })
+            else:
+                self.finished_signal.emit({"success": False, "error": f"API Error: {response.status_code}"})
+        except Exception as e:
+            logging.error(f"检查更新失败: {e}")
+            self.finished_signal.emit({"success": False, "error": str(e)})
+
+    def compare_versions(self, v1, v2):
+        """Compare two version strings like 1.3.33 and 1.3.32"""
+        try:
+            parts1 = [int(p) for p in v1.split('.')]
+            parts2 = [int(p) for p in v2.split('.')]
+            
+            # Pad with zeros
+            max_len = max(len(parts1), len(parts2))
+            parts1.extend([0] * (max_len - len(parts1)))
+            parts2.extend([0] * (max_len - len(parts2)))
+            
+            for i in range(max_len):
+                if parts1[i] > parts2[i]:
+                    return 1
+                if parts1[i] < parts2[i]:
+                    return -1
+            return 0
+        except Exception:
+            return 0
+
+class EjectThread(QThread):
+    """后台线程执行弹出操作，防止 UI 卡死"""
+    finished_signal = Signal(bool, str)
+
+    def __init__(self, disk_index, model=None, serial=None):
+        super().__init__()
+        self.disk_index = disk_index
+        self.model = model
+        self.serial = serial
+
+    def run(self):
+        try:
+            from src.core.device_manager import DeviceManager
+            success, message = DeviceManager.safe_eject_disk(self.disk_index, model=self.model, serial=self.serial)
+            self.finished_signal.emit(success, message)
+        except Exception as e:
+            logging.error(f"弹出线程执行异常: {e}")
+            self.finished_signal.emit(False, str(e))
 
 class ListHandler(logging.Handler):
     def __init__(self, log_list=None):
@@ -60,6 +153,152 @@ class LogDialog(QDialog):
         clipboard = QApplication.clipboard()
         clipboard.setText(self.text_edit.toPlainText())
         QMessageBox.information(self, "提示", "日志已复制到剪贴板")
+
+class ReportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("错误报告与分析")
+        self.resize(700, 600)
+        self.setStyleSheet("""
+            QDialog { background-color: #1a1a1a; color: #ffffff; }
+            QLabel { color: #ffffff; font-size: 14px; }
+            QPushButton { background-color: #333333; color: white; border: 1px solid #555; padding: 6px 12px; border-radius: 4px; }
+            QPushButton:hover { background-color: #444444; }
+            QTextEdit { background-color: #262626; color: #dddddd; border: 1px solid #3d3d3d; font-family: Consolas; font-size: 12px; }
+            QCheckBox { color: #aaaaaa; }
+        """)
+        
+        self.reporter = LogReporter()
+        self.config_manager = parent.config_manager if parent else ConfigManager()
+        self.report_config = self.config_manager.get_report_config()
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # 1. Header
+        header = QLabel("自动日志分析结果")
+        header.setStyleSheet("font-weight: bold; color: #76b900; font-size: 16px;")
+        layout.addWidget(header)
+        
+        # 2. Analysis Text
+        self.analysis_text = QTextEdit()
+        self.analysis_text.setReadOnly(True)
+        layout.addWidget(self.analysis_text)
+        
+        # Load analysis immediately
+        self.load_analysis()
+        
+        # 3. Settings
+        # 移除自动上传选项，因为没有后端服务器支持
+        # settings_layout = QHBoxLayout()
+        # self.auto_report_cb = QCheckBox("以后遇到严重错误自动发送报告 (需配置服务器)")
+        # self.auto_report_cb.setChecked(self.report_config["auto_report"])
+        # settings_layout.addWidget(self.auto_report_cb)
+        # layout.addLayout(settings_layout)
+        
+        # 4. Actions
+        btn_layout = QHBoxLayout()
+        
+        self.export_btn = QPushButton("仅导出到本地...")
+        self.export_btn.clicked.connect(self.do_export)
+        
+        self.send_btn = QPushButton("通过邮件发送报告 (推荐)")
+        self.send_btn.setStyleSheet("background-color: #76b900; color: black; font-weight: bold; border: none;")
+        self.send_btn.clicked.connect(self.do_email_report)
+        
+        self.close_btn = QPushButton("关闭")
+        self.close_btn.clicked.connect(self.accept)
+        
+        btn_layout.addWidget(self.export_btn)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.send_btn)
+        btn_layout.addWidget(self.close_btn)
+        layout.addLayout(btn_layout)
+        
+    def load_analysis(self):
+        issues = self.reporter.analyze_logs()
+        if not issues:
+            self.analysis_text.setPlainText("未发现明显的错误日志。")
+        else:
+            self.analysis_text.setPlainText("\n\n".join(issues))
+            
+    def do_export(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"JiFengZhi_Logs_{timestamp}.zip"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出错误日志", 
+            os.path.join(os.path.expanduser("~"), "Desktop", default_name),
+            "Zip Files (*.zip)"
+        )
+        
+        if file_path:
+            zip_path = self.reporter.pack_logs()
+            if zip_path:
+                shutil.copy2(zip_path, file_path)
+                QMessageBox.information(self, "导出成功", f"日志已保存至:\n{file_path}")
+                try:
+                    subprocess.Popen(f'explorer /select,"{file_path}"')
+                except:
+                    pass
+            else:
+                QMessageBox.critical(self, "导出失败", "无法创建日志包")
+        
+    def do_email_report(self):
+        """生成日志并打开邮件客户端"""
+        self.send_btn.setEnabled(False)
+        self.send_btn.setText("正在生成...")
+        QApplication.processEvents()
+        
+        # 1. Pack logs to a temp location
+        zip_path = self.reporter.pack_logs()
+        if not zip_path:
+            QMessageBox.warning(self, "错误", "无法生成日志包")
+            self.send_btn.setEnabled(True)
+            self.send_btn.setText("通过邮件发送报告 (推荐)")
+            return
+            
+        # 2. Open folder with file selected
+        try:
+            subprocess.Popen(f'explorer /select,"{zip_path}"')
+        except Exception as e:
+            logging.error(f"Failed to open explorer: {e}")
+            
+        # 3. Construct mailto link
+        recipient = "278715262@qq.com"
+        subject = f"疾风知硬盘柜-错误报告 ({datetime.now().strftime('%Y-%m-%d')})"
+        
+        # 4. Show custom guide dialog
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("发送错误报告")
+        msg_box.setText(
+            "请按以下步骤发送报告：\n\n"
+            "1. 包含日志的文件夹已自动打开 (选中了 .zip 文件)\n"
+            "2. 请手动发送邮件给开发者\n\n"
+            f"收件人: {recipient}\n"
+            f"主　题: {subject}\n"
+            "附　件: (请拖入刚才生成的 zip 文件)\n\n"
+            "点击“确定”关闭此窗口。"
+        )
+        msg_box.setIcon(QMessageBox.Information)
+        
+        # Add a "Copy Email" button
+        copy_btn = msg_box.addButton("复制邮箱地址", QMessageBox.ActionRole)
+        msg_box.addButton("确定", QMessageBox.AcceptRole)
+        
+        msg_box.exec()
+        
+        if msg_box.clickedButton() == copy_btn:
+            QApplication.clipboard().setText(recipient)
+            QMessageBox.information(self, "提示", "邮箱地址已复制")
+        
+        self.accept()
+            
+    def accept(self):
+        # Save checkbox state if it existed
+        # self.config_manager.set_report_config(self.auto_report_cb.isChecked())
+        super().accept()
 
 NVIDIA_STYLE = """
 QMainWindow {
@@ -193,7 +432,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
-        self.setWindowTitle("疾风知硬盘柜管理程序 v1.3.33")
+        self.version = "1.3.37"
+        self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version} (关机保护版)")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
         
@@ -261,98 +501,95 @@ class MainWindow(QMainWindow):
         self.sidebar = QListWidget()
         self.sidebar.setFrameShape(QFrame.NoFrame) # Remove border as container has it
         self.sidebar.itemClicked.connect(self.on_disk_selected)
-        self.sidebar_layout.addWidget(self.sidebar)
+        # Give stretch to list so it takes available space
+        self.sidebar_layout.addWidget(self.sidebar, 1)
 
-        # Settings Area at Sidebar Bottom
+        # Settings Area (Placed in Sidebar, AT THE BOTTOM)
         self.settings_container = QWidget()
-        self.settings_container.setStyleSheet("background-color: #1a1a1a; border-top: 1px solid #2d2d2d; padding: 10px;")
+        self.settings_container.setStyleSheet("background-color: #1a1a1a; border-top: 1px solid #2d2d2d;")
         self.settings_layout = QVBoxLayout(self.settings_container)
-        
-        from PySide6.QtWidgets import QCheckBox
-        self.autostart_checkbox = QCheckBox("随系统启动")
-        self.autostart_checkbox.setStyleSheet("""
-            QCheckBox {
-                color: #aaaaaa;
-                font-size: 13px;
-                padding: 5px;
-            }
-            QCheckBox::indicator {
-                width: 16px;
-                height: 16px;
-            }
-            QCheckBox:hover {
-                color: #ffffff;
-            }
-        """)
-        # Initialize state from config/registry
-        is_enabled = self.config_manager.is_autostart_enabled()
-        self.autostart_checkbox.setChecked(is_enabled)
-        self.autostart_checkbox.stateChanged.connect(self.on_autostart_changed)
-        
-        # Add Refresh Button
+        self.settings_layout.setContentsMargins(10, 10, 10, 10)
+        self.settings_layout.setSpacing(8)
+
+        # 1. Refresh Button (Green)
         self.refresh_btn = QPushButton("刷新设备列表")
         self.refresh_btn.setObjectName("RefreshButton")
-        self.refresh_btn.setFixedHeight(45)
-        self.refresh_btn.setToolTip("重新扫描系统硬件，识别新插入的硬盘")
-        # 显式设置绿色样式，与安全弹出按钮一致
+        self.refresh_btn.setFixedHeight(38)
         self.refresh_btn.setStyleSheet("""
             QPushButton#RefreshButton {
                 background-color: #76b900;
                 color: #000000;
                 border: none;
                 border-radius: 4px;
-                padding: 10px 20px;
                 font-weight: bold;
-                font-size: 14px;
-                margin-bottom: 12px;
+                font-size: 13px;
             }
-            QPushButton#RefreshButton:hover {
-                background-color: #88d000;
-            }
-            QPushButton#RefreshButton:pressed {
-                background-color: #5c9100;
-            }
+            QPushButton#RefreshButton:hover { background-color: #88d000; }
         """)
         self.refresh_btn.clicked.connect(self.on_refresh_clicked)
         self.settings_layout.addWidget(self.refresh_btn)
-        
-        # Add Export Logs Button
-        self.export_logs_btn = QPushButton("导出错误日志")
+
+        # 2. Check Update Button (Purple accent)
+        self.check_update_btn = QPushButton("检查软件更新")
+        self.check_update_btn.setObjectName("CheckUpdateButton")
+        self.check_update_btn.setFixedHeight(32)
+        self.check_update_btn.setStyleSheet("""
+            QPushButton#CheckUpdateButton {
+                background-color: #333333;
+                color: #ffffff;
+                border: 1px solid #9147ff;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton#CheckUpdateButton:hover { background-color: #444444; border-color: #a875ff; }
+        """)
+        self.check_update_btn.clicked.connect(self.on_check_update_clicked)
+        self.settings_layout.addWidget(self.check_update_btn)
+
+        # 3. Export Logs Button (Grey)
+        self.export_logs_btn = QPushButton("错误报告与分析")
         self.export_logs_btn.setObjectName("ExportLogsButton")
-        self.export_logs_btn.setFixedHeight(30)
-        self.export_logs_btn.setToolTip("将程序运行日志打包导出，以便排查问题")
+        self.export_logs_btn.setFixedHeight(32)
         self.export_logs_btn.setStyleSheet("""
-            QPushButton {
+            QPushButton#ExportLogsButton {
                 background-color: #333333;
                 color: #ffffff;
                 border: 1px solid #444444;
                 border-radius: 4px;
                 font-size: 12px;
-                text-align: center;
-                padding: 0px 10px;
-                font-family: "OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif;
             }
-            QPushButton:hover {
-                background-color: #444444;
-                color: #ffffff;
-                border-color: #555555;
-            }
-            QPushButton:pressed {
-                background-color: #222222;
-            }
+            QPushButton#ExportLogsButton:hover { background-color: #444444; }
         """)
         self.export_logs_btn.clicked.connect(self.export_logs)
         self.settings_layout.addWidget(self.export_logs_btn)
 
+        # 4. Autostart Checkbox
+        from PySide6.QtWidgets import QCheckBox
+        self.autostart_checkbox = QCheckBox("随系统启动")
+        self.autostart_checkbox.setStyleSheet("color: #aaaaaa; font-size: 12px; padding: 5px;")
+        is_enabled = self.config_manager.is_autostart_enabled()
+        self.autostart_checkbox.setChecked(is_enabled)
+        self.autostart_checkbox.stateChanged.connect(self.on_autostart_changed)
         self.settings_layout.addWidget(self.autostart_checkbox)
-        self.sidebar_layout.addWidget(self.settings_container)
+
+        # 5. Shutdown Auto-Eject Checkbox
+        self.shutdown_eject_checkbox = QCheckBox("关机时自动弹出硬盘")
+        self.shutdown_eject_checkbox.setStyleSheet("color: #aaaaaa; font-size: 12px; padding: 5px;")
+        self.shutdown_eject_checkbox.setChecked(self.config_manager.get_shutdown_eject())
+        self.shutdown_eject_checkbox.stateChanged.connect(self.on_shutdown_eject_changed)
+        self.settings_layout.addWidget(self.shutdown_eject_checkbox)
         
+        # Add Settings Container to Sidebar (Fixed height by content, NO stretch)
+        self.sidebar_layout.addWidget(self.settings_container, 0)
+
         self.main_layout.addWidget(self.sidebar_container)
         
         # Right Area: Details
         self.detail_area = QWidget()
         self.detail_layout = QVBoxLayout(self.detail_area)
         self.detail_layout.setContentsMargins(30, 30, 30, 30)
+        self.detail_layout.setSpacing(20)
+        
         self.main_layout.addWidget(self.detail_area)
         
         # Header in details
@@ -676,7 +913,12 @@ class MainWindow(QMainWindow):
         self.config_manager.set_sleep_timer(self.current_disk_serial, minutes)
         
         # 2. 立即应用到硬件
-        success, message = DeviceManager.set_standby_timer(self.current_disk_index, minutes)
+        success, message = DeviceManager.set_standby_timer(
+            self.current_disk_index, 
+            minutes,
+            model=self.current_disk_model, 
+            serial=self.current_disk_serial
+        )
         
         if success:
             self.sleep_timer_label.setStyleSheet("color: #9147ff; font-size: 13px; font-weight: bold;")
@@ -807,50 +1049,68 @@ class MainWindow(QMainWindow):
             dialog.exec()
 
     def export_logs(self):
-        """Export logs to a zip file for troubleshooting"""
-        import sys
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            default_name = f"JiFengZhi_Logs_{timestamp}.zip"
+        """Show report dialog instead of just exporting"""
+        dialog = ReportDialog(self)
+        dialog.exec()
+
+    def on_check_update_clicked(self):
+        """Handle check update button click"""
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("正在检查更新...")
+        
+        self.update_thread = UpdateCheckThread(self.version)
+        self.update_thread.finished_signal.connect(self.on_update_check_finished)
+        self.update_thread.start()
+
+    @Slot(dict)
+    def on_update_check_finished(self, result):
+        """Callback when update check is finished"""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("检查软件更新")
+        
+        if not result.get("success"):
+            QMessageBox.warning(self, "检查更新失败", f"无法连接到 Gitee 服务器: {result.get('error')}")
+            return
             
-            # Ask user where to save
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "导出错误日志", 
-                os.path.join(os.path.expanduser("~"), "Desktop", default_name),
-                "Zip Files (*.zip)"
+        if result.get("is_newer"):
+            latest_version = result.get("latest_version")
+            changelog = result.get("changelog")
+            download_url = result.get("download_url")
+            
+            msg = f"发现新版本: {latest_version}\n\n更新日志:\n{changelog}\n\n是否前往 Gitee 下载最新版本？"
+            reply = QMessageBox.question(
+                self, "发现更新", msg,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
             )
             
-            if not file_path:
-                return
-                
-            # Create zip
-            with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                if getattr(sys, 'frozen', False):
-                    base_dir = os.path.dirname(sys.executable)
-                
-                # Add app.log
-                log_path = os.path.join(base_dir, "app.log")
-                if os.path.exists(log_path):
-                    zipf.write(log_path, "app.log")
-                
-                # Add smart_history.json
-                history_path = os.path.join(base_dir, "smart_history.json")
-                if os.path.exists(history_path):
-                    zipf.write(history_path, "smart_history.json")
-                    
-                # Add system info
-                info = f"OS: Windows\nTime: {timestamp}\nApp Version: v1.3.26\n"
-                zipf.writestr("system_info.txt", info)
-                
-            QMessageBox.information(self, "导出成功", f"日志已保存至:\n{file_path}\n\n请将此文件发送给开发者。")
-            
-            # Open folder
-            subprocess.Popen(f'explorer /select,"{file_path}"')
-            
+            if reply == QMessageBox.Yes:
+                self.open_url(download_url)
+        else:
+            # If already latest, still offer to visit Gitee
+            reply = QMessageBox.information(
+                self, "检查更新", 
+                "当前已是最新版本。\n\n是否前往项目主页查看更多信息？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.open_url("https://gitee.com/stormforge/JiFengZhiHDDManager")
+
+    def open_url(self, url):
+        """Robustly open URL in browser, especially when running as Admin"""
+        if not url: return
+        try:
+            # Try webbrowser first
+            import webbrowser
+            webbrowser.open(url)
         except Exception as e:
-            logging.error(f"Failed to export logs: {e}")
-            QMessageBox.critical(self, "导出失败", f"无法导出日志: {str(e)}")
+            logging.warning(f"webbrowser.open failed: {e}")
+            try:
+                # Fallback to os.startfile on Windows
+                import os
+                os.startfile(url)
+            except Exception as e2:
+                logging.error(f"os.startfile failed: {e2}")
+                QMessageBox.warning(self, "无法打开浏览器", f"请手动访问: {url}")
 
     @Slot()
     def on_autostart_changed(self, state):
@@ -865,6 +1125,63 @@ class MainWindow(QMainWindow):
         else:
             status = "已开启" if enabled else "已关闭"
             logging.info(f"用户通过 UI {status} 了开机自启动")
+
+    @Slot(int)
+    def on_shutdown_eject_changed(self, state):
+        enabled = (state == Qt.Checked)
+        self.config_manager.set_shutdown_eject(enabled)
+        logging.info(f"关机自动弹出设置已更新: {enabled}")
+
+    def nativeEvent(self, eventType, message):
+        """Handle Windows native events to detect shutdown"""
+        try:
+            if eventType.data() == b"windows_generic_MSG":
+                msg = MSG.from_address(int(message))
+                if msg.message == WM_QUERYENDSESSION:
+                    logging.info("收到系统关机信号 (WM_QUERYENDSESSION)")
+                    if self.config_manager.get_shutdown_eject():
+                        self.eject_all_removable_disks()
+                    # Must return True (1) to allow shutdown
+                    return True, 1
+        except Exception as e:
+            logging.error(f"nativeEvent error: {e}")
+            
+        return super().nativeEvent(eventType, message)
+
+    def eject_all_removable_disks(self):
+        """Synchronously eject all removable disks"""
+        logging.info("正在执行关机自动弹出...")
+        
+        # 尝试设置关机阻塞原因 (提升用户体验)
+        hwnd = int(self.winId())
+        try:
+            reason = "正在为您安全弹出所有移动硬盘，请稍候..."
+            ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
+        except Exception as e:
+            logging.warning(f"设置关机阻塞提示失败: {e}")
+
+        try:
+            # Re-enumerate to get current list, or use cached?
+            # Better to get fresh list to avoid ejecting already ejected ones
+            disks = self.device_manager.get_physical_disks()
+            for disk in disks:
+                if disk.is_removable:
+                    logging.info(f"关机保护: 正在尝试弹出硬盘 {disk.model} (Index: {disk.index})...")
+                    # Synchronous eject
+                    success, msg = self.device_manager.safe_eject_disk(
+                        disk.index, 
+                        model=disk.model, 
+                        serial=disk.serial_number
+                    )
+                    logging.info(f"弹出结果: {success} - {msg}")
+        except Exception as e:
+            logging.error(f"关机自动弹出执行异常: {e}")
+        finally:
+            # 无论成功失败，都移除阻塞原因
+            try:
+                ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+            except:
+                pass
 
     def on_disk_selected(self, item):
         if not item:
@@ -899,6 +1216,7 @@ class MainWindow(QMainWindow):
         self.spin_down_button.setEnabled(True)
         self.current_disk_index = disk.get("index") # Store current index
         self.current_disk_serial = disk.get("serial")
+        self.current_disk_model = disk.get("model")
 
         # Load interval config
         interval_sec = self.config_manager.get_disk_interval(self.current_disk_serial)
@@ -1043,7 +1361,11 @@ class MainWindow(QMainWindow):
                 self.monitor_service.mark_disk_sleeping(self.current_disk_serial)
             
             # 2. 发送停转指令
-            success, message = DeviceManager.spin_down_disk(self.current_disk_index)
+            success, message = DeviceManager.spin_down_disk(
+                self.current_disk_index, 
+                model=self.current_disk_model, 
+                serial=self.current_disk_serial
+            )
             
             if success:
                 QMessageBox.information(self, "操作成功", message)
@@ -1068,27 +1390,47 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.Yes:
             logging.info(f"用户触发弹出磁盘 {self.current_disk_index}")
+            
             # 1. 首先在监控服务中屏蔽该硬盘
             if hasattr(self, 'monitor_service') and self.current_disk_serial:
                 self.monitor_service.mark_disk_sleeping(self.current_disk_serial)
 
-            # 2. 执行弹出逻辑（内部包含停转指令）
-            success, message = DeviceManager.safe_eject_disk(self.current_disk_index)
+            # 2. 禁用按钮，显示等待状态
+            self.eject_button.setEnabled(False)
+            self.eject_button.setText("正在弹出...")
+            self.status_label.setText(f"正在尝试安全弹出磁盘 {self.current_disk_index}，请稍候...")
+
+            # 3. 启动后台线程执行弹出逻辑
+            self.eject_thread = EjectThread(
+                self.current_disk_index, 
+                model=self.current_disk_model, 
+                serial=self.current_disk_serial
+            )
+            self.eject_thread.finished_signal.connect(self.on_eject_finished)
+            self.eject_thread.start()
+
+    @Slot(bool, str)
+    def on_eject_finished(self, success, message):
+        """弹出操作完成的回调"""
+        # 恢复按钮状态
+        self.eject_button.setText("安全弹出设备")
+        self.eject_button.setEnabled(True)
+        self.status_label.setText("就绪")
+
+        if success:
+            QMessageBox.information(
+                self, 
+                "弹出成功", 
+                f"设备已安全弹出。\n\n{message}\n\n您现在可以安全地拔掉硬盘或关闭电源了。"
+            )
+            # 刷新列表
+            self.on_refresh_clicked()
+        else:
+            # 如果失败了，尝试在监控中恢复（以便下次重试或继续监控）
+            if hasattr(self, 'monitor_service') and self.current_disk_serial:
+                self.monitor_service.mark_disk_awake(self.current_disk_serial)
             
-            if success:
-                QMessageBox.information(
-                    self, 
-                    "弹出成功", 
-                    f"{message}\n\n注意：由于硬盘已进入深度休眠，若重新插入后未识别，请点击左下角的“刷新设备列表”按钮。"
-                )
-                # 触发一次刷新，由于已标记为休眠，检测时会跳过实际硬件查询
-                if hasattr(self, 'monitor_service'):
-                    self.monitor_service.check_all_smart()
-            else:
-                # 弹出失败，恢复监控
-                if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                    self.monitor_service.mark_disk_awake(self.current_disk_serial)
-                QMessageBox.warning(self, "弹出失败", message)
+            QMessageBox.warning(self, "弹出失败", f"无法安全弹出设备：\n{message}\n\n请确保没有程序正在使用该磁盘中的文件。")
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():

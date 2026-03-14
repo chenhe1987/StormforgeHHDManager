@@ -20,8 +20,8 @@ def zip_directory(directory_path, zip_path):
                         print(f"Retry failed for {file_path}: {e2}")
 
 if __name__ == "__main__":
-    src_dir = r"dist\疾风知硬盘柜管理_v1.3.33"
-    dst_zip = r"dist\疾风知硬盘柜管理_v1.3.33.zip"
+    src_dir = r"dist\疾风知硬盘柜管理_v1.3.37"
+    dst_zip = r"dist\疾风知硬盘柜管理_v1.3.37.zip"
     if os.path.exists(src_dir):
         print(f"Zipping {src_dir} to {dst_zip}...")
         zip_directory(src_dir, dst_zip)

@@ -134,6 +134,15 @@ class SmartParser:
             raw_bytes = attr_data[5:11]
             raw_value = int.from_bytes(raw_bytes, byteorder='little')
             
+            # Special handling for Power-On Hours (ID 9)
+            # Some drives (e.g. Western Digital) store extra data in high bytes
+            if attr_id == 9 and raw_value > 500000: # > 57 years
+                # Try masking to lower 32 bits (standard 4-byte integer)
+                lower_32 = raw_value & 0xFFFFFFFF
+                # If the lower 32 bits result in a reasonable value (< 57 years), use it
+                if lower_32 < 500000:
+                    raw_value = lower_32
+            
             info = SmartParser.ATTRIBUTE_INFO.get(attr_id, (f"Unknown (0x{attr_id:02X})", "未知属性"))
             name, name_cn = info
             

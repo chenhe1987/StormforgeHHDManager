@@ -10,8 +10,10 @@ from .win32_api import (
 )
 
 class ASMCommander:
-    def __init__(self, drive_index):
+    def __init__(self, drive_index, model_hint=None, serial_hint=None):
         self.drive_index = drive_index
+        self.model_hint = model_hint
+        self.serial_hint = serial_hint
         self.handle = None
 
     def __enter__(self):
@@ -112,12 +114,18 @@ class ASMCommander:
         )
         
         if not result:
-            logging.error(f"Drive {self.drive_index}: DeviceIoControl (SCSI) failed. Error: {error_code} ({hex(error_code)})")
+            # 25H2 specific: logging more details
+            from ctypes import FormatError
+            err_msg = FormatError(error_code).strip()
+            cdb_hex = "".join([f"{b:02X}" for b in cdb])
+            logging.error(f"Drive {self.drive_index}: DeviceIoControl (SCSI) failed. CDB: {cdb_hex}, Error: {error_code} ({hex(error_code)}) - {err_msg}")
+            # If error is 1 (Incorrect function) or 50 (Not supported), it might be a driver/OS restriction
             return False, 0
         
         if sptdw.sptd.ScsiStatus != 0:
             sense_hex = bytes(sptdw.sense).hex()
-            logging.error(f"Drive {self.drive_index}: SCSI Status {sptdw.sptd.ScsiStatus}, Sense: {sense_hex}")
+            cdb_hex = "".join([f"{b:02X}" for b in cdb])
+            logging.error(f"Drive {self.drive_index}: SCSI Status {sptdw.sptd.ScsiStatus}, CDB: {cdb_hex}, Sense: {sense_hex}")
             return False, 0
             
         return True, bytes_returned
@@ -249,10 +257,10 @@ class ASMCommander:
         cdb16 = [0] * 16
         cdb16[0] = 0x85 # ATA PASS-THROUGH (16)
         cdb16[1] = (4 << 1) # PROTOCOL=4 (PIO Data-In)
-        cdb16[2] = 0x0A # CK_COND=0, T_DIR=1, BYTE_BLOCK=0, T_LENGTH=2
+        cdb16[2] = 0x2E # CK_COND=1, T_DIR=1, BYTE_BLOCK=1, T_LENGTH=2
         cdb16[4] = 0xD0 # Features (7:0)
         cdb16[6] = 0x01 # Sector Count (7:0)
-        # Byte 8: LBA Low (7:0) - 0
+        cdb16[8] = 0x00 # LBA Low (7:0)
         cdb16[10] = 0x4F # LBA Mid (15:8) - Cylinder Low
         cdb16[12] = 0xC2 # LBA High (23:16) - Cylinder High
         cdb16[14] = 0xB0 # Command - SMART
@@ -267,10 +275,10 @@ class ASMCommander:
         cdb12 = [0] * 12
         cdb12[0] = 0xA1 # ATA PASS-THROUGH (12)
         cdb12[1] = (4 << 1) # PROTOCOL=4 (PIO Data-In)
-        cdb12[2] = 0x0A # CK_COND=0, T_DIR=1, BYTE_BLOCK=0, T_LENGTH=2
+        cdb12[2] = 0x2E # CK_COND=1, T_DIR=1, BYTE_BLOCK=1, T_LENGTH=2
         cdb12[3] = 0xD0 # Features
         cdb12[4] = 0x01 # Sector Count
-        # LBA Low = 0
+        cdb12[5] = 0x00 # LBA Low
         cdb12[6] = 0x4F # LBA Mid
         cdb12[7] = 0xC2 # LBA High
         cdb12[9] = 0xB0 # Command - SMART
@@ -288,31 +296,36 @@ class ASMCommander:
             return bytes(buffer)
             
         logging.error(f"Drive {self.drive_index}: All SMART query methods failed.")
-        return None
-
-        # Attempt 2: SAT-12
-        cdb12 = [0] * 12
-        cdb12[0] = 0xA1 # ATA PASS-THROUGH (12)
-        cdb12[1] = (4 << 1) # PIO Data-In
-        cdb12[2] = 0x0A
-        cdb12[3] = 0xD0 # Features
-        cdb12[4] = 0x01 # Sector Count
-        # Byte 5: LBA Low - 0
-        cdb12[6] = 0x4F # LBA Mid
-        cdb12[7] = 0xC2 # LBA High
-        cdb12[9] = 0xB0 # Command
-
-        success, _ = self.send_scsi_command(cdb12, buffer, SCSI_IOCTL_DATA_IN)
-        if success:
-            return bytes(buffer)
-
-        # Attempt 3: SAT-16 with CK_COND=1 (Some ASMedia bridges like this)
-        cdb16[2] = 0x2A # CK_COND=1, T_DIR=1, BYTE_BLOCK=0, T_LENGTH=2
-        success, _ = self.send_scsi_command(cdb16, buffer, SCSI_IOCTL_DATA_IN)
-        if success:
-            return bytes(buffer)
-
-        logging.error(f"Drive {self.drive_index}: All SAT attempts failed.")
+        
+        # --- Method 4: WMI Fallback (Final Attempt) ---
+        try:
+            # First, get model/serial to match WMI
+            identify_data = self.identify_device()
+            model, serial = self.parse_identify_data(identify_data)
+            
+            # Use hints if IDENTIFY failed
+            if not serial:
+                model = self.model_hint
+                serial = self.serial_hint
+                
+            if not serial:
+                return None
+                
+            import wmi
+            c = wmi.WMI(namespace="root/wmi")
+            # WMI SMART data
+            for drive in c.MSStorageDriver_ATASmartData():
+                # InstanceName contains Model and Serial often
+                # Example: IDE\DiskWDC_WD10JPVX-22JC3T0_____________________1.04____\4&30030022&0&0.0.0_0
+                instance_name = drive.InstanceName.upper()
+                if serial.upper() in instance_name or (model and model.upper()[:10] in instance_name):
+                    logging.info(f"Drive {self.drive_index}: Found matching WMI SMART data for {serial}")
+                    return bytes(drive.VendorSpecific)
+        except Exception as e:
+            logging.warning(f"Drive {self.drive_index}: WMI SMART fallback failed: {e}")
+            import traceback
+            logging.debug(traceback.format_exc())
+            
         return None
 
     def spin_down(self):

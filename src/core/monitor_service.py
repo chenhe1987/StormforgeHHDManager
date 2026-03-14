@@ -171,11 +171,15 @@ class MonitorService(threading.Thread):
                 continue
 
             # Add basic info first
+            interface_type = disk.interface_type
+            if interface_type == "IDE" and (disk.is_removable or "USB" in disk.pnp_id):
+                interface_type = "USB (SATA)"
+            
             disk_info = {
                 "index": disk.index,
                 "model": disk.model,
                 "serial": disk.serial_number,
-                "interface": disk.interface_type,
+                "interface": interface_type,
                 "is_removable": disk.is_removable,
                 "temp": "N/A",
                 "status": "Unknown",
@@ -185,7 +189,7 @@ class MonitorService(threading.Thread):
             }
 
             try:
-                with ASMCommander(disk.index) as cmd:
+                with ASMCommander(disk.index, model_hint=disk.model, serial_hint=disk.serial_number) as cmd:
                     # 尝试读取 NVMe 数据（针对某些显示为 IDE 的 SSD）
                     nvme_data = cmd.get_nvme_smart_data()
                     if nvme_data:

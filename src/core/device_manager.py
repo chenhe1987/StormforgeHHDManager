@@ -99,13 +99,14 @@ class DeviceManager:
         return volumes
 
     @staticmethod
-    def spin_down_disk(disk_index):
+    def spin_down_disk(disk_index, model=None, serial=None):
         """仅发送停转命令，不弹出设备"""
         logging.info(f"正在尝试让磁盘 {disk_index} 进入休眠...")
         try:
             from src.hal.asm_commander import ASMCommander
-            with ASMCommander(disk_index) as cmd:
-                if cmd.spin_down():
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
+                # 使用 sleep() 代替 spin_down() 以实现更彻底的停转
+                if cmd.sleep():
                     logging.info(f"磁盘 {disk_index} 休眠命令发送成功")
                     return True, "硬盘已进入休眠状态"
                 else:
@@ -116,12 +117,13 @@ class DeviceManager:
             return False, f"操作异常: {e}"
 
     @staticmethod
-    def set_standby_timer(disk_index, minutes):
+    def set_standby_timer(disk_index, minutes, model=None, serial=None):
         """设置硬盘的自动休眠时间"""
-        logging.info(f"正在尝试设置磁盘 {disk_index} 的休眠时间为 {minutes} 分钟...")
         try:
+            minutes = int(minutes)
+            logging.info(f"正在尝试设置磁盘 {disk_index} 的休眠时间为 {minutes} 分钟...")
             from src.hal.asm_commander import ASMCommander
-            with ASMCommander(disk_index) as cmd:
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
                 if cmd.set_standby_timer(minutes):
                     logging.info(f"磁盘 {disk_index} 休眠时间设置成功")
                     return True, f"休眠时间已设置为 {minutes} 分钟"
@@ -133,7 +135,7 @@ class DeviceManager:
             return False, f"操作异常: {e}"
 
     @staticmethod
-    def safe_eject_disk(disk_index):
+    def safe_eject_disk(disk_index, model=None, serial=None):
         """安全弹出物理磁盘，使用 Windows USB 弹出逻辑"""
         logging.info(f"正在尝试安全弹出磁盘 {disk_index}...")
         
@@ -141,7 +143,7 @@ class DeviceManager:
         instance_id = Win32API.get_device_instance_path(disk_index)
         if not instance_id:
             logging.error(f"无法获取磁盘 {disk_index} 的设备实例 ID")
-            return False, "无法识别设备节点"
+            return False, "无法识别设备节点，请尝试重新扫描设备。"
 
         # 2. 获取并卸载卷
         volumes = DeviceManager.get_volumes_for_disk(disk_index)
@@ -149,13 +151,22 @@ class DeviceManager:
             for vol_letter in volumes:
                 vol_path = f"\\\\.\\{vol_letter}"
                 logging.info(f"正在预卸载卷: {vol_letter}")
+                
+                # 尝试打开卷
                 handle = Win32API.open_volume(vol_path)
                 if handle:
                     try:
-                        Win32API.lock_volume(handle)
-                        Win32API.dismount_volume(handle)
+                        # 锁定卷 (尝试，如果不成功也继续，因为后续 PnP 弹出会有最终否决权)
+                        if Win32API.lock_volume(handle):
+                            logging.info(f"卷 {vol_letter} 锁定成功")
+                            if Win32API.dismount_volume(handle):
+                                logging.info(f"卷 {vol_letter} 卸载成功")
+                        else:
+                            logging.warning(f"卷 {vol_letter} 锁定失败，可能被其他进程占用")
                     finally:
                         Win32API.close_handle(handle)
+                else:
+                    logging.warning(f"无法打开卷 {vol_letter} 的句柄")
         else:
             logging.info(f"磁盘 {disk_index} 上未发现活动卷")
 
@@ -167,12 +178,22 @@ class DeviceManager:
             import time
             from src.hal.asm_commander import ASMCommander
             logging.info(f"正在发送 SLEEP 命令到磁盘 {disk_index}...")
-            with ASMCommander(disk_index) as cmd:
-                if cmd.sleep():
-                    logging.info(f"磁盘 {disk_index} 已进入深度休眠 (SLEEP)")
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
+                # 增加重试机制
+                sleep_success = False
+                for attempt in range(2):
+                    if cmd.sleep():
+                        logging.info(f"磁盘 {disk_index} 已进入深度休眠 (SLEEP)")
+                        sleep_success = True
+                        break
+                    else:
+                        logging.warning(f"第 {attempt+1} 次 SLEEP 命令尝试失败")
+                        time.sleep(0.5)
+                
+                if sleep_success:
                     time.sleep(1.5) # 给硬盘一点时间完成磁头归位和停转
                 else:
-                    logging.warning(f"磁盘 {disk_index} SLEEP 命令发送失败，尝试普通停转...")
+                    logging.warning(f"磁盘 {disk_index} SLEEP 命令最终失败，尝试普通停转...")
                     cmd.spin_down()
         except Exception as e:
             logging.error(f"磁盘 {disk_index} 停转操作发生异常: {e}")
@@ -183,13 +204,15 @@ class DeviceManager:
         
         if success:
             logging.info(f"磁盘 {disk_index} 设备节点移除成功")
-            return True, "设备已安全弹出并停转"
+            return True, "设备已安全弹出并停转。硬盘磁头已归位，马达已停止。"
         else:
-            if "ROOT_HUB" in message or "未知原因 (代码: 8)" in message:
-                logging.warning(f"磁盘 {disk_index} 停转成功但节点移除被否决 (Hub级别): {message}")
-                return True, "设备已成功停转。提示：由于系统占用，设备节点未彻底从管理器移除，但可安全拔掉。"
+            # 特殊情况处理：虽然 PnP 节点移除失败（通常是因为 Hub 被占用），但如果停转成功，用户依然可以安全拔掉。
+            if "ROOT_HUB" in message or "PNP_VetoNonRecursive" in message or "代码: 8" in message:
+                logging.warning(f"磁盘 {disk_index} 停转成功但节点移除被否决: {message}")
+                return True, "设备已成功停转并卸载卷。提示：由于 USB 控制器正在管理其他设备，系统节点未彻底移除，但您可以安全拔掉该硬盘。"
             
-            return False, f"停转成功但节点移除失败: {message}"
+            logging.error(f"磁盘 {disk_index} 弹出最终失败: {message}")
+            return False, f"停转成功但系统拒绝移除节点: {message}\n请检查是否有程序（如资源管理器）正在访问该盘符。"
 
 if __name__ == "__main__":
     # Test disk enumeration

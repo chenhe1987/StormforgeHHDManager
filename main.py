@@ -36,11 +36,15 @@ def main():
     os.chdir(base_dir)
 
     # 2. 初始化日志
+    handlers = [
+        logging.FileHandler(log_file, mode='a', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+    
     logging.basicConfig(
-        filename=log_file,
-        filemode='a', # 改为追加模式，方便追踪多次运行
         level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=handlers
     )
 
     try:

@@ -161,12 +161,16 @@ class Win32API:
 
     @staticmethod
     def lock_volume(handle):
-        result, _, _ = Win32API.device_io_control(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0)
+        result, _, error = Win32API.device_io_control(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0)
+        if not result:
+            logging.warning(f"Lock volume failed. Error: {error}")
         return bool(result)
 
     @staticmethod
     def dismount_volume(handle):
-        result, _, _ = Win32API.device_io_control(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0)
+        result, _, error = Win32API.device_io_control(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0)
+        if not result:
+            logging.warning(f"Dismount volume failed. Error: {error}")
         return bool(result)
 
     @staticmethod
@@ -457,15 +461,18 @@ class Win32API:
             cfgmgr32 = ctypes.WinDLL('cfgmgr32')
             buffer_size = wintypes.DWORD(0)
             
-            # First call to get size
+            # First call to get required size
             res = cfgmgr32.CM_Get_DevNode_Registry_PropertyW(
                 dev_inst, property_id, None, None, ctypes.byref(buffer_size), 0
             )
             
-            if res != 0x0000001A: # CR_BUFFER_SMALL (or success if size known)
-                 # Wait, usually returns CR_BUFFER_SMALL if buffer is None?
-                 # Actually, let's just allocate a reasonable buffer
-                 buffer_size = wintypes.DWORD(1024)
+            # CR_BUFFER_SMALL is 0x1A. If it's not success or small buffer, return None.
+            if res != 0 and res != 0x1A:
+                return None
+            
+            if buffer_size.value == 0:
+                # If size not returned, try a default large buffer
+                buffer_size = wintypes.DWORD(2048)
 
             buffer = (ctypes.c_byte * buffer_size.value)()
             res = cfgmgr32.CM_Get_DevNode_Registry_PropertyW(
@@ -473,9 +480,11 @@ class Win32API:
             )
             
             if res == 0:
+                # Interpret as wide string (W version of API)
                 return ctypes.cast(buffer, ctypes.c_wchar_p).value
             return None
-        except Exception:
+        except Exception as e:
+            logging.debug(f"Error getting devnode property: {e}")
             return None
 
     @staticmethod

@@ -48,7 +48,11 @@ def main():
     
     repo_name = "JiFengZhiHDDManager"
     repo_desc = "专为 ASM2074+ASM1153E 芯片方案设计的硬盘柜管理工具，支持智能休眠、安全弹出和 SMART 监控。"
-    release_tag = "v1.3.33"
+    release_tag = "v1.3.37"
+    if len(sys.argv) > 1:
+        release_tag = sys.argv[1]
+        if not release_tag.startswith('v'):
+            release_tag = 'v' + release_tag
     
     repo_url = f"https://gitee.com/stormforge/{repo_name}"
     git_url = f"https://gitee.com/stormforge/{repo_name}.git"
@@ -183,27 +187,51 @@ def main():
              
         return
 
-    print("\n正在创建 Release v1.3.32...")
-    release_name = f"v1.3.32 Release - 修复设备管理器命名问题"
-    release_body = """
-## v1.3.32 更新日志
+    # --- 更新日志配置 (Changelog Configuration) ---
+    changelogs = {
+        "v1.3.36": {
+            "name": "v1.3.36 Release - 修复浏览器跳转与交互优化",
+            "body": """## v1.3.36 更新日志
 
-### 修复与改进
-1. **[重要] 修复设备管理器命名问题**
-   - 彻底解决了 Windows 设备管理器中硬盘名称显示为通用名 (如 "ASMT 2115 USB Device") 的问题。
-   - 现在会自动读取硬盘固件中的真实型号 (如 "WD Blue SN570") 并强制更新设备管理器显示名称。
-   - 增加了自动提权逻辑，解决了修改注册表时的 "拒绝访问 (Error 5)" 问题。
-2. **修复 PowerShell 调用错误**
-   - 修正了内部调用 PowerShell 获取设备映射时的参数错误，确保设备识别更准确。
-3. **优化启动流程**
-   - 优化了管理员权限检测和提权流程。
+### 功能修复
+1. **[修复] 浏览器跳转问题**
+   - 修复了在某些系统环境下（尤其是管理员权限运行时）点击“检查软件更新”无法自动打开浏览器的问题。
+   - 引入了 `os.startfile` 作为备选方案，提升了跳转成功率。
+2. **[优化] 版本检查交互**
+   - 即使当前已是最新版本，现在也提供前往项目主页的快捷链接。"""
+        },
+        "v1.3.35": {
+            "name": "v1.3.35 Release - 修复通电时间显示异常",
+            "body": """## v1.3.35 更新日志
 
-### 已知问题
-- 首次运行时可能需要数秒钟扫描硬盘并更新名称，期间界面可能会短暂无响应。
-    """
+### 重要修复
+1. **[修复] SMART 通电时间解析错误**
+   - 修复了部分硬盘（如西数）在读取 SMART 属性 9 时，因厂商自定义高位数据导致的“使用时间显示为 169 亿年”的严重 Bug。
+   - 增加了原始值合理性校验，自动屏蔽非标准数据。"""
+        },
+        "v1.3.34": {
+            "name": "v1.3.34 Release - 界面布局优化与接口修正",
+            "body": """## v1.3.34 更新日志
+
+### 界面优化
+1. **[布局] 功能按钮位置调整**
+   - 将“刷新设备列表”、“检查软件更新”、“导出错误日志”、“随系统启动”移动至左侧侧边栏底部，解决了硬盘列表过多时遮挡按钮的问题。
+2. **[修正] 接口类型显示**
+   - 修正了 USB 硬盘接口显示，由 "IDE" 改为更准确的 "USB (SATA)"。"""
+        }
+    }
+
+    # 获取当前版本的日志
+    log_info = changelogs.get(release_tag, {
+        "name": f"{release_tag} Release",
+        "body": f"## {release_tag} 更新日志\n\n暂无详细更新日志。"
+    })
+
+    print(f"\n正在更新 Release {release_tag}...")
+    release_name = log_info["name"]
+    release_body = log_info["body"]
     
     release_data = {
-        "access_token": token,
         "tag_name": release_tag,
         "name": release_name,
         "body": release_body,
@@ -220,7 +248,7 @@ def main():
         # 检查 Tag 是否存在
         # Gitee API 创建 Release 会自动创建 Tag
         
-        rel_resp = requests.post(f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases", json=release_data)
+        rel_resp = requests.post(f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases", json=release_data, params={"access_token": token})
         if rel_resp.status_code == 201:
             print(f"✅ Release {release_tag} 创建成功！")
             release_id = rel_resp.json()['id']
@@ -231,6 +259,19 @@ def main():
              if get_rel_resp.status_code == 200:
                  release_id = get_rel_resp.json()['id']
                  print(f"✅ 获取到 Release ID: {release_id}")
+                 
+                 # 更新已存在的 Release 内容
+                 print(f"正在更新已存在的 Release {release_tag} 内容...")
+                 patch_data = {
+                     "tag_name": release_tag,
+                     "name": release_name,
+                     "body": release_body
+                 }
+                 patch_resp = requests.patch(f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases/{release_id}", json=patch_data, params={"access_token": token})
+                 if patch_resp.status_code == 200:
+                     print(f"✅ Release {release_tag} 内容更新成功！")
+                 else:
+                     print(f"⚠️ Release 内容更新失败: {patch_resp.status_code}")
              else:
                  print(f"❌ 无法获取 Release ID: {get_rel_resp.status_code}")
                  return

@@ -61,48 +61,62 @@ class ConfigManager:
         self.config["sleep_timers"][serial] = int(minutes)
         self.save_config()
 
-    def set_autostart(self, enabled):
-        """设置或取消开机自启动 (使用 Windows 计划任务以支持 Win11/Admin)"""
-        try:
-            # 1. 尝试清理旧的注册表启动项 (为了兼容性)
-            try:
-                key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
-                winreg.DeleteValue(key, self.app_name)
-                winreg.CloseKey(key)
-                logging.info("已清理旧版注册表自启动项")
-            except:
-                pass
+    def get_report_config(self):
+        return {
+            "auto_report": self.config.get("auto_report", False),
+            "report_url": self.config.get("report_url", "https://your-report-server.com/api/upload") 
+        }
 
-            # 2. 使用 schtasks 管理计划任务
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
+    def set_report_config(self, auto_report, report_url=None):
+        self.config["auto_report"] = auto_report
+        if report_url:
+            self.config["report_url"] = report_url
+        self.save_config()
+
+    def set_autostart(self, enabled):
+        """设置或取消开机自启动 (使用注册表 HKCU\Software\Microsoft\Windows\CurrentVersion\Run)"""
+        try:
+            # 1. 无论如何，都尝试清理旧的计划任务 (如果存在)
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                cmd = f'schtasks /Delete /F /TN "{self.task_name}"'
+                subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
+                logging.info("已清理旧版计划任务自启动项")
+            except Exception as e:
+                logging.debug(f"清理计划任务失败 (可能不存在): {e}")
+
+            # 2. 操作注册表
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             if enabled:
                 # 获取当前运行的可执行文件路径
                 if getattr(sys, 'frozen', False):
                     path = sys.executable
                 else:
                     path = os.path.abspath(sys.argv[0])
+                    # 如果是脚本运行，通常不需要特殊处理，但为了稳妥指向 python
+                    if path.endswith('.py'):
+                        path = f'"{sys.executable}" "{path}"'
+                    else:
+                        path = f'"{path}"'
+
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(key, self.app_name, 0, winreg.REG_SZ, path)
+                winreg.CloseKey(key)
                 
-                # 构建命令: schtasks /Create /F /RL HIGHEST /SC ONLOGON /TN "TaskName" /TR "'Path'"
-                # 注意引号处理：/TR "'C:\Program Files\App.exe'"
-                cmd = f'schtasks /Create /F /RL HIGHEST /SC ONLOGON /TN "{self.task_name}" /TR "\'{path}\'"'
-                
-                result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
-                if result.returncode == 0:
-                    logging.info(f"已设置计划任务自启动: {cmd}")
-                    self.config["autostart"] = True
-                    self.save_config()
-                    return True
-                else:
-                    logging.error(f"设置计划任务失败: {result.stderr}")
-                    return False
+                logging.info(f"已设置注册表自启动: {path}")
+                self.config["autostart"] = True
+                self.save_config()
+                return True
             else:
-                # 删除任务
-                cmd = f'schtasks /Delete /F /TN "{self.task_name}"'
-                subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
-                logging.info("已取消计划任务自启动")
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+                    winreg.DeleteValue(key, self.app_name)
+                    winreg.CloseKey(key)
+                except FileNotFoundError:
+                    pass
+                
+                logging.info("已取消注册表自启动")
                 self.config["autostart"] = False
                 self.save_config()
                 return True
@@ -112,22 +126,42 @@ class ConfigManager:
             return False
 
     def is_autostart_enabled(self):
-        """检查计划任务确认是否已设置自启动"""
+        """检查注册表确认是否已设置自启动"""
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        is_enabled = False
         try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            # 1. 检查注册表
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+                winreg.QueryValueEx(key, self.app_name)
+                winreg.CloseKey(key)
+                is_enabled = True
+            except FileNotFoundError:
+                pass
             
-            # 查询任务状态
-            cmd = f'schtasks /Query /TN "{self.task_name}"'
-            result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
-            
-            enabled = (result.returncode == 0)
-            
+            # 2. 如果注册表没有，检查计划任务 (为了兼容旧版状态显示)
+            if not is_enabled:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                cmd = f'schtasks /Query /TN "{self.task_name}"'
+                result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
+                if result.returncode == 0:
+                    is_enabled = True
+
             # 同步配置文件状态
-            if self.config.get("autostart") != enabled:
-                self.config["autostart"] = enabled
+            if self.config.get("autostart") != is_enabled:
+                self.config["autostart"] = is_enabled
                 self.save_config()
-            return enabled
+            return is_enabled
         except Exception as e:
             logging.error(f"查询自启动状态失败: {e}")
             return self.config.get("autostart", False)
+
+    def get_shutdown_eject(self):
+        """获取关机自动弹出设置"""
+        return self.config.get("shutdown_eject", False)
+
+    def set_shutdown_eject(self, enabled):
+        """保存关机自动弹出设置"""
+        self.config["shutdown_eject"] = enabled
+        self.save_config()
