@@ -55,6 +55,9 @@ class STORAGE_PROTOCOL_DATA_DESCRIPTOR(ctypes.Structure):
 ProtocolTypeNvme = 3
 NVMeDataTypeLogPage = 1
 NVMeLogPageHealthInfo = 2
+NVMeDataTypeIdentify = 2
+NVMeIdentifyController = 1
+NVMeIdentifyNamespace = 0
 
 # SCSI PASS THROUGH DIRECT Structure
 class SCSI_PASS_THROUGH_DIRECT(ctypes.Structure):

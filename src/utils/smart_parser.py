@@ -237,7 +237,9 @@ class SmartParser:
             "ssd_life_left": None,
             "total_writes_gb": None,
             "total_reads_gb": None,
-            "attributes_analysis": {} # New: Per-attribute analysis
+            "attributes_analysis": {}, # New: Per-attribute analysis
+            "critical_warning": None,
+            "percent_used": None
         }
         
         # Helper to get previous raw value for an attribute ID
@@ -245,7 +247,8 @@ class SmartParser:
             if not history_entry: return None
             # history_entry structure: {"first_seen": ts, "last_check": ts, "attributes": {id: raw}}
             attrs = history_entry.get("attributes", {})
-            return attrs.get(str(attr_id))
+            val = attrs.get(str(attr_id))
+            return int(val) if val is not None else None
 
         # Helper to format duration
         def format_duration(seconds):
@@ -272,6 +275,11 @@ class SmartParser:
             # 2. Extract Key Metrics (Existing logic)
             if attr.id == 0xC2 or attr.id == 0xBE or attr.id == 0x02: # Temperature
                 summary["temp"] = attr.raw & 0xFFFF
+            elif attr.id == 0x01: # Read Error Rate (SATA) or Critical Warning (NVMe simulated)
+                if attr.name == "Critical Warning":
+                    summary["critical_warning"] = attr.raw
+                else:
+                    summary["read_error_rate"] = attr.raw
             elif attr.id == 0x05: # Reallocated (SATA) or Percentage Used (NVMe simulated)
                 if attr.name == "Percentage Used":
                     summary["percent_used"] = attr.raw
@@ -363,17 +371,23 @@ class SmartParser:
             summary["attributes_analysis"][attr.id] = analysis
 
 
-        # Generate intelligent summary and advice (Aggregated)
-        advices = []
-        status = "Healthy"
-        
-        # ... (Rest of existing advice generation logic)
-
         # Generate intelligent summary and advice
         advices = []
         status = "Healthy"
         
-        # 1. Power on analysis
+        # 1. Critical Warning (NVMe)
+        if summary.get("critical_warning") is not None and summary["critical_warning"] > 0:
+            status = "Critical"
+            cw = summary["critical_warning"]
+            reasons = []
+            if cw & 0x01: reasons.append("备用空间过低")
+            if cw & 0x02: reasons.append("温度异常")
+            if cw & 0x04: reasons.append("可靠性下降 (NAND 错误)")
+            if cw & 0x08: reasons.append("介质设为只读")
+            if cw & 0x10: reasons.append("易失性存储器备份失败")
+            advices.append(f"严重警告：NVMe 硬盘报告关键性错误 (代码 0x{cw:02X}: {', '.join(reasons)})！请立即备份并更换硬盘。")
+
+        # 2. Power on analysis
         hours = summary["power_on_hours"]
         years = hours / 8760
         power_str = f"硬盘已累计通电 {hours} 小时"
@@ -382,12 +396,11 @@ class SmartParser:
         elif hours < 100:
             advices.append("这是一块较新的硬盘，请关注初期运行状态。")
             
-        # 2. Health risk analysis
+        # 3. Health risk analysis
         if summary["reallocated"] is not None and summary["reallocated"] > 0:
             count = summary["reallocated"]
-            delta = 0
-            if prev_summary and prev_summary.get("reallocated") is not None:
-                delta = count - prev_summary.get("reallocated")
+            prev_val = get_prev_raw(0x05) # ID for Reallocated
+            delta = count - prev_val if prev_val is not None else 0
                 
             status = "Warning"
             if delta > 0:
@@ -397,9 +410,8 @@ class SmartParser:
             
         if summary["pending"] is not None and summary["pending"] > 0:
             count = summary["pending"]
-            delta = 0
-            if prev_summary and prev_summary.get("pending") is not None:
-                delta = count - prev_summary.get("pending")
+            prev_val = get_prev_raw(0xC5) # ID for Pending
+            delta = count - prev_val if prev_val is not None else 0
 
             status = "Warning"
             if delta > 0:
@@ -407,7 +419,7 @@ class SmartParser:
             else:
                 advices.append(f"存在 {count} 个待处理扇区。数值暂未增加，但仍属于高风险状态，请定期检查。")
 
-        if "percent_used" in summary and summary["percent_used"] > 90:
+        if summary.get("percent_used") is not None and summary["percent_used"] > 90:
             status = "Warning"
             advices.append(f"NVMe 寿命已消耗 {summary['percent_used']}%，接近设计寿命终点，建议近期更换。")
             
@@ -417,9 +429,8 @@ class SmartParser:
 
         if summary["crc_errors"] is not None and summary["crc_errors"] > 0:
             count = summary["crc_errors"]
-            delta = 0
-            if prev_summary and prev_summary.get("crc_errors") is not None:
-                delta = count - prev_summary.get("crc_errors")
+            prev_val = get_prev_raw(0xC7) # ID for CRC Errors
+            delta = count - prev_val if prev_val is not None else 0
             
             if delta > 0:
                 status = "Warning"
@@ -428,7 +439,7 @@ class SmartParser:
                 # High count but stable
                 advices.append(f"检测到历史累计的 UDMA CRC 错误 ({count} 次)。\n近期数值未增加，说明通信已稳定，可能是历史遗留问题。")
 
-        # 3. Temperature analysis
+        # 4. Temperature analysis
         temp = summary["temp"]
         if temp and temp > 55:
             advices.append(f"当前温度 ({temp}°C) 偏高，建议改善散热环境，长期高温会缩短硬盘寿命。")

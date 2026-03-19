@@ -74,6 +74,62 @@ class ASMCommander:
         
         return None
 
+    def get_nvme_identify(self):
+        """Read NVMe Identify Controller data using IOCTL_STORAGE_QUERY_PROPERTY"""
+        if not self.handle:
+            return None
+
+        # Output buffer for STORAGE_PROTOCOL_DATA_DESCRIPTOR + 4096 bytes data (NVMe Identify is 4KB)
+        output_buffer_size = ctypes.sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) + 4096
+        output_buffer = (ctypes.c_ubyte * output_buffer_size)()
+        
+        for prop_id in [28, 30]:
+            query = STORAGE_PROPERTY_QUERY()
+            query.PropertyId = prop_id
+            query.QueryType = 0
+            
+            protocol_data = ctypes.cast(query.AdditionalParameters, ctypes.POINTER(STORAGE_PROTOCOL_SPECIFIC_DATA)).contents
+            protocol_data.ProtocolType = ProtocolTypeNvme
+            protocol_data.DataType = NVMeDataTypeIdentify
+            protocol_data.ProtocolDataRequestValue = NVMeIdentifyController
+            protocol_data.ProtocolDataRequestSubValue = 0
+            protocol_data.ProtocolDataOffset = ctypes.sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)
+            protocol_data.ProtocolDataLength = 4096
+            
+            result, bytes_returned, error_code = Win32API.device_io_control(
+                self.handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query),
+                ctypes.sizeof(query),
+                ctypes.byref(output_buffer),
+                output_buffer_size
+            )
+            
+            if result:
+                descriptor = ctypes.cast(output_buffer, ctypes.POINTER(STORAGE_PROTOCOL_DATA_DESCRIPTOR)).contents
+                offset = descriptor.ProtocolSpecificData.ProtocolDataOffset
+                if offset > 0 and offset < output_buffer_size:
+                    identify_data = bytes(output_buffer[offset : offset + 4096])
+                    logging.info(f"Drive {self.drive_index}: NVMe IDENTIFY query successful with PropertyId {prop_id}")
+                    return identify_data
+        
+        return None
+
+    @staticmethod
+    def parse_nvme_identify_data(data):
+        """Parse NVMe Identify Controller data to extract model and serial"""
+        if not data or len(data) < 1024:
+            return None, None
+            
+        try:
+            # Serial Number: bytes 4-23 (20 bytes)
+            serial = data[4:24].decode('ascii', errors='ignore').strip()
+            # Model Number: bytes 24-63 (40 bytes)
+            model = data[24:64].decode('ascii', errors='ignore').strip()
+            return model, serial
+        except Exception:
+            return None, None
+
     def send_scsi_command(self, cdb, data_buffer=None, data_direction=SCSI_IOCTL_DATA_IN, timeout=15):
         if not self.handle:
             return False, 0
@@ -123,7 +179,28 @@ class ASMCommander:
             return False, 0
         
         if sptdw.sptd.ScsiStatus != 0:
-            sense_hex = bytes(sptdw.sense).hex()
+            sense = bytes(sptdw.sense)
+            # Check if it's a SAT success with ATA registers (CHECK CONDITION + RECOVERED ERROR/NO SENSE + ASC=00, ASCQ=1D)
+            if sptdw.sptd.ScsiStatus == 2: # CHECK CONDITION
+                is_sat_success = False
+                if sense[0] in (0x72, 0x73): # Descriptor format
+                    sense_key = sense[1] & 0x0F
+                    asc = sense[2]
+                    ascq = sense[3]
+                    if sense_key in (0x00, 0x01, 0x09) and asc == 0x00 and ascq == 0x1D:
+                        is_sat_success = True
+                elif sense[0] in (0x70, 0x71): # Fixed format
+                    sense_key = sense[2] & 0x0F
+                    asc = sense[12]
+                    ascq = sense[13]
+                    if sense_key in (0x00, 0x01, 0x09) and asc == 0x00 and ascq == 0x1D:
+                        is_sat_success = True
+                        
+                if is_sat_success:
+                    # The command actually succeeded, the device is just returning ATA registers
+                    return True, bytes_returned
+
+            sense_hex = sense.hex()
             cdb_hex = "".join([f"{b:02X}" for b in cdb])
             logging.error(f"Drive {self.drive_index}: SCSI Status {sptdw.sptd.ScsiStatus}, CDB: {cdb_hex}, Sense: {sense_hex}")
             return False, 0

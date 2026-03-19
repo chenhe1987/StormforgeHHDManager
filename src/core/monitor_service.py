@@ -162,18 +162,20 @@ class MonitorService(threading.Thread):
                       "SN580" in model_upper or 
                       "980 PRO" in model_upper or
                       "990 PRO" in model_upper or
+                      "SOLIDIGM" in model_upper or
+                      "WD_BLACK" in model_upper or
                       ("SSD" in model_upper and disk.interface_type == "IDE"))
             
             logging.info(f"DEBUG: 磁盘 {disk.index} ({disk.model}) Interface: {disk.interface_type}, is_nvme: {is_nvme}")
             
-            if is_nvme:
-                logging.info(f"DEBUG: 跳过 NVMe 硬盘: {disk.model}")
-                continue
-
             # Add basic info first
             interface_type = disk.interface_type
-            if interface_type == "IDE" and (disk.is_removable or "USB" in disk.pnp_id):
+            if interface_type == "IDE" and (disk.is_removable or "USB" in (disk.pnp_id or "").upper()):
                 interface_type = "USB (SATA)"
+            elif "USB" in (disk.interface_type or "").upper():
+                interface_type = "USB"
+            elif is_nvme:
+                interface_type = "NVMe"
             
             disk_info = {
                 "index": disk.index,
@@ -190,28 +192,50 @@ class MonitorService(threading.Thread):
 
             try:
                 with ASMCommander(disk.index, model_hint=disk.model, serial_hint=disk.serial_number) as cmd:
-                    # 尝试读取 NVMe 数据（针对某些显示为 IDE 的 SSD）
-                    nvme_data = cmd.get_nvme_smart_data()
-                    if nvme_data:
-                        logging.info(f"DEBUG: 硬盘 {disk.index} 识别为 NVMe 协议，跳过显示")
-                        is_nvme = True
-                        continue # Skip this disk as it's NVMe
-                    else:
-                        # Try SATA/SAT protocol
+                    attributes = []
+                    
+                    # 1. 优先尝试获取真实型号和序列号 (Identify)
+                    # 无论是 NVMe 还是 SATA，获取真实型号是第一要务
+                    if is_nvme:
+                        # 尝试 NVMe Identify
+                        nvme_id = cmd.get_nvme_identify()
+                        if nvme_id:
+                            real_model, real_serial = ASMCommander.parse_nvme_identify_data(nvme_id)
+                            if real_model:
+                                logging.info(f"DEBUG: NVMe Identify 识别到真实型号: {real_model}")
+                                disk_info["model"] = real_model
+                                if real_serial and len(real_serial) > 5:
+                                    disk_info["serial"] = real_serial
+                                    
+                                # 自动重命名逻辑
+                                try:
+                                    if disk.pnp_id and real_model and real_model != "Unknown":
+                                        current_friendly = DeviceRenamer.get_friendly_name(disk.pnp_id)
+                                        if DeviceRenamer.should_rename(current_friendly, real_model):
+                                            logging.info(f"检测到 NVMe 设备名需更新: '{current_friendly}' -> '{real_model}'")
+                                            DeviceRenamer.set_friendly_name(disk.pnp_id, real_model)
+                                except Exception as e:
+                                    logging.warning(f"NVMe 自动重命名尝试失败: {e}")
+                        
+                        # 2. 尝试获取 NVMe SMART
+                        nvme_data = cmd.get_nvme_smart_data()
+                        if nvme_data:
+                            logging.info(f"DEBUG: 硬盘 {disk.index} NVMe SMART 数据读取成功")
+                            attributes = SmartParser.parse_nvme(nvme_data)
+                    
+                    # 3. 如果不是 NVMe 或 NVMe SMART 读取失败，尝试 SATA/SAT
+                    if not attributes:
                         id_data = cmd.identify_device()
-                        if not id_data:
-                            logging.warning(f"硬盘 {disk.index} IDENTIFY 失败，可能不支持 SAT")
-                            attributes = []
-                        else:
-                            logging.info(f"DEBUG: 硬盘 {disk.index} IDENTIFY 成功")
+                        if id_data:
+                            logging.info(f"DEBUG: 硬盘 {disk.index} SATA IDENTIFY 成功")
                             real_model, real_serial = ASMCommander.parse_identify_data(id_data)
                             if real_model:
-                                logging.info(f"DEBUG: 识别到真实硬盘型号: {real_model}, 序列号: {real_serial}")
+                                logging.info(f"DEBUG: SATA 识别到真实型号: {real_model}")
                                 disk_info["model"] = real_model
                                 if real_serial and len(real_serial) > 5:
                                     disk_info["serial"] = real_serial
 
-                                # 尝试修复设备管理器中的显示名称 (DeviceRenamer)
+                                # 自动重命名逻辑
                                 try:
                                     if disk.pnp_id and real_model and real_model != "Unknown":
                                         current_friendly = DeviceRenamer.get_friendly_name(disk.pnp_id)
@@ -224,8 +248,6 @@ class MonitorService(threading.Thread):
                             raw_data = cmd.get_smart_data()
                             if raw_data:
                                 attributes = SmartParser.parse_512(raw_data)
-                            else:
-                                attributes = []
 
                     if attributes:
                         logging.info(f"DEBUG: 硬盘 {disk.index} 数据解析成功")

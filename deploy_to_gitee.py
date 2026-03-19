@@ -48,7 +48,7 @@ def main():
     
     repo_name = "JiFengZhiHDDManager"
     repo_desc = "专为 ASM2074+ASM1153E 芯片方案设计的硬盘柜管理工具，支持智能休眠、安全弹出和 SMART 监控。"
-    release_tag = "v1.3.37"
+    release_tag = "v1.3.38"
     if len(sys.argv) > 1:
         release_tag = sys.argv[1]
         if not release_tag.startswith('v'):

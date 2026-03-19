@@ -432,7 +432,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
-        self.version = "1.3.37"
+        self.version = "1.3.38"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version} (关机保护版)")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
