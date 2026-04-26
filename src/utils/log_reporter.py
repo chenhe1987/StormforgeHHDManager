@@ -11,6 +11,7 @@ class LogReporter:
     def __init__(self):
         self.base_dir = get_base_path()
         self.log_file = os.path.join(self.base_dir, "app.log")
+        self.operation_log_file = os.path.join(self.base_dir, "operations.log")
         self.history_file = os.path.join(self.base_dir, "smart_history.json")
         self.config_file = os.path.join(self.base_dir, "config.json")
 
@@ -24,6 +25,9 @@ class LogReporter:
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 if os.path.exists(self.log_file):
                     zipf.write(self.log_file, "app.log")
+
+                if os.path.exists(self.operation_log_file):
+                    zipf.write(self.operation_log_file, "operations.log")
                 
                 if os.path.exists(self.history_file):
                     zipf.write(self.history_file, "smart_history.json")
@@ -96,8 +100,14 @@ class LogReporter:
 
         issues = []
         try:
-            with open(self.log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
+            lines = []
+            if os.path.exists(self.log_file):
+                with open(self.log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines.extend(f.readlines())
+
+            if os.path.exists(self.operation_log_file):
+                with open(self.operation_log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines.extend(f.readlines())
 
             # Simple keyword analysis
             # We look at the last 1000 lines to avoid old history

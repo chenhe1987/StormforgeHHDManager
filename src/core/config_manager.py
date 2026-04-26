@@ -4,20 +4,45 @@ import logging
 import sys
 import winreg
 import subprocess
+import shutil
 from src.utils.paths import get_base_path
 
 class ConfigManager:
+    _instance = None
+    
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(ConfigManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self, filename="app_config.json"):
-        self.filename = os.path.join(get_base_path(), filename)
+        if getattr(self, '_initialized', False):
+            return
+        cfg_root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or get_base_path()
+        cfg_dir = os.path.join(cfg_root, "StormForgeDiskManager")
+        try:
+            os.makedirs(cfg_dir, exist_ok=True)
+        except Exception:
+            cfg_dir = get_base_path()
+        self.filename = os.path.join(cfg_dir, filename)
+        legacy_path = os.path.join(get_base_path(), filename)
+        if not os.path.exists(self.filename) and os.path.exists(legacy_path):
+            try:
+                shutil.copy2(legacy_path, self.filename)
+            except Exception:
+                pass
         self.config = self._load_config()
         self.app_name = "StormForgeDiskManager"
         self.task_name = "JiFengZhiHDDManager"
+        self._initialized = True
         
     def _load_config(self):
         default_config = {
             "intervals": {}, # {serial: seconds}
             "sleep_timers": {}, # {serial: minutes}
-            "autostart": False
+            "autostart": False,
+            "shutdown_eject": False
         }
         if not os.path.exists(self.filename):
             return default_config
@@ -73,6 +98,34 @@ class ConfigManager:
             self.config["report_url"] = report_url
         self.save_config()
 
+    def _get_autostart_command(self):
+        """构造当前版本应写入注册表的启动命令。"""
+        if getattr(sys, 'frozen', False):
+            return f'"{os.path.abspath(sys.executable)}"'
+
+        path = os.path.abspath(sys.argv[0])
+        if path.endswith('.py'):
+            return f'"{sys.executable}" "{path}"'
+        return f'"{path}"'
+
+    def _normalize_autostart_command(self, command):
+        if not command:
+            return ""
+        return os.path.normcase(os.path.normpath(command.strip()))
+
+    def _extract_command_path(self, command):
+        """从注册表命令中提取主可执行路径。"""
+        if not command:
+            return ""
+
+        command = command.strip()
+        if command.startswith('"'):
+            end_quote = command.find('"', 1)
+            if end_quote > 1:
+                return command[1:end_quote]
+
+        return command.split(" ")[0]
+
     def set_autostart(self, enabled):
         """设置或取消开机自启动 (使用注册表 HKCU\Software\Microsoft\Windows\CurrentVersion\Run)"""
         try:
@@ -89,16 +142,7 @@ class ConfigManager:
             # 2. 操作注册表
             key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
             if enabled:
-                # 获取当前运行的可执行文件路径
-                if getattr(sys, 'frozen', False):
-                    path = sys.executable
-                else:
-                    path = os.path.abspath(sys.argv[0])
-                    # 如果是脚本运行，通常不需要特殊处理，但为了稳妥指向 python
-                    if path.endswith('.py'):
-                        path = f'"{sys.executable}" "{path}"'
-                    else:
-                        path = f'"{path}"'
+                path = self._get_autostart_command()
 
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
                 winreg.SetValueEx(key, self.app_name, 0, winreg.REG_SZ, path)
@@ -130,14 +174,32 @@ class ConfigManager:
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
         is_enabled = False
         try:
+            reg_value = None
             # 1. 检查注册表
             try:
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
-                winreg.QueryValueEx(key, self.app_name)
+                reg_value, _ = winreg.QueryValueEx(key, self.app_name)
                 winreg.CloseKey(key)
                 is_enabled = True
             except FileNotFoundError:
                 pass
+
+            # 如果注册表存在，但仍指向旧版本 EXE，则自动修复为当前版本路径。
+            if is_enabled and reg_value:
+                expected_command = self._get_autostart_command()
+                current_path = self._extract_command_path(reg_value)
+                command_matches = self._normalize_autostart_command(reg_value) == self._normalize_autostart_command(expected_command)
+                path_exists = os.path.exists(current_path) if current_path else False
+
+                if not command_matches or not path_exists:
+                    logging.warning(
+                        f"检测到自启动项路径已过期或失效，当前值: {reg_value}，期望值: {expected_command}"
+                    )
+                    repaired = self.set_autostart(True)
+                    if repaired:
+                        is_enabled = True
+                    else:
+                        is_enabled = False
             
             # 2. 如果注册表没有，检查计划任务 (为了兼容旧版状态显示)
             if not is_enabled:

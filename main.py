@@ -1,5 +1,6 @@
 import sys
 import os
+from logging.handlers import RotatingFileHandler
 
 # 确保程序根目录在 import 路径中
 if getattr(sys, 'frozen', False):
@@ -33,23 +34,49 @@ def main():
     # 1. 基础路径准备
     base_dir = get_base_path()
     log_file = os.path.join(base_dir, 'app.log')
+    operation_log_file = os.path.join(base_dir, 'operations.log')
     os.chdir(base_dir)
 
     # 2. 初始化日志
-    handlers = [
-        logging.FileHandler(log_file, mode='a', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-    
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=handlers
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'
     )
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.DEBUG)
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        mode='a',
+        maxBytes=2 * 1024 * 1024,
+        backupCount=3,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
+    operation_handler = RotatingFileHandler(
+        operation_log_file,
+        mode='a',
+        maxBytes=2 * 1024 * 1024,
+        backupCount=2,
+        encoding='utf-8'
+    )
+    operation_handler.setLevel(logging.INFO)
+    operation_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(operation_handler)
+    root_logger.addHandler(console_handler)
 
     try:
         logging.info("--- 程序启动尝试 ---")
-        logging.info(f"管理员权限: {is_admin()}, 运行目录: {base_dir}")
+        logging.info(f"管理员权限: {is_admin()}, 运行目录: {base_dir}, 主日志: {log_file}, 操作日志: {operation_log_file}")
         
         # 3. 管理员权限提升逻辑
         if not is_admin():

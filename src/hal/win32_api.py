@@ -13,6 +13,13 @@ FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
 INVALID_HANDLE_VALUE = -1
 
+# Message Constants
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+ENDSESSION_CLOSEAPP = 0x0001
+ENDSESSION_CRITICAL = 0x40000000
+ENDSESSION_LOGOFF = 0x80000000
+
 # CfgMgr32 Constants
 CR_SUCCESS = 0x00000000
 CM_LOCATE_DEVNODE_NORMAL = 0x00000000
@@ -268,10 +275,13 @@ class Win32API:
                 cfgmgr32.CM_Get_Device_IDW(dev_inst, id_buffer, 260, 0)
                 node_id = id_buffer.value.upper()
 
-                # 如果是代码 47，或者 (是磁盘相关设备且有其他错误代码)
+                # 如果是代码 47，或者 (是磁盘相关设备且有其他错误代码，排除 45 PHANTOM)
                 is_target_error = (problem.value == CM_PROB_HELD_FOR_EJECT) or \
-                                 (problem.value in [CM_PROB_PHANTOM, CM_PROB_DISABLED] and \
+                                 (problem.value == CM_PROB_DISABLED and \
                                   any(k in node_id for k in ["USBSTOR", "SCSI", "DISK"]))
+
+                # 优化：只关注可能与外置硬盘柜相关的设备，提高准确性和安全性
+                is_target_error = is_target_error and any(k in node_id for k in ["USB", "SCSI", "VEN_174C", "ASMT", "VEN_152D", "VEN_0BDA", "VEN_14CD", "STORMFOR"])
 
                 if res == CR_SUCCESS and is_target_error:
                     logging.info(f"发现异常状态设备: {node_id} (错误码: {problem.value})，尝试重启...")
@@ -353,9 +363,9 @@ class Win32API:
                 if any(k in parent_id for k in ["USB\\", "USBSTOR", "UASPSTOR"]):
                     return True
                 
-                # 特别针对 ASMedia 等硬盘柜控制器 (Vendor ID: 174C)
+                # 特别针对 ASMedia, JMicron, Realtek 等硬盘柜控制器
                 # 即使它在某些驱动下显示为 SCSI，其父节点通常仍包含这些特征
-                if "VEN_174C" in parent_id or "ASMT" in parent_id:
+                if any(k in parent_id for k in ["VEN_174C", "ASMT", "VEN_152D", "VEN_0BDA", "VEN_14CD"]):
                     return True
                     
                 curr = parent
@@ -364,6 +374,54 @@ class Win32API:
         except Exception as e:
             logging.error(f"判断设备是否外置时发生异常: {e}")
             return False
+
+    @staticmethod
+    def get_windows_disk_idle_settings():
+        """
+        读取当前电源计划中“在此时间后关闭硬盘”的 AC/DC 设置。
+        返回:
+            {
+                "ac_seconds": int | None,
+                "dc_seconds": int | None,
+                "is_never_sleep_ac": bool,
+                "is_never_sleep_dc": bool,
+            }
+        """
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            result = subprocess.run(
+                ["powercfg", "/query", "scheme_current", "SUB_DISK", "DISKIDLE"],
+                capture_output=True,
+                text=True,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+            if result.returncode != 0:
+                logging.warning(f"读取 Windows 硬盘休眠设置失败: {result.stderr}")
+                return None
+
+            ac_match = re.search(r"当前交流电源设置索引:\s*0x([0-9a-fA-F]+)", result.stdout)
+            dc_match = re.search(r"当前直流电源设置索引:\s*0x([0-9a-fA-F]+)", result.stdout)
+
+            if not ac_match and not dc_match:
+                logging.warning("无法从 powercfg 输出中解析硬盘休眠设置")
+                return None
+
+            ac_seconds = int(ac_match.group(1), 16) if ac_match else None
+            dc_seconds = int(dc_match.group(1), 16) if dc_match else None
+
+            return {
+                "ac_seconds": ac_seconds,
+                "dc_seconds": dc_seconds,
+                "is_never_sleep_ac": ac_seconds == 0 if ac_seconds is not None else False,
+                "is_never_sleep_dc": dc_seconds == 0 if dc_seconds is not None else False,
+            }
+        except Exception as e:
+            logging.warning(f"检测 Windows 硬盘休眠设置异常: {e}")
+            return None
 
     @staticmethod
     def get_device_instance_path(disk_index):
@@ -379,80 +437,167 @@ class Win32API:
         return None
 
     @staticmethod
-    def eject_device_by_instance_id(instance_id):
-        """使用 CfgMgr32 API 安全弹出设备，并尝试查找可弹出的父节点"""
+    def _get_devnode_id(dev_inst):
+        """获取 DevNode 的实例 ID 字符串"""
         try:
             cfgmgr32 = ctypes.WinDLL('cfgmgr32')
-            
-            # 1. 获取初始设备句柄
+            id_buffer = (ctypes.c_wchar * 260)()
+            res = cfgmgr32.CM_Get_Device_IDW(dev_inst, id_buffer, 260, 0)
+            if res == 0:
+                return id_buffer.value
+        except Exception as e:
+            logging.debug(f"获取设备实例 ID 失败: {e}")
+        return None
+
+    @staticmethod
+    def _is_critical_service(service_name):
+        """避免对 USB Hub、控制器或系统总线发起弹出"""
+        if not service_name:
+            return False
+
+        critical_services = [
+            "USBHUB3", "USBHUB", "IUSB3HUB", "ASMTXHCI", "XHCI", "EHCI", "UHCI",
+            "PCI", "ACPI", "STORAHCI", "IASTORA", "NVME", "ROOT", "VOLMGR", "PARTMGR"
+        ]
+        service_upper = service_name.upper()
+        return any(keyword in service_upper for keyword in critical_services)
+
+    @staticmethod
+    def _score_eject_candidate(node_id, service_name):
+        """为更接近 Windows 原生可移除设备节点的候选项打分"""
+        if not node_id:
+            return -1
+
+        node_upper = node_id.upper()
+        service_upper = service_name.upper() if service_name else ""
+
+        if Win32API._is_critical_service(service_name):
+            return -1
+
+        score = 0
+
+        # Windows 在独立 USB-SATA 桥接上通常会暴露这些节点类型。
+        if node_upper.startswith("USB\\"):
+            score = max(score, 100)
+        if "UASPSTOR" in node_upper:
+            score = max(score, 95)
+        if "USBSTOR" in node_upper:
+            score = max(score, 90)
+        if any(keyword in node_upper for keyword in ["VEN_174C", "ASMT", "VEN_152D", "JMS", "VEN_0BDA", "VEN_14CD"]):
+            score = max(score, 85)
+        if service_upper in ["UASPSTOR", "USBSTOR"]:
+            score = max(score, 88)
+
+        return score
+
+    @staticmethod
+    def find_native_eject_target(instance_id, max_depth=8):
+        """
+        查找最接近 Windows 原生“安全删除硬件”行为的目标节点。
+        返回值:
+            {
+                "dev_inst": DWORD,
+                "instance_id": str,
+                "service": str | None,
+                "score": int,
+                "chain": list[str]
+            } | None
+        """
+        try:
+            cfgmgr32 = ctypes.WinDLL('cfgmgr32')
+
             dev_inst = wintypes.DWORD()
             res = cfgmgr32.CM_Locate_DevNodeW(ctypes.byref(dev_inst), instance_id, 0)
             if res != 0:
-                return False, f"CM_Locate_DevNodeW 失败: {res}"
-            
-            # 2. 向上查找具有 'Eject' 或 'Removable' 属性的父节点
+                logging.error(f"CM_Locate_DevNodeW 失败，无法定位原生弹出目标: {res}")
+                return None
+
             current_inst = dev_inst
-            parent_inst = wintypes.DWORD()
-            
-            # Veto 相关
-            veto_type = ctypes.c_int(0)
-            veto_name = (ctypes.c_wchar * 260)()
-            
-            # 尝试向上查找最多 5 层
-            last_veto_reason = "未能找到可弹出的设备节点"
-            
-            # 定义禁止弹出的关键服务名称 (Hub, Controller, PCI Bus, etc.)
-            CRITICAL_SERVICES = [
-                "USBHUB3", "USBHUB", "IUSB3HUB", "ASMTXHCI", "XHCI", "EHCI", "UHCI", 
-                "PCI", "ACPI", "STORAHCI", "IASTORA", "NVME", "ROOT", "VOLMGR", "PARTMGR"
-            ]
+            best_candidate = None
+            traversed_chain = []
 
-            for i in range(5):
-                # 获取当前节点的实例 ID 字符串用于日志
-                id_buffer = (ctypes.c_wchar * 260)()
-                cfgmgr32.CM_Get_Device_IDW(current_inst, id_buffer, 260, 0)
-                node_id = id_buffer.value
+            for depth in range(max_depth):
+                node_id = Win32API._get_devnode_id(current_inst)
+                service_name = Win32API._get_devnode_property(current_inst, 0x00000005)  # CM_DRP_SERVICE
+                traversed_chain.append(f"{depth}:{node_id or '<unknown>'}|{service_name or 'None'}")
 
-                # 检查服务名称，避免弹出 Hub 或控制器
-                service_name = Win32API._get_devnode_property(current_inst, 0x00000005) # CM_DRP_SERVICE
-                if service_name:
-                    service_upper = service_name.upper()
-                    # 如果服务名称包含任何关键服务关键字，停止向上查找
-                    if any(crit in service_upper for crit in CRITICAL_SERVICES):
-                        logging.warning(f"停止向上遍历：节点 {node_id} 是关键设备 (Service: {service_name})，禁止弹出")
-                        # 如果是第0层就是关键设备，那说明初始设备找错了，直接返回失败
-                        if i == 0:
-                            return False, f"目标设备是关键系统设备 ({service_name})，禁止弹出"
-                        break # 停止循环，不再尝试父节点
+                score = Win32API._score_eject_candidate(node_id, service_name)
+                if score >= 0:
+                    candidate = {
+                        "dev_inst": wintypes.DWORD(current_inst.value),
+                        "instance_id": node_id,
+                        "service": service_name,
+                        "score": score,
+                    }
+                    if not best_candidate or score > best_candidate["score"]:
+                        best_candidate = candidate
 
-                logging.info(f"正在尝试弹出节点 (层级 {i}): {node_id} (Service: {service_name})")
-
-                # 请求弹出
-                res = cfgmgr32.CM_Request_Device_EjectW(
-                    current_inst, 
-                    ctypes.byref(veto_type), 
-                    veto_name, 
-                    260, 
-                    0
-                )
-                
-                if res == 0:
-                    return True, "设备已安全弹出"
-                
-                # 如果被否决 (Veto)，记录原因
-                if res == 0x00000017: # CR_REMOVE_VETOED
-                    last_veto_reason = Win32API._get_veto_reason_str(veto_type.value, veto_name.value)
-                    logging.warning(f"节点 {node_id} 弹出被否决: {last_veto_reason}")
-                else:
-                    logging.warning(f"节点 {node_id} 弹出请求失败，错误代码: {res}")
-                
-                # 尝试获取父节点
+                parent_inst = wintypes.DWORD()
                 res = cfgmgr32.CM_Get_Parent(ctypes.byref(parent_inst), current_inst, 0)
                 if res != 0:
                     break
+
+                parent_service = Win32API._get_devnode_property(parent_inst, 0x00000005)
+                if Win32API._is_critical_service(parent_service):
+                    parent_id = Win32API._get_devnode_id(parent_inst)
+                    traversed_chain.append(f"{depth + 1}:{parent_id or '<unknown>'}|{parent_service or 'None'}")
+                    break
+
                 current_inst = parent_inst
 
-            return False, last_veto_reason
+            if best_candidate:
+                best_candidate["chain"] = traversed_chain
+                logging.info(
+                    f"已定位原生弹出目标: {best_candidate['instance_id']} "
+                    f"(Service: {best_candidate['service']}, Score: {best_candidate['score']})"
+                )
+                logging.info(f"设备父链: {' -> '.join(traversed_chain)}")
+                return best_candidate
+
+            logging.warning(f"未在父链中找到合适的原生弹出目标: {' -> '.join(traversed_chain)}")
+            return None
+        except Exception as e:
+            logging.error(f"查找原生弹出目标时发生异常: {e}")
+            return None
+
+    @staticmethod
+    def eject_device_by_instance_id(instance_id):
+        """使用更接近 Windows 原生行为的节点进行单次设备弹出"""
+        try:
+            cfgmgr32 = ctypes.WinDLL('cfgmgr32')
+
+            target = Win32API.find_native_eject_target(instance_id)
+            if not target:
+                return False, "未找到对应的 USB-SATA 可弹出节点"
+
+            veto_type = ctypes.c_int(0)
+            veto_name = (ctypes.c_wchar * 260)()
+
+            logging.info(
+                f"正在按原生策略弹出节点: {target['instance_id']} "
+                f"(Service: {target['service']})"
+            )
+            eject_started = time.perf_counter()
+            res = cfgmgr32.CM_Request_Device_EjectW(
+                target["dev_inst"],
+                ctypes.byref(veto_type),
+                veto_name,
+                260,
+                0
+            )
+            elapsed = time.perf_counter() - eject_started
+
+            if res == 0:
+                logging.info(f"原生设备弹出成功，耗时 {elapsed:.2f} 秒")
+                return True, "设备已按 Windows 原生方式安全弹出"
+
+            if res == 0x00000017:  # CR_REMOVE_VETOED
+                veto_reason = Win32API._get_veto_reason_str(veto_type.value, veto_name.value)
+                logging.warning(f"原生设备弹出被否决，耗时 {elapsed:.2f} 秒: {veto_reason}")
+                return False, veto_reason
+
+            logging.warning(f"原生设备弹出失败，耗时 {elapsed:.2f} 秒，错误代码: {res}")
+            return False, f"CM_Request_Device_EjectW 失败: {res}"
         except Exception as e:
             logging.error(f"弹出过程发生异常: {e}")
             return False, str(e)
@@ -668,9 +813,9 @@ class Win32API:
             
             # PowerShell 命令：
             # 查找所有 Class 为 DiskDrive 的设备（不仅是 -Present 的，因为有些安全删除后可能不被视为 Present）
-            # 过滤掉没有 Problem 的设备
+            # 过滤掉没有 Problem 的设备，以及 Problem 为 CM_PROB_PHANTOM (已拔出的幽灵设备)
             ps_cmd = """
-            $devices = Get-PnpDevice -Class DiskDrive -ErrorAction SilentlyContinue | Where-Object { $_.Problem -ne 0 -and $_.Problem -ne $null }
+            $devices = Get-PnpDevice -Class DiskDrive -ErrorAction SilentlyContinue | Where-Object { $_.Problem -ne 0 -and $_.Problem -ne $null -and $_.Problem -ne 'CM_PROB_PHANTOM' -and $_.Problem -ne 45 }
             foreach ($dev in $devices) {
                 $parent = Get-PnpDeviceProperty -InstanceId $dev.InstanceId -KeyName DEVPKEY_Device_Parent -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Data
                 Write-Output "$($dev.InstanceId)|$($dev.Problem)|$parent"

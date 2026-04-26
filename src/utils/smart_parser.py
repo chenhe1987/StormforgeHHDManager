@@ -195,11 +195,21 @@ class SmartParser:
         attributes.append(SmartAttribute(1, 'Critical Warning', '严重警告', 100, 100, 0))
         
         # 2. Temperature
-        temp = data.get('Temperature', 0)
+        temp = data.get('Temperature')
+        if temp is None: 
+            temp = 0
+        else:
+            try: temp = int(float(temp))
+            except: temp = 0
         attributes.append(SmartAttribute(2, 'Temperature', '温度', 100, 100, temp))
         
         # 3. Available Spare (Simulate from Wear?)
-        wear = data.get('Wear', 0)
+        wear = data.get('Wear')
+        if wear is None: 
+            wear = 0
+        else:
+            try: wear = int(float(wear))
+            except: wear = 0
         spare = 100 - wear
         attributes.append(SmartAttribute(3, 'Available Spare', '可用备用空间', spare, spare, spare))
         
@@ -209,16 +219,16 @@ class SmartParser:
         # 6. Power On Hours
         hours = data.get('PowerOnHours')
         if hours is not None:
-             attributes.append(SmartAttribute(9, 'Power On Hours', '通电时间', 100, 100, hours))
+             attributes.append(SmartAttribute(9, 'Power On Hours', '通电时间', 100, 100, int(hours)))
              
         # Read/Write Errors
         read_err = data.get('ReadErrorsTotal')
         if read_err is not None:
-            attributes.append(SmartAttribute(0xC9, 'Read Errors Total', '读取错误总数', 100, 100, read_err))
+            attributes.append(SmartAttribute(0xC9, 'Read Errors Total', '读取错误总数', 100, 100, int(read_err)))
             
         write_err = data.get('WriteErrorsTotal')
         if write_err is not None:
-            attributes.append(SmartAttribute(0xCA, 'Write Errors Total', '写入错误总数', 100, 100, write_err))
+            attributes.append(SmartAttribute(0xCA, 'Write Errors Total', '写入错误总数', 100, 100, int(write_err)))
             
         return attributes
 

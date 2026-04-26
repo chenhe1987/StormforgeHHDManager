@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QW
                              QListWidgetItem, QFrame, QScrollArea, QPushButton, QSlider,
                              QDialog, QTextEdit, QFileDialog, QCheckBox, QInputDialog)
 from PySide6.QtGui import QIcon, QAction, QColor, QFont, QPalette, QPixmap
-from PySide6.QtCore import Qt, Slot, Signal, QSize, QThread
+from PySide6.QtCore import Qt, Slot, Signal, QSize, QThread, QTimer
 import logging
 import os
 import time
@@ -14,6 +14,7 @@ import subprocess
 import requests
 import webbrowser
 import ctypes
+import threading
 from ctypes import wintypes
 from datetime import datetime
 
@@ -432,10 +433,17 @@ class MainWindow(QMainWindow):
     def __init__(self):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
-        self.version = "1.3.38"
+        self.version = "1.3.46"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version} (关机保护版)")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
+        
+        # 提高进程关机优先级 (0x280 > 0x100)
+        try:
+            ctypes.windll.kernel32.SetProcessShutdownParameters(0x280, 0)
+            logging.info("进程关机优先级已设置为 0x280")
+        except Exception as e:
+            logging.warning(f"设置关机优先级失败: {e}")
         
         # Initialize Managers
         self.config_manager = ConfigManager()
@@ -787,8 +795,6 @@ class MainWindow(QMainWindow):
 
         self.current_disk_serial = None # Track currently selected disk
         
-        self.config_manager = ConfigManager()
-
         # Start Monitor Service
         logging.info("正在启动监控服务线程...")
         self.monitor_service = MonitorService(
@@ -1140,16 +1146,29 @@ class MainWindow(QMainWindow):
                 if msg.message == WM_QUERYENDSESSION:
                     logging.info("收到系统关机信号 (WM_QUERYENDSESSION)")
                     if self.config_manager.get_shutdown_eject():
+                        # 再次确认阻塞原因 (部分 Windows 版本需要在此处再次调用)
+                        hwnd = int(self.winId())
+                        reason = "正在为您安全弹出所有移动硬盘，请稍候..."
+                        ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
+                        
+                        # 同步执行弹出
                         self.eject_all_removable_disks()
-                    # Must return True (1) to allow shutdown
+                        
+                    # 允许关机
                     return True, 1
+                    
+                elif msg.message == WM_ENDSESSION:
+                    logging.info(f"系统会话结束 (WM_ENDSESSION, wParam={msg.wParam})")
+                    if msg.wParam: # 确认系统真的要关机
+                        # 如果已经在弹出中，这里做最后的等待
+                        pass
         except Exception as e:
             logging.error(f"nativeEvent error: {e}")
             
         return super().nativeEvent(eventType, message)
 
     def eject_all_removable_disks(self):
-        """Synchronously eject all removable disks"""
+        """Synchronously eject all removable disks (Optimized for fast shutdown with parallel execution)"""
         logging.info("正在执行关机自动弹出...")
         
         # 尝试设置关机阻塞原因 (提升用户体验)
@@ -1161,19 +1180,46 @@ class MainWindow(QMainWindow):
             logging.warning(f"设置关机阻塞提示失败: {e}")
 
         try:
-            # Re-enumerate to get current list, or use cached?
-            # Better to get fresh list to avoid ejecting already ejected ones
-            disks = self.device_manager.get_physical_disks()
-            for disk in disks:
-                if disk.is_removable:
-                    logging.info(f"关机保护: 正在尝试弹出硬盘 {disk.model} (Index: {disk.index})...")
-                    # Synchronous eject
-                    success, msg = self.device_manager.safe_eject_disk(
-                        disk.index, 
-                        model=disk.model, 
-                        serial=disk.serial_number
-                    )
-                    logging.info(f"弹出结果: {success} - {msg}")
+            # 优先使用缓存的磁盘数据，避免关机时执行耗时的 WMI 扫描
+            if not hasattr(self, 'disk_data') or not self.disk_data:
+                logging.warning("没有可用的磁盘缓存数据，回退到在线扫描")
+                disks_to_eject = [d for d in self.device_manager.get_physical_disks() if d.is_removable]
+                eject_list = [(d.index, d.model, d.serial_number) for d in disks_to_eject]
+            else:
+                eject_list = [(d.get("index"), d.get("model"), d.get("serial")) 
+                              for d in self.disk_data if d.get("is_removable")]
+
+            if not eject_list:
+                logging.info("没有需要弹出的外置硬盘")
+                return
+
+            import threading
+            from src.core.device_manager import DeviceManager
+            
+            def eject_worker(disk_index, model, serial):
+                try:
+                    logging.info(f"关机保护: 正在尝试快速弹出硬盘 {model} (Index: {disk_index})...")
+                    # 使用完整的安全弹出逻辑（包含卸载卷和休眠），这能防止系统关机时再次唤醒硬盘
+                    DeviceManager.safe_eject_disk(disk_index, model=model, serial=serial)
+                except Exception as e:
+                    logging.error(f"磁盘 {disk_index} 关机弹出异常: {e}")
+
+            threads = []
+            # 并发执行所有硬盘的弹出操作，节省关机等待时间
+            for disk_index, model, serial in eject_list:
+                t = threading.Thread(target=eject_worker, args=(disk_index, model, serial))
+                t.start()
+                threads.append(t)
+            
+            # 等待所有线程完成，严格控制最大总等待时间为 4 秒（Windows 关机超时通常为 5 秒）
+            import time
+            start_time = time.time()
+            for t in threads:
+                remaining = 4.0 - (time.time() - start_time)
+                if remaining > 0:
+                    t.join(timeout=remaining)
+                
+            logging.info("关机自动弹出执行完毕")
         except Exception as e:
             logging.error(f"关机自动弹出执行异常: {e}")
         finally:
@@ -1368,10 +1414,9 @@ class MainWindow(QMainWindow):
             )
             
             if success:
-                QMessageBox.information(self, "操作成功", message)
-                # 3. 强制刷新 UI 显示为“休眠中”
-                if hasattr(self, 'monitor_service'):
-                    self.monitor_service.check_all_smart()
+                self._mark_current_disk_sleeping_in_ui()
+                full_message = message + self._build_windows_sleep_guidance()
+                QMessageBox.information(self, "操作成功", full_message)
             else:
                 # 如果失败了，恢复监控
                 if hasattr(self, 'monitor_service') and self.current_disk_serial:
@@ -1423,14 +1468,90 @@ class MainWindow(QMainWindow):
                 "弹出成功", 
                 f"设备已安全弹出。\n\n{message}\n\n您现在可以安全地拔掉硬盘或关闭电源了。"
             )
-            # 刷新列表
-            self.on_refresh_clicked()
+            # 立即从当前 UI 中移除已弹出的磁盘，避免主线程执行完整刷新导致界面卡顿。
+            self._remove_ejected_disk_from_ui(self.current_disk_serial, self.current_disk_index)
+            self.status_label.setText("设备已弹出，正在后台同步列表...")
+            QTimer.singleShot(200, self._refresh_after_eject_async)
+            QTimer.singleShot(1500, lambda: self.status_label.setText("就绪"))
         else:
             # 如果失败了，尝试在监控中恢复（以便下次重试或继续监控）
             if hasattr(self, 'monitor_service') and self.current_disk_serial:
                 self.monitor_service.mark_disk_awake(self.current_disk_serial)
             
             QMessageBox.warning(self, "弹出失败", f"无法安全弹出设备：\n{message}\n\n请确保没有程序正在使用该磁盘中的文件。")
+
+    def _remove_ejected_disk_from_ui(self, serial, disk_index):
+        """先本地更新列表，避免成功弹出后同步刷新阻塞 UI。"""
+        if not hasattr(self, "disk_data") or not self.disk_data:
+            self.sidebar.clearSelection()
+            return
+
+        remaining_disks = [
+            disk for disk in self.disk_data
+            if not (
+                (serial and disk.get("serial") == serial) or
+                (disk_index is not None and disk.get("index") == disk_index)
+            )
+        ]
+        self.handle_data_update(remaining_disks)
+
+    def _refresh_after_eject_async(self):
+        """后台执行一次轻量同步，避免在主线程里完整刷新造成假死。"""
+        if not hasattr(self, "monitor_service"):
+            return
+
+        def worker():
+            try:
+                self.monitor_service.check_all_smart(force=True)
+            except Exception as e:
+                logging.error(f"弹出后的后台刷新失败: {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _mark_current_disk_sleeping_in_ui(self):
+        """本地直接把当前磁盘标记为休眠，避免立即触发一次全盘扫描导致再次唤醒。"""
+        if not hasattr(self, "disk_data") or not self.disk_data:
+            self.status_label.setText("硬盘已进入休眠状态")
+            return
+
+        updated_disks = []
+        for disk in self.disk_data:
+            updated_disk = dict(disk)
+            if self.current_disk_serial and updated_disk.get("serial") == self.current_disk_serial:
+                updated_disk["status"] = "Sleeping"
+                updated_disk["temp"] = "N/A"
+                updated_disk["reallocated"] = "N/A"
+                updated_disk["pending"] = "N/A"
+            updated_disks.append(updated_disk)
+
+        self.handle_data_update(updated_disks)
+        self.status_label.setText("硬盘已进入休眠状态")
+
+    def _build_windows_sleep_guidance(self):
+        """根据当前电源计划补充休眠建议，避免客户被 Windows 周期性唤醒硬盘。"""
+        settings = Win32API.get_windows_disk_idle_settings()
+        if not settings:
+            return (
+                "\n\n如果硬盘之后又被系统自动唤醒，请检查 Windows 电源计划中的“在此时间后关闭硬盘”设置，"
+                "不要设为“从不”。建议设置为 10-20 分钟。"
+            )
+
+        warnings = []
+        if settings.get("is_never_sleep_ac"):
+            warnings.append("交流电源")
+        if settings.get("is_never_sleep_dc"):
+            warnings.append("电池电源")
+
+        if not warnings:
+            return ""
+
+        warning_text = "、".join(warnings)
+        return (
+            f"\n\n检测到当前 Windows 电源计划的{warning_text}已设置为“从不关闭硬盘”。"
+            "在这种情况下，系统和部分驱动可能会周期性重新唤醒已休眠的机械盘。\n"
+            "建议客户在“控制面板 -> 电源选项 -> 更改计划设置 -> 更改高级电源设置 -> 硬盘 -> 在此时间后关闭硬盘”中，"
+            "把对应项改为 600-1200 秒（10-20 分钟）。"
+        )
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():

@@ -1,6 +1,7 @@
 import wmi
 import logging
 import os
+import time
 from src.hal.win32_api import Win32API
 from src.core.device_renamer import DeviceRenamer
 
@@ -136,83 +137,72 @@ class DeviceManager:
 
     @staticmethod
     def safe_eject_disk(disk_index, model=None, serial=None):
-        """安全弹出物理磁盘，使用 Windows USB 弹出逻辑"""
-        logging.info(f"正在尝试安全弹出磁盘 {disk_index}...")
-        
-        # 1. 首先尝试获取 PNP 设备实例 ID
+        """按更接近 Windows 原生的流程安全弹出物理磁盘，并保留 SLEEP 停转增强"""
+        started_at = time.perf_counter()
+        logging.info("=" * 72)
+        logging.info(
+            f"开始安全弹出磁盘: index={disk_index}, model={model or 'Unknown'}, serial={serial or 'Unknown'}"
+        )
+
+        # 1. 获取该物理盘对应的设备实例 ID
         instance_id = Win32API.get_device_instance_path(disk_index)
         if not instance_id:
             logging.error(f"无法获取磁盘 {disk_index} 的设备实例 ID")
+            logging.info("=" * 72)
             return False, "无法识别设备节点，请尝试重新扫描设备。"
 
-        # 2. 获取并卸载卷
+        logging.info(f"磁盘 {disk_index} 的实例 ID: {instance_id}")
+
+        # 2. 仅记录卷信息，卷释放交给 Windows 原生 eject 处理，避免手动锁卷造成长时间阻塞
         volumes = DeviceManager.get_volumes_for_disk(disk_index)
         if volumes:
-            for vol_letter in volumes:
-                vol_path = f"\\\\.\\{vol_letter}"
-                logging.info(f"正在预卸载卷: {vol_letter}")
-                
-                # 尝试打开卷
-                handle = Win32API.open_volume(vol_path)
-                if handle:
-                    try:
-                        # 锁定卷 (尝试，如果不成功也继续，因为后续 PnP 弹出会有最终否决权)
-                        if Win32API.lock_volume(handle):
-                            logging.info(f"卷 {vol_letter} 锁定成功")
-                            if Win32API.dismount_volume(handle):
-                                logging.info(f"卷 {vol_letter} 卸载成功")
-                        else:
-                            logging.warning(f"卷 {vol_letter} 锁定失败，可能被其他进程占用")
-                    finally:
-                        Win32API.close_handle(handle)
-                else:
-                    logging.warning(f"无法打开卷 {vol_letter} 的句柄")
+            logging.info(f"磁盘 {disk_index} 当前关联卷: {', '.join(volumes)}")
         else:
             logging.info(f"磁盘 {disk_index} 上未发现活动卷")
 
-        # 3. 发送进入深度休眠指令 (SLEEP)
-        # 关键修复：使用 ATA SLEEP (0xE6) 而非 STANDBY IMMEDIATE。
-        # SLEEP 命令会让硬盘进入最低功耗状态，且除非断电重连或硬件复位，否则不会因为 OS 扫描而起旋。
-        # 这能彻底解决弹出瞬间硬盘重新旋转的问题。
+        sleep_success = False
+
+        # 3. 发送短超时 SLEEP 指令，作为“停转增强”而不是主流程阻塞点
         try:
-            import time
             from src.hal.asm_commander import ASMCommander
             logging.info(f"正在发送 SLEEP 命令到磁盘 {disk_index}...")
+            sleep_started = time.perf_counter()
             with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
-                # 增加重试机制
-                sleep_success = False
-                for attempt in range(2):
-                    if cmd.sleep():
-                        logging.info(f"磁盘 {disk_index} 已进入深度休眠 (SLEEP)")
-                        sleep_success = True
-                        break
-                    else:
-                        logging.warning(f"第 {attempt+1} 次 SLEEP 命令尝试失败")
-                        time.sleep(0.5)
-                
-                if sleep_success:
-                    time.sleep(1.5) # 给硬盘一点时间完成磁头归位和停转
-                else:
-                    logging.warning(f"磁盘 {disk_index} SLEEP 命令最终失败，尝试普通停转...")
-                    cmd.spin_down()
+                sleep_success = cmd.sleep()
+
+            sleep_elapsed = time.perf_counter() - sleep_started
+            if sleep_success:
+                logging.info(f"磁盘 {disk_index} 已进入深度休眠 (SLEEP)，耗时 {sleep_elapsed:.2f} 秒")
+                time.sleep(0.8)
+            else:
+                logging.warning(f"磁盘 {disk_index} 的 SLEEP 命令未成功，耗时 {sleep_elapsed:.2f} 秒")
         except Exception as e:
             logging.error(f"磁盘 {disk_index} 停转操作发生异常: {e}")
 
-        # 4. 最后使用 CfgMgr32 进行 PnP 设备弹出
-        logging.info(f"正在请求移除设备节点: {instance_id}")
+        # 4. 使用更接近 Windows 原生行为的设备节点弹出策略
+        logging.info(f"正在按 Windows 原生策略请求移除设备节点: {instance_id}")
         success, message = Win32API.eject_device_by_instance_id(instance_id)
-        
+
+        total_elapsed = time.perf_counter() - started_at
         if success:
-            logging.info(f"磁盘 {disk_index} 设备节点移除成功")
-            return True, "设备已安全弹出并停转。硬盘磁头已归位，马达已停止。"
-        else:
-            # 特殊情况处理：虽然 PnP 节点移除失败（通常是因为 Hub 被占用），但如果停转成功，用户依然可以安全拔掉。
-            if "ROOT_HUB" in message or "PNP_VetoNonRecursive" in message or "代码: 8" in message:
-                logging.warning(f"磁盘 {disk_index} 停转成功但节点移除被否决: {message}")
-                return True, "设备已成功停转并卸载卷。提示：由于 USB 控制器正在管理其他设备，系统节点未彻底移除，但您可以安全拔掉该硬盘。"
-            
-            logging.error(f"磁盘 {disk_index} 弹出最终失败: {message}")
-            return False, f"停转成功但系统拒绝移除节点: {message}\n请检查是否有程序（如资源管理器）正在访问该盘符。"
+            logging.info(f"磁盘 {disk_index} 设备节点移除成功，总耗时 {total_elapsed:.2f} 秒")
+            logging.info(f"安全弹出完成: index={disk_index}, sleep_success={sleep_success}, total={total_elapsed:.2f}s")
+            logging.info("=" * 72)
+            if sleep_success:
+                return True, "设备已按 Windows 原生方式安全弹出，并已发送停转命令。"
+            return True, "设备已按 Windows 原生方式安全弹出。"
+
+        # 某些桥接芯片会拒绝彻底移除节点，但盘体已停转时，依然可以允许用户拔盘。
+        if sleep_success and ("PNP_VetoNonRecursive" in message or "代码: 8" in message or "不可卸载" in message):
+            logging.warning(f"磁盘 {disk_index} 节点移除被否决，但盘已停转，总耗时 {total_elapsed:.2f} 秒: {message}")
+            logging.info(f"安全弹出降级成功: index={disk_index}, total={total_elapsed:.2f}s, reason={message}")
+            logging.info("=" * 72)
+            return True, "硬盘已停转。虽然 Windows 未彻底移除设备节点，但该盘已可安全拔出。"
+
+        logging.error(f"磁盘 {disk_index} 弹出最终失败，总耗时 {total_elapsed:.2f} 秒: {message}")
+        logging.info(f"安全弹出失败: index={disk_index}, total={total_elapsed:.2f}s, reason={message}")
+        logging.info("=" * 72)
+        return False, f"Windows 原生弹出失败: {message}"
 
 if __name__ == "__main__":
     # Test disk enumeration

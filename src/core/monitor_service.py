@@ -29,6 +29,9 @@ class MonitorService(threading.Thread):
         self.disk_health_status = {} # {serial: summary}
         self.disk_last_check_times = {} # {serial: timestamp}
         self.sleeping_disks = set() # {serial} - Disks that should not be polled
+        self.cached_disks = []
+        self.last_inventory_scan_time = 0
+        self.device_inventory_interval = 60
         self.scan_lock = threading.Lock()
 
     def run(self):
@@ -63,14 +66,7 @@ class MonitorService(threading.Thread):
     def check_disks_schedule(self):
         """Check each disk independently based on its configured interval"""
         try:
-            # We need to know which disks are available.
-            # Ideally we maintain a list of active disks.
-            # For now, let's re-scan physical disks list quickly or cache it?
-            # Re-scanning WMI every 10s might be heavy.
-            # But we need to handle hot-plug.
-            # Let's assume we scan list every minute or so?
-            # Or just scan all now.
-            disks = DeviceManager.get_physical_disks()
+            disks = self._get_cached_or_scan_disks(force=False)
             current_time = time.time()
             
             disks_to_check = []
@@ -97,6 +93,26 @@ class MonitorService(threading.Thread):
         # Let's refactor check_all_smart to accept a list of disks.
         self.check_all_smart(target_disks=disks)
 
+    def _get_cached_or_scan_disks(self, force=False):
+        """
+        获取磁盘列表。
+        只要存在手动休眠的硬盘，后台就完全冻结自动重新枚举，直到用户手动唤醒或执行刷新。
+        """
+        now = time.time()
+
+        if self.sleeping_disks and not force:
+            logging.info(f"检测到 {len(self.sleeping_disks)} 个手动休眠硬盘，后台停止自动重扫，直接复用缓存")
+            return list(self.cached_disks)
+
+        if force or not self.cached_disks or now - self.last_inventory_scan_time >= self.device_inventory_interval:
+            self.cached_disks = DeviceManager.get_physical_disks()
+            self.last_inventory_scan_time = now
+            logging.info(f"更新物理磁盘缓存: {len(self.cached_disks)} 个设备")
+        else:
+            logging.info(f"复用物理磁盘缓存: {len(self.cached_disks)} 个设备")
+
+        return list(self.cached_disks)
+
     def check_all_smart(self, force=False, target_disks=None):
         if not self.scan_lock.acquire(blocking=False):
             if force:
@@ -116,7 +132,7 @@ class MonitorService(threading.Thread):
         logging.info("执行 SMART 健康检测...")
         try:
             if target_disks is None:
-                disks = DeviceManager.get_physical_disks()
+                disks = self._get_cached_or_scan_disks(force=force)
             else:
                 disks = target_disks
                 
@@ -164,7 +180,13 @@ class MonitorService(threading.Thread):
                       "990 PRO" in model_upper or
                       "SOLIDIGM" in model_upper or
                       "WD_BLACK" in model_upper or
-                      ("SSD" in model_upper and disk.interface_type == "IDE"))
+                      "TIPLUS" in model_upper or
+                      "KIOXIA" in model_upper)
+                      
+            # 根据用户要求，在程序中彻底屏蔽 NVMe 硬盘的展示
+            if is_nvme:
+                logging.info(f"屏蔽 NVMe 硬盘的展示: {disk.model}")
+                continue
             
             logging.info(f"DEBUG: 磁盘 {disk.index} ({disk.model}) Interface: {disk.interface_type}, is_nvme: {is_nvme}")
             
@@ -249,6 +271,43 @@ class MonitorService(threading.Thread):
                             if raw_data:
                                 attributes = SmartParser.parse_512(raw_data)
 
+                    # 4. 如果所有底层 API 均失败，尝试 PowerShell / WMI 回退 (通用)
+                    if not attributes:
+                        logging.info(f"DEBUG: 底层 API 读取失败，尝试通过 WMI 获取 SMART (硬盘 {disk.index})...")
+                        try:
+                            import wmi
+                            w = wmi.WMI(namespace="root/Microsoft/Windows/Storage")
+                            counters = w.MSFT_StorageReliabilityCounter(DeviceId=str(disk.index))
+                            if counters:
+                                counter = counters[0]
+                                data = {
+                                    'Temperature': getattr(counter, 'Temperature', 0),
+                                    'Wear': getattr(counter, 'Wear', 0),
+                                    'PowerOnHours': getattr(counter, 'PowerOnHours', 0),
+                                    'ReadErrorsTotal': getattr(counter, 'ReadErrorsTotal', 0),
+                                    'WriteErrorsTotal': getattr(counter, 'WriteErrorsTotal', 0)
+                                }
+                                logging.info(f"DEBUG: WMI 获取 NVMe SMART 成功: {data}")
+                                attributes = SmartParser.parse_powershell_nvme(data)
+                        except Exception as e:
+                            logging.debug(f"WMI NVMe fallback failed: {e}")
+                            
+                        # 如果 WMI 失败，尝试 PowerShell 作为最后手段
+                        if not attributes:
+                            try:
+                                import subprocess, json
+                                ps_cmd = f'powershell -NoProfile -Command "Get-PhysicalDisk -DeviceNumber {disk.index} | Get-StorageReliabilityCounter | Select-Object DeviceId, Temperature, Wear, PowerOnHours, ReadErrorsTotal, WriteErrorsTotal | ConvertTo-Json"'
+                                output = subprocess.check_output(ps_cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+                                if output and output.strip():
+                                    data = json.loads(output)
+                                    if isinstance(data, list) and len(data) > 0:
+                                        data = data[0]
+                                    if data and isinstance(data, dict):
+                                        logging.info(f"DEBUG: PowerShell 获取 NVMe SMART 成功")
+                                        attributes = SmartParser.parse_powershell_nvme(data)
+                            except Exception as e:
+                                logging.debug(f"PowerShell NVMe fallback failed: {e}")
+
                     if attributes:
                         logging.info(f"DEBUG: 硬盘 {disk.index} 数据解析成功")
                         current_serial = disk_info["serial"]
@@ -315,6 +374,8 @@ class MonitorService(threading.Thread):
         if serial in self.sleeping_disks:
             logging.info(f"将硬盘标记为唤醒: {serial}")
             self.sleeping_disks.remove(serial)
+            # 醒来后尽快允许下一次重新枚举，保证设备列表及时同步。
+            self.last_inventory_scan_time = 0
 
     def stop(self):
         self.running = False
