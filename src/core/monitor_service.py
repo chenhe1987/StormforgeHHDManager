@@ -14,6 +14,7 @@ class MonitorService(threading.Thread):
         super().__init__()
         self.daemon = True
         self.running = True
+        self.shutdown_mode = False
         self.callback_notify = callback_notify # Function to call for notifications (title, msg)
         self.callback_update_ui = callback_update_ui # Function to call to update UI data (data_dict)
         
@@ -29,6 +30,7 @@ class MonitorService(threading.Thread):
         self.disk_health_status = {} # {serial: summary}
         self.disk_last_check_times = {} # {serial: timestamp}
         self.sleeping_disks = set() # {serial} - Disks that should not be polled
+        self.ejected_disks = set() # {serial} - Disks successfully ejected; ignore until manual refresh
         self.cached_disks = []
         self.last_inventory_scan_time = 0
         self.device_inventory_interval = 60
@@ -42,6 +44,10 @@ class MonitorService(threading.Thread):
         self.last_event_check = time.time()
 
         while self.running:
+            if self.shutdown_mode:
+                logging.info("监控服务进入关机静默模式，停止后台检测")
+                break
+
             current_time = time.time()
             
             # 1. Check Event Log (High frequency, no disk wake-up)
@@ -65,6 +71,10 @@ class MonitorService(threading.Thread):
 
     def check_disks_schedule(self):
         """Check each disk independently based on its configured interval"""
+        if self.shutdown_mode:
+            logging.info("关机静默模式下跳过定时磁盘检测")
+            return
+
         try:
             disks = self._get_cached_or_scan_disks(force=False)
             current_time = time.time()
@@ -100,6 +110,10 @@ class MonitorService(threading.Thread):
         """
         now = time.time()
 
+        if self.shutdown_mode:
+            logging.info("关机静默模式下复用现有磁盘缓存，不再重新枚举")
+            return self._filter_excluded_disks(self.cached_disks)
+
         if self.sleeping_disks and not force:
             logging.info(f"检测到 {len(self.sleeping_disks)} 个手动休眠硬盘，后台停止自动重扫，直接复用缓存")
             return list(self.cached_disks)
@@ -111,7 +125,7 @@ class MonitorService(threading.Thread):
         else:
             logging.info(f"复用物理磁盘缓存: {len(self.cached_disks)} 个设备")
 
-        return list(self.cached_disks)
+        return self._filter_excluded_disks(self.cached_disks)
 
     def check_all_smart(self, force=False, target_disks=None):
         if not self.scan_lock.acquire(blocking=False):
@@ -130,6 +144,10 @@ class MonitorService(threading.Thread):
 
     def _check_all_smart_impl(self, force=False, target_disks=None):
         logging.info("执行 SMART 健康检测...")
+        if self.shutdown_mode:
+            logging.info("关机静默模式下跳过 SMART 健康检测")
+            return
+
         try:
             if target_disks is None:
                 disks = self._get_cached_or_scan_disks(force=force)
@@ -146,7 +164,15 @@ class MonitorService(threading.Thread):
         current_time = time.time()
         
         for disk in disks:
+            if self.shutdown_mode:
+                logging.info("检测过程中收到关机静默请求，提前结束本轮 SMART 检测")
+                break
+
             serial = disk.serial_number
+
+            if serial in self.ejected_disks:
+                logging.info(f"跳过已弹出的硬盘: {disk.model} ({serial})")
+                continue
             
             # Check if disk is marked as sleeping
             if serial in self.sleeping_disks and not force:
@@ -368,14 +394,52 @@ class MonitorService(threading.Thread):
     def mark_disk_sleeping(self, serial):
         if serial:
             logging.info(f"将硬盘标记为休眠: {serial}")
+            self.ejected_disks.discard(serial)
             self.sleeping_disks.add(serial)
 
+    def mark_disk_ejected(self, serial):
+        if serial:
+            logging.info(f"将硬盘标记为已弹出: {serial}")
+            self.sleeping_disks.discard(serial)
+            self.ejected_disks.add(serial)
+            self.cached_disks = [
+                disk for disk in self.cached_disks
+                if getattr(disk, "serial_number", None) != serial
+            ]
+            self.disk_health_status.pop(serial, None)
+            self.disk_last_check_times.pop(serial, None)
+            # 允许后续正常扫描剩余设备，但不要再把已弹出的设备重新加回来，直到用户手动刷新。
+            self.last_inventory_scan_time = 0
+
     def mark_disk_awake(self, serial):
+        changed = False
         if serial in self.sleeping_disks:
             logging.info(f"将硬盘标记为唤醒: {serial}")
             self.sleeping_disks.remove(serial)
+            changed = True
+        if serial in self.ejected_disks:
+            logging.info(f"将硬盘从已弹出名单移除: {serial}")
+            self.ejected_disks.remove(serial)
+            changed = True
+        if changed:
             # 醒来后尽快允许下一次重新枚举，保证设备列表及时同步。
             self.last_inventory_scan_time = 0
 
+    def clear_disk_exclusions(self):
+        """手动刷新时清空休眠/已弹出屏蔽名单，允许系统重新发现设备。"""
+        self.sleeping_disks.clear()
+        self.ejected_disks.clear()
+        self.last_inventory_scan_time = 0
+
+    def _filter_excluded_disks(self, disks):
+        if not self.ejected_disks:
+            return list(disks)
+        return [
+            disk for disk in disks
+            if getattr(disk, "serial_number", None) not in self.ejected_disks
+        ]
+
     def stop(self):
+        logging.info("监控服务收到停止请求")
+        self.shutdown_mode = True
         self.running = False

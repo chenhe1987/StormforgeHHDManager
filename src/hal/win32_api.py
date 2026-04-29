@@ -24,6 +24,7 @@ ENDSESSION_LOGOFF = 0x80000000
 CR_SUCCESS = 0x00000000
 CM_LOCATE_DEVNODE_NORMAL = 0x00000000
 CM_LOCATE_DEVNODE_PHANTOM = 0x00000001
+CM_REMOVE_UI_NOT_OK = 0x00000002
 
 IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x4D014
 IOCTL_ATA_PASS_THROUGH = 0x4D02C
@@ -141,9 +142,10 @@ class Win32API:
     def open_volume(volume_path):
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
         kernel32.CreateFileW.restype = ctypes.c_void_p
-        
+
+        normalized_path = Win32API.normalize_volume_device_path(volume_path) or volume_path
         handle = kernel32.CreateFileW(
-            volume_path,
+            normalized_path,
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
@@ -151,8 +153,9 @@ class Win32API:
             0,
             None
         )
-        
+
         if handle == 0 or handle == 0xFFFFFFFFFFFFFFFF or handle == -1:
+            logging.warning(f"打开卷句柄失败: {normalized_path}, error={ctypes.get_last_error()}")
             return None
         return handle
 
@@ -187,6 +190,194 @@ class Win32API:
     def eject_media(handle):
         result, _, _ = Win32API.device_io_control(handle, IOCTL_STORAGE_EJECT_MEDIA, None, 0, None, 0)
         return bool(result)
+
+    @staticmethod
+    def normalize_volume_device_path(volume_name):
+        """将 'E:' 之类的盘符统一为卷设备路径 '\\\\.\\E:'。"""
+        volume_root = Win32API.normalize_volume_root(volume_name)
+        if not volume_root:
+            return None
+        return f"\\\\.\\{volume_root[0]}:"
+
+    @staticmethod
+    def normalize_volume_root(volume_name):
+        """将 'E:' 之类的盘符统一为 Shell 可接受的根路径 'E:\\'。"""
+        if not volume_name:
+            return None
+
+        volume_name = volume_name.strip().rstrip("\\/")
+        if re.fullmatch(r"[A-Za-z]:", volume_name):
+            return f"{volume_name}\\"
+        if re.fullmatch(r"[A-Za-z]:[\\/]", volume_name):
+            return f"{volume_name[0]}:\\"
+        return None
+
+    @staticmethod
+    def is_volume_present(volume_name):
+        """检查盘符当前是否仍由系统挂载。"""
+        volume_root = Win32API.normalize_volume_root(volume_name)
+        if not volume_root:
+            return False
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        drive_type = kernel32.GetDriveTypeW(volume_root)
+        return drive_type != 1  # DRIVE_NO_ROOT_DIR
+
+    @staticmethod
+    def flush_volume_buffers(handle):
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        result = kernel32.FlushFileBuffers(handle)
+        return bool(result), ctypes.get_last_error()
+
+    @staticmethod
+    def prepare_volume_for_safe_removal(volume_name, lock_timeout_seconds=1.5, retry_interval=0.2):
+        """
+        对卷执行短超时的 lock + dismount。
+        设备节点移除前由上层决定何时释放卷句柄，避免卷对象长期被当前进程持有。
+        """
+        volume_root = Win32API.normalize_volume_root(volume_name)
+        volume_path = Win32API.normalize_volume_device_path(volume_name)
+        if not volume_root or not volume_path:
+            return False, f"无效盘符: {volume_name}", None
+        volume_label = volume_root.rstrip("\\")
+
+        handle = Win32API.open_volume(volume_name)
+        if not handle:
+            return False, f"无法打开卷句柄: {volume_label}", None
+
+        try:
+            flush_ok, flush_error = Win32API.flush_volume_buffers(handle)
+            if not flush_ok:
+                logging.debug(f"卷 {volume_root} FlushFileBuffers 未成功，error={flush_error}")
+
+            deadline = time.perf_counter() + lock_timeout_seconds
+            last_error = 0
+            while time.perf_counter() < deadline:
+                result, _, last_error = Win32API.device_io_control(handle, FSCTL_LOCK_VOLUME, None, 0, None, 0)
+                if result:
+                    logging.info(f"卷 {volume_root} 已锁定")
+                    break
+                time.sleep(retry_interval)
+            else:
+                # 尝试使用 Restart Manager 获取占用程序
+                occupying_apps = []
+                try:
+                    from src.utils.restart_manager import get_locking_processes
+                    occupying_apps = get_locking_processes(volume_root)
+                except Exception as rm_err:
+                    logging.debug(f"获取占用程序失败: {rm_err}")
+                    
+                msg = f"卷仍被占用，无法锁定 (error={last_error})"
+                if occupying_apps:
+                    msg += f"，可能被以下程序占用: {', '.join(occupying_apps)}"
+                    
+                return False, msg, handle
+
+            result, _, dismount_error = Win32API.device_io_control(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0)
+            if not result:
+                return False, f"卷锁定成功，但卸载失败 (error={dismount_error})", handle
+
+            logging.info(f"卷 {volume_root} 已锁定并卸载")
+            return True, "卷已锁定并卸载", handle
+        except Exception as e:
+            return False, f"卷预处理异常: {e}", handle
+
+    @staticmethod
+    def prepare_volumes_for_safe_removal(volumes, lock_timeout_seconds=1.5):
+        prepared = []
+        failures = []
+        seen = set()
+
+        for volume in volumes or []:
+            volume_root = Win32API.normalize_volume_root(volume)
+            if not volume_root or volume_root in seen:
+                continue
+            seen.add(volume_root)
+
+            success, message, handle = Win32API.prepare_volume_for_safe_removal(
+                volume,
+                lock_timeout_seconds=lock_timeout_seconds,
+            )
+            if success and handle:
+                prepared.append({
+                    "volume": volume_root.rstrip("\\"),
+                    "handle": handle,
+                })
+            else:
+                failures.append({
+                    "volume": volume_root.rstrip("\\"),
+                    "message": message,
+                })
+                if handle:
+                    Win32API.close_handle(handle)
+
+        return prepared, failures
+
+    @staticmethod
+    def release_prepared_volumes(prepared_volumes):
+        for item in prepared_volumes or []:
+            handle = item.get("handle")
+            volume = item.get("volume", "<unknown>")
+            try:
+                if handle:
+                    Win32API.close_handle(handle)
+                    logging.info(f"已释放卷句柄: {volume}")
+            except Exception as e:
+                logging.warning(f"释放卷句柄失败 {volume}: {e}")
+
+    @staticmethod
+    def eject_volume_by_drive_letter(volume_name, expected_volumes=None, timeout_seconds=12.0, poll_interval=0.25):
+        """
+        通过 Shell 的 Eject 动作触发和资源管理器一致的原生弹出流程。
+        成功发起后，轮询关联盘符是否全部消失，用于确认系统已完成卸载。
+        """
+        volume_root = Win32API.normalize_volume_root(volume_name)
+        if not volume_root:
+            return False, f"无效盘符: {volume_name}"
+
+        expected = []
+        for item in expected_volumes or [volume_name]:
+            normalized = Win32API.normalize_volume_root(item)
+            if normalized and normalized not in expected:
+                expected.append(normalized)
+        if not expected:
+            expected = [volume_root]
+
+        shell32 = ctypes.WinDLL('shell32', use_last_error=True)
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        shell32.ShellExecuteW.argtypes = [
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+
+        logging.info(
+            f"正在调用 Windows Shell 原生弹出: target={volume_root}, expected={', '.join(expected)}"
+        )
+        result = shell32.ShellExecuteW(None, "Eject", volume_root, None, None, 0)
+        result_code = ctypes.cast(result, ctypes.c_void_p).value or 0
+        if result_code <= 32:
+            last_error = ctypes.get_last_error()
+            logging.warning(
+                f"Shell 原生弹出调用失败: target={volume_root}, return={result_code}, last_error={last_error}"
+            )
+            return False, f"Windows Shell 原生弹出调用失败: {result_code}"
+
+        deadline = time.perf_counter() + timeout_seconds
+        while time.perf_counter() < deadline:
+            remaining = [item for item in expected if Win32API.is_volume_present(item)]
+            if not remaining:
+                logging.info(f"Windows Shell 原生弹出完成，相关盘符已卸载: {', '.join(expected)}")
+                return True, "设备已按 Windows 原生方式安全弹出"
+            time.sleep(poll_interval)
+
+        remaining = [item for item in expected if Win32API.is_volume_present(item)]
+        remaining_display = ", ".join(item.rstrip("\\") for item in remaining) if remaining else ", ".join(expected)
+        logging.warning(f"Windows Shell 原生弹出超时，仍在线的盘符: {remaining_display}")
+        return False, f"Windows 原生弹出未完成，卷仍处于挂载状态: {remaining_display}"
 
     @staticmethod
     def rescan_hardware():
@@ -561,43 +752,102 @@ class Win32API:
             return None
 
     @staticmethod
-    def eject_device_by_instance_id(instance_id):
-        """使用更接近 Windows 原生行为的节点进行单次设备弹出"""
+    def _locate_devnode(instance_id):
         try:
             cfgmgr32 = ctypes.WinDLL('cfgmgr32')
-
-            target = Win32API.find_native_eject_target(instance_id)
-            if not target:
-                return False, "未找到对应的 USB-SATA 可弹出节点"
-
-            veto_type = ctypes.c_int(0)
-            veto_name = (ctypes.c_wchar * 260)()
-
-            logging.info(
-                f"正在按原生策略弹出节点: {target['instance_id']} "
-                f"(Service: {target['service']})"
-            )
-            eject_started = time.perf_counter()
-            res = cfgmgr32.CM_Request_Device_EjectW(
-                target["dev_inst"],
-                ctypes.byref(veto_type),
-                veto_name,
-                260,
-                0
-            )
-            elapsed = time.perf_counter() - eject_started
-
+            dev_inst = wintypes.DWORD()
+            res = cfgmgr32.CM_Locate_DevNodeW(ctypes.byref(dev_inst), instance_id, 0)
             if res == 0:
-                logging.info(f"原生设备弹出成功，耗时 {elapsed:.2f} 秒")
-                return True, "设备已按 Windows 原生方式安全弹出"
+                return dev_inst
+            logging.warning(f"CM_Locate_DevNodeW 失败，无法定位设备节点 {instance_id}: {res}")
+        except Exception as e:
+            logging.error(f"定位设备节点失败 {instance_id}: {e}")
+        return None
 
-            if res == 0x00000017:  # CR_REMOVE_VETOED
-                veto_reason = Win32API._get_veto_reason_str(veto_type.value, veto_name.value)
-                logging.warning(f"原生设备弹出被否决，耗时 {elapsed:.2f} 秒: {veto_reason}")
-                return False, veto_reason
+    @staticmethod
+    def _call_request_device_eject(cfgmgr32, dev_inst, display_name):
+        veto_type = ctypes.c_int(0)
+        veto_name = (ctypes.c_wchar * 260)()
 
-            logging.warning(f"原生设备弹出失败，耗时 {elapsed:.2f} 秒，错误代码: {res}")
-            return False, f"CM_Request_Device_EjectW 失败: {res}"
+        logging.info(f"正在请求弹出节点: {display_name}")
+        started_at = time.perf_counter()
+        res = cfgmgr32.CM_Request_Device_EjectW(
+            dev_inst,
+            ctypes.byref(veto_type),
+            veto_name,
+            260,
+            0
+        )
+        elapsed = time.perf_counter() - started_at
+        return res, veto_type.value, veto_name.value, elapsed
+
+    @staticmethod
+    def _call_query_and_remove_subtree(cfgmgr32, dev_inst, display_name):
+        veto_type = ctypes.c_int(0)
+        veto_name = (ctypes.c_wchar * 260)()
+
+        logging.info(f"正在请求移除设备子树: {display_name}")
+        started_at = time.perf_counter()
+        res = cfgmgr32.CM_Query_And_Remove_SubTreeW(
+            dev_inst,
+            ctypes.byref(veto_type),
+            veto_name,
+            260,
+            CM_REMOVE_UI_NOT_OK
+        )
+        elapsed = time.perf_counter() - started_at
+        return res, veto_type.value, veto_name.value, elapsed
+
+    @staticmethod
+    def eject_device_by_instance_id(instance_id):
+        """
+        弹出设备，模拟“安全删除硬件”。
+        对于基于 UASP/USB 桥接芯片的硬盘柜，需要找到最合适的父节点。
+        """
+        try:
+            cfgmgr32 = ctypes.WinDLL('cfgmgr32')
+            
+            # 1. 查找最适合弹出的节点
+            target_info = Win32API.find_native_eject_target(instance_id)
+            
+            if target_info:
+                target_id = target_info['instance_id']
+                dev_inst = target_info['dev_inst']
+                logging.info(f"找到最佳弹出节点: {target_id} (得分: {target_info['score']}, 服务: {target_info.get('service')})")
+                
+                # 使用 CM_Request_Device_EjectW 弹出
+                res, veto_type, veto_name, elapsed = Win32API._call_request_device_eject(
+                    cfgmgr32, dev_inst, target_id
+                )
+                
+                if res == 0:
+                    logging.info(f"原生设备弹出成功，耗时 {elapsed:.2f} 秒")
+                    return True, "设备已安全移除"
+                else:
+                    reason = Win32API._get_veto_reason_str(veto_type, veto_name)
+                    logging.warning(f"原生设备弹出失败，耗时 {elapsed:.2f} 秒: {reason}")
+                    # 不在此处直接 return False，而是继续尝试向下回退到移除原始磁盘节点。
+                    # 因为对于多盘位硬盘盒，如果其他盘被占用，父节点 (USB) 的弹出会被否决，
+                    # 但目标子节点 (SCSI\\DISK) 仍然可以被单独卸载。
+            else:
+                logging.warning("未找到最佳弹出节点，将尝试直接移除原始磁盘节点")
+
+            # 2. 如果原生弹出失败或找不到，退回到 CM_Query_And_Remove_SubTreeW 移除磁盘节点本身
+            original_dev_inst = Win32API._locate_devnode(instance_id)
+            if original_dev_inst:
+                res, veto_type, veto_name, elapsed = Win32API._call_query_and_remove_subtree(
+                    cfgmgr32, original_dev_inst, instance_id
+                )
+                
+                if res == 0:
+                    logging.info(f"原始磁盘节点移除成功，耗时 {elapsed:.2f} 秒")
+                    return True, "设备已安全移除（节点卸载）"
+                    
+                reason = Win32API._get_veto_reason_str(veto_type, veto_name)
+                logging.warning(f"原始磁盘节点移除被否决，耗时 {elapsed:.2f} 秒: {reason}")
+                return False, reason
+
+            return False, "无法定位原始磁盘节点"
         except Exception as e:
             logging.error(f"弹出过程发生异常: {e}")
             return False, str(e)
@@ -644,12 +894,14 @@ class Win32API:
             3: "驱动程序拒绝请求 (PNP_VetoOutstandingOpen)",
             4: "设备仍有挂起的 I/O 操作 (PNP_VetoDevice)",
             5: "驱动程序不支持弹出 (PNP_VetoDriver)",
-            6: "设备不可卸载 (PNP_VetoIllegalDeviceRequest)",
+            6: "设备被占用或不可卸载 (PNP_VetoIllegalDeviceRequest)",
             7: "有子设备正在运行 (PNP_VetoInsufficientPower)",
             8: "权限不足或非可弹出节点 (PNP_VetoNonRecursive)",
             # ... 更多类型可以根据需要添加
         }
         reason = veto_types.get(veto_type, f"未知原因 (代码: {veto_type})")
+        if veto_name and veto_name.upper().startswith("STORAGE\\VOLUME"):
+            return "磁盘正被系统或其他程序占用（如资源管理器、杀毒软件等），请关闭相关程序或窗口后重试"
         if veto_name:
             reason += f" - 涉及对象: {veto_name}"
         return reason

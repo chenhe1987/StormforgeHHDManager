@@ -4,12 +4,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-DIST_DIR = ROOT / "dist146"
-BUILD_DIR = ROOT / "build146"
-SPEC_FILE = ROOT / "build_146.spec"
-PACKAGE_DIR = DIST_DIR / "疾风知硬盘柜管理_v1.3.46"
-ZIP_BASE = DIST_DIR / "疾风知硬盘柜管理_v1.3.46"
-LOG_FILE = ROOT / "pyinstaller_146_output.txt"
+DIST_DIR = ROOT / "dist"
+BUILD_DIR = ROOT / "build"
+SPEC_FILE = ROOT / "build_159.spec"
+PACKAGE_DIR = DIST_DIR / "疾风知硬盘柜管理_v1.3.59"
+ZIP_BASE = DIST_DIR / "疾风知硬盘柜管理_v1.3.59"
+LOG_FILE = ROOT / "pyinstaller_159_output.txt"
 
 
 def main():

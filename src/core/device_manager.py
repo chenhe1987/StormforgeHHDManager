@@ -137,7 +137,7 @@ class DeviceManager:
 
     @staticmethod
     def safe_eject_disk(disk_index, model=None, serial=None):
-        """按更接近 Windows 原生的流程安全弹出物理磁盘，并保留 SLEEP 停转增强"""
+        """先尝试停转，再按 Windows 安全删除硬件的思路弹出设备。"""
         started_at = time.perf_counter()
         logging.info("=" * 72)
         logging.info(
@@ -160,49 +160,80 @@ class DeviceManager:
         else:
             logging.info(f"磁盘 {disk_index} 上未发现活动卷")
 
-        sleep_success = False
-
-        # 3. 发送短超时 SLEEP 指令，作为“停转增强”而不是主流程阻塞点
+        # 释放 WMI COM 对象，防止它们占用卷句柄导致后续的锁卷和弹出失败
+        import gc
+        gc.collect()
         try:
-            from src.hal.asm_commander import ASMCommander
-            logging.info(f"正在发送 SLEEP 命令到磁盘 {disk_index}...")
-            sleep_started = time.perf_counter()
-            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
-                sleep_success = cmd.sleep()
+            import pythoncom
+            pythoncom.CoFreeUnusedLibraries()
+        except Exception:
+            pass
 
-            sleep_elapsed = time.perf_counter() - sleep_started
-            if sleep_success:
-                logging.info(f"磁盘 {disk_index} 已进入深度休眠 (SLEEP)，耗时 {sleep_elapsed:.2f} 秒")
-                time.sleep(0.8)
-            else:
-                logging.warning(f"磁盘 {disk_index} 的 SLEEP 命令未成功，耗时 {sleep_elapsed:.2f} 秒")
-        except Exception as e:
-            logging.error(f"磁盘 {disk_index} 停转操作发生异常: {e}")
+        prepared_volumes = []
+        volume_failures = []
 
-        # 4. 使用更接近 Windows 原生行为的设备节点弹出策略
-        logging.info(f"正在按 Windows 原生策略请求移除设备节点: {instance_id}")
-        success, message = Win32API.eject_device_by_instance_id(instance_id)
+        # 3. 对关联卷做短超时 lock + dismount，尽量还原 Windows 安全删除前的卷处理状态。
+        if volumes:
+            prepared_volumes, volume_failures = Win32API.prepare_volumes_for_safe_removal(
+                volumes,
+                lock_timeout_seconds=3.0,
+            )
+            if prepared_volumes:
+                logging.info(
+                    "卷预处理成功: " + ", ".join(item["volume"] for item in prepared_volumes)
+                )
+            if volume_failures:
+                logging.warning(
+                    "部分卷预处理失败: " +
+                    "; ".join(f"{item['volume']}={item['message']}" for item in volume_failures)
+                )
+
+        # 4. 走更接近“安全删除硬件”的设备节点 eject。
+        try:
+            logging.info(f"正在按 Windows 安全删除硬件策略请求移除设备节点: {instance_id}")
+            # Ensure any WMI COM objects are released before calling eject
+            import pythoncom
+            try:
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception:
+                pass
+            
+            success, message = Win32API.eject_device_by_instance_id(instance_id)
+        finally:
+            Win32API.release_prepared_volumes(prepared_volumes)
 
         total_elapsed = time.perf_counter() - started_at
         if success:
-            logging.info(f"磁盘 {disk_index} 设备节点移除成功，总耗时 {total_elapsed:.2f} 秒")
-            logging.info(f"安全弹出完成: index={disk_index}, sleep_success={sleep_success}, total={total_elapsed:.2f}s")
+            logging.info(f"磁盘 {disk_index} 安全弹出成功，总耗时 {total_elapsed:.2f} 秒")
             logging.info("=" * 72)
-            if sleep_success:
-                return True, "设备已按 Windows 原生方式安全弹出，并已发送停转命令。"
-            return True, "设备已按 Windows 原生方式安全弹出。"
+            return True, "设备已按 Windows 原生方式安全弹出"
 
-        # 某些桥接芯片会拒绝彻底移除节点，但盘体已停转时，依然可以允许用户拔盘。
-        if sleep_success and ("PNP_VetoNonRecursive" in message or "代码: 8" in message or "不可卸载" in message):
-            logging.warning(f"磁盘 {disk_index} 节点移除被否决，但盘已停转，总耗时 {total_elapsed:.2f} 秒: {message}")
-            logging.info(f"安全弹出降级成功: index={disk_index}, total={total_elapsed:.2f}s, reason={message}")
-            logging.info("=" * 72)
-            return True, "硬盘已停转。虽然 Windows 未彻底移除设备节点，但该盘已可安全拔出。"
-
+        if volume_failures and ("STORAGE\\Volume" in message or "被系统或其他程序占用" in message or "不可卸载" in message):
+            # 将复杂的日志信息简化，让用户更容易理解
+            volume_details = "; ".join(f"{item['volume']} 仍被占用" for item in volume_failures)
+            message = f"磁盘正被占用，无法安全弹出。({volume_details})。请关闭占用该磁盘的程序或窗口（如资源管理器）后重试。"
+        
+        if not success and ("占用" in message or "STORAGE\\Volume" in message or "不可卸载" in message) and volumes:
+            # 尝试通过 Restart Manager 获取到底是什么程序在占用
+            occupying_apps = []
+            try:
+                from src.utils.restart_manager import get_locking_processes
+                for vol in volumes:
+                    vol_root = f"{vol}\\" if not vol.endswith("\\") else vol
+                    apps = get_locking_processes(vol_root)
+                    if apps:
+                        occupying_apps.extend(apps)
+            except Exception as rm_err:
+                logging.debug(f"获取占用程序失败: {rm_err}")
+                
+            if occupying_apps:
+                unique_apps = list(set(occupying_apps))
+                message += f"\n可能正在占用该磁盘的程序: {', '.join(unique_apps)}"
+                
         logging.error(f"磁盘 {disk_index} 弹出最终失败，总耗时 {total_elapsed:.2f} 秒: {message}")
         logging.info(f"安全弹出失败: index={disk_index}, total={total_elapsed:.2f}s, reason={message}")
         logging.info("=" * 72)
-        return False, f"Windows 原生弹出失败: {message}"
+        return False, message
 
 if __name__ == "__main__":
     # Test disk enumeration
