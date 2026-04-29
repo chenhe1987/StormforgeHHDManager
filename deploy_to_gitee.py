@@ -4,6 +4,46 @@ import requests
 import json
 import subprocess
 import re
+from pathlib import Path
+
+
+def ensure_release_zip(release_tag):
+    dist_zip = Path(f"dist/疾风知硬盘柜管理_{release_tag}.zip")
+    src_dir = Path(f"dist/疾风知硬盘柜管理_{release_tag}")
+
+    if dist_zip.exists():
+        print(f"✅ ZIP 包已存在: {dist_zip.resolve()}")
+        return dist_zip
+
+    if not src_dir.exists():
+        print(f"⚠️ 找不到构建目录: {src_dir}，无法打包。")
+        return None
+
+    print(f"正在压缩 {dist_zip}...")
+    import shutil
+
+    dist_zip.parent.mkdir(parents=True, exist_ok=True)
+    shutil.make_archive(str(dist_zip.with_suffix("")), "zip", str(src_dir))
+    print(f"✅ ZIP 包已生成: {dist_zip.resolve()}")
+    return dist_zip
+
+
+def upload_release_asset(owner, repo, release_id, token, zip_path):
+    print(f"正在上传附件: {zip_path}...")
+    with open(zip_path, "rb") as fp:
+        attach_resp = requests.post(
+            f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases/{release_id}/attach_files",
+            params={"access_token": token},
+            files={"file": (Path(zip_path).name, fp, "application/zip")},
+            timeout=300,
+        )
+
+    if attach_resp.status_code == 201:
+        print("✅ 附件上传成功！")
+        return True
+
+    print(f"⚠️ 附件上传失败: {attach_resp.status_code} - {attach_resp.text}")
+    return False
 
 def run_command(command, check=True):
     """运行Shell命令"""
@@ -168,22 +208,7 @@ def main():
         print(f"2. 编辑 Tag {release_tag}")
         print("3. 上传 dist/ 目录下的 zip 文件。")
         
-        # 仍然生成 zip 文件方便用户
-        dist_zip = f"dist/疾风知硬盘柜管理_{release_tag}.zip"
-        if not os.path.exists(dist_zip):
-             print(f"正在压缩 {dist_zip}...")
-             import shutil
-             if not os.path.exists("dist"):
-                 os.makedirs("dist")
-             # Assuming pyinstaller created dist/疾风知硬盘柜管理_v1.3.27
-             src_dir = f"dist/疾风知硬盘柜管理_{release_tag}"
-             if os.path.exists(src_dir):
-                 shutil.make_archive(dist_zip.replace(".zip", ""), 'zip', src_dir)
-                 print(f"✅ ZIP 包已生成: {os.path.abspath(dist_zip)}")
-             else:
-                 print(f"⚠️ 找不到构建目录: {src_dir}，无法打包。")
-        else:
-             print(f"✅ ZIP 包已存在: {os.path.abspath(dist_zip)}")
+        ensure_release_zip(release_tag)
              
         return
 
@@ -335,29 +360,9 @@ def main():
 
         # 6. 上传附件 (无论新建还是已存在，都尝试上传)
         if release_id:
-            dist_zip = f"dist/疾风知硬盘柜管理_{release_tag}.zip"
-            # 如果 zip 不存在，尝试先压缩
-            if not os.path.exists(dist_zip):
-                print(f"正在压缩 {dist_zip}...")
-                import shutil
-                shutil.make_archive(dist_zip.replace(".zip", ""), 'zip', f"dist/疾风知硬盘柜管理_{release_tag}")
-            
-            if os.path.exists(dist_zip):
-                print(f"正在上传附件: {dist_zip}...")
-                # Gitee API 上传附件
-                files = {'file': open(dist_zip, 'rb')}
-                # 注意：Gitee 上传附件 API 是 POST /repos/{owner}/{repo}/releases/{id}/attach_files
-                attach_resp = requests.post(
-                    f"https://gitee.com/api/v5/repos/{owner}/{repo}/releases/{release_id}/attach_files",
-                    params={"access_token": token},
-                    files=files
-                )
-                if attach_resp.status_code == 201:
-                    print("✅ 附件上传成功！")
-                else:
-                    print(f"⚠️ 附件上传失败: {attach_resp.status_code} - {attach_resp.text}")
-            else:
-                print(f"⚠️ 找不到附件文件: {dist_zip}")
+            dist_zip = ensure_release_zip(release_tag)
+            if dist_zip:
+                upload_release_asset(owner, repo, release_id, token, dist_zip)
 
     print("\n=== 全部完成！ ===")
     print(f"项目地址: {repo_url}")
