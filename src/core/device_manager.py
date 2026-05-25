@@ -137,7 +137,6 @@ class DeviceManager:
 
     @staticmethod
     def safe_eject_disk(disk_index, model=None, serial=None):
-        """先尝试停转，再按 Windows 安全删除硬件的思路弹出设备。"""
         started_at = time.perf_counter()
         logging.info("=" * 72)
         logging.info(
@@ -153,14 +152,14 @@ class DeviceManager:
 
         logging.info(f"磁盘 {disk_index} 的实例 ID: {instance_id}")
 
-        # 2. 仅记录卷信息，卷释放交给 Windows 原生 eject 处理，避免手动锁卷造成长时间阻塞
+        # 2. 记录卷信息
         volumes = DeviceManager.get_volumes_for_disk(disk_index)
         if volumes:
             logging.info(f"磁盘 {disk_index} 当前关联卷: {', '.join(volumes)}")
         else:
             logging.info(f"磁盘 {disk_index} 上未发现活动卷")
 
-        # 释放 WMI COM 对象，防止它们占用卷句柄导致后续的锁卷和弹出失败
+        # 释放 WMI COM 对象
         import gc
         gc.collect()
         try:
@@ -169,10 +168,46 @@ class DeviceManager:
         except Exception:
             pass
 
+        # 3. 弹出前先发送 FLUSH CACHE + SLEEP，确保磁头归位并停转
+        #    对于 2074+1153E 组合，这一步弥补了 Windows 不发送停转命令的缺陷
+        spin_down_ok = False
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
+                if cmd.sleep():
+                    spin_down_ok = True
+                    logging.info(f"磁盘 {disk_index} 弹出前停转成功")
+                else:
+                    logging.warning(f"磁盘 {disk_index} 弹出前停转命令失败，继续弹出流程")
+        except Exception as e:
+            logging.warning(f"磁盘 {disk_index} 弹出前停转异常: {e}")
+
+        # 4. 策略 A (优先): Shell Eject
+        #    与 Windows 原生安全删除硬件使用相同路径
+        #    对 2074 Hub + 多 ASM1153E 桥接的组合最为可靠
+        shell_msg = ""
+        if volumes:
+            primary_volume = volumes[0]
+            logging.info(f"策略 A: 尝试 Shell Eject 弹出卷 {primary_volume}")
+            shell_ok, shell_msg = Win32API.eject_volume_by_drive_letter(
+                primary_volume,
+                expected_volumes=volumes,
+                timeout_seconds=15.0,
+            )
+            if shell_ok:
+                total_elapsed = time.perf_counter() - started_at
+                msg = "设备已安全弹出"
+                if spin_down_ok:
+                    msg += "，硬盘已停转"
+                logging.info(f"磁盘 {disk_index} 策略 A (Shell Eject) 成功，总耗时 {total_elapsed:.2f} 秒")
+                logging.info("=" * 72)
+                return True, msg
+
+        # 5. 策略 B (备选): PnP 设备节点移除
+        #    适用于独立 USB-SATA 桥接芯片，对于 2074 hub 下的子设备可能被否决
         prepared_volumes = []
         volume_failures = []
 
-        # 3. 对关联卷做短超时 lock + dismount，尽量还原 Windows 安全删除前的卷处理状态。
         if volumes:
             prepared_volumes, volume_failures = Win32API.prepare_volumes_for_safe_removal(
                 volumes,
@@ -188,33 +223,47 @@ class DeviceManager:
                     "; ".join(f"{item['volume']}={item['message']}" for item in volume_failures)
                 )
 
-        # 4. 走更接近“安全删除硬件”的设备节点 eject。
         try:
-            logging.info(f"正在按 Windows 安全删除硬件策略请求移除设备节点: {instance_id}")
-            # Ensure any WMI COM objects are released before calling eject
-            import pythoncom
+            logging.info(f"策略 B: 按 PnP 设备节点移除策略请求移除设备: {instance_id}")
             try:
                 pythoncom.CoFreeUnusedLibraries()
             except Exception:
                 pass
-            
-            success, message = Win32API.eject_device_by_instance_id(instance_id)
+
+            pnp_ok, pnp_msg = Win32API.eject_device_by_instance_id(instance_id)
         finally:
             Win32API.release_prepared_volumes(prepared_volumes)
 
-        total_elapsed = time.perf_counter() - started_at
-        if success:
-            logging.info(f"磁盘 {disk_index} 安全弹出成功，总耗时 {total_elapsed:.2f} 秒")
+        if pnp_ok:
+            total_elapsed = time.perf_counter() - started_at
+            msg = "设备已安全移除"
+            if spin_down_ok:
+                msg += "，硬盘已停转"
+            logging.info(f"磁盘 {disk_index} 策略 B (PnP 移除) 成功，总耗时 {total_elapsed:.2f} 秒")
             logging.info("=" * 72)
-            return True, "设备已按 Windows 原生方式安全弹出"
+            return True, msg
 
-        if volume_failures and ("STORAGE\\Volume" in message or "被系统或其他程序占用" in message or "不可卸载" in message):
-            # 将复杂的日志信息简化，让用户更容易理解
+        # 6. 所有策略都失败，生成详细错误信息
+        total_elapsed = time.perf_counter() - started_at
+
+        messages = []
+        if shell_msg:
+            messages.append(f"Shell Eject: {shell_msg}")
+        messages.append(f"PnP 移除: {pnp_msg}")
+
+        if spin_down_ok:
+            messages.append(
+                "虽然 Windows 未能完成设备节点移除，但硬盘已成功停转，"
+                "您可以稍后通过系统托盘安全删除硬件完成最终弹出。"
+            )
+
+        combined = "\n".join(messages)
+
+        if volume_failures:
             volume_details = "; ".join(f"{item['volume']} 仍被占用" for item in volume_failures)
-            message = f"磁盘正被占用，无法安全弹出。({volume_details})。请关闭占用该磁盘的程序或窗口（如资源管理器）后重试。"
-        
-        if not success and ("占用" in message or "STORAGE\\Volume" in message or "不可卸载" in message) and volumes:
-            # 尝试通过 Restart Manager 获取到底是什么程序在占用
+            combined = f"磁盘正被占用，无法安全弹出。({volume_details})。请关闭占用该磁盘的程序或窗口后重试。"
+
+        if volumes:
             occupying_apps = []
             try:
                 from src.utils.restart_manager import get_locking_processes
@@ -225,15 +274,14 @@ class DeviceManager:
                         occupying_apps.extend(apps)
             except Exception as rm_err:
                 logging.debug(f"获取占用程序失败: {rm_err}")
-                
+
             if occupying_apps:
                 unique_apps = list(set(occupying_apps))
-                message += f"\n可能正在占用该磁盘的程序: {', '.join(unique_apps)}"
-                
-        logging.error(f"磁盘 {disk_index} 弹出最终失败，总耗时 {total_elapsed:.2f} 秒: {message}")
-        logging.info(f"安全弹出失败: index={disk_index}, total={total_elapsed:.2f}s, reason={message}")
+                combined += f"\n可能正在占用该磁盘的程序: {', '.join(unique_apps)}"
+
+        logging.error(f"磁盘 {disk_index} 弹出最终失败，总耗时 {total_elapsed:.2f} 秒: {combined}")
         logging.info("=" * 72)
-        return False, message
+        return False, combined
 
 if __name__ == "__main__":
     # Test disk enumeration

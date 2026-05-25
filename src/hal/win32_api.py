@@ -1163,3 +1163,229 @@ class Win32API:
         except Exception as e:
             logging.error(f"强力恢复过程异常: {e}")
             return Win32API.restart_safe_removed_devices()
+
+
+# ====== Safe Removal Spin-Down Patch (DBT_DEVICEQUERYREMOVE Hook) ======
+
+WM_DEVICECHANGE = 0x0219
+DBT_DEVICEQUERYREMOVE = 0x8001
+DBT_DEVICEREMOVEPENDING = 0x8003
+DBT_DEVICEREMOVECOMPLETE = 0x8004
+DBT_DEVTYP_VOLUME = 0x00000002
+
+DBT_CONFIGCHANGED = 0x0018
+DBT_DEVICEARRIVAL = 0x8000
+DBT_DEVICEREMOVECOMPLETE_BROADCAST = 0x8004
+
+DEVICE_NOTIFY_WINDOW_HANDLE = 0
+DEVICE_NOTIFY_SERVICE_HANDLE = 1
+
+class DEV_BROADCAST_VOLUME(ctypes.Structure):
+    _fields_ = [
+        ("dbcv_size", wintypes.DWORD),
+        ("dbcv_devicetype", wintypes.DWORD),
+        ("dbcv_reserved", wintypes.DWORD),
+        ("dbcv_unitmask", wintypes.DWORD),
+        ("dbcv_flags", wintypes.WORD),
+    ]
+
+
+class SafeRemovalPatcher:
+    """
+    拦截 Windows 安全弹出的 DBT_DEVICEQUERYREMOVE 消息，
+    在外置 USB-SATA 硬盘被系统移除前发送 FLUSH CACHE + SLEEP 停转命令。
+
+    用法:
+        patcher = SafeRemovalPatcher()
+        patcher.register(hwnd)
+        # 在窗口的 nativeEvent 中:
+        #   patcher.handle_wm_devicechange(msg.wParam, msg.lParam)
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._notification_handle = None
+        self._hwnd = None
+        self._enabled = True
+        self._processed_disks = set()
+        self._initialized = True
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, value):
+        self._enabled = bool(value)
+        if self._enabled and self._hwnd:
+            if not self._notification_handle:
+                self.register(self._hwnd)
+        else:
+            self.unregister()
+
+    def register(self, hwnd):
+        try:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            self._hwnd = hwnd
+
+            if not self._enabled:
+                logging.info("[SafeRemovalPatch] 功能未启用，跳过注册设备通知")
+                return False
+
+            dbv = DEV_BROADCAST_VOLUME()
+            dbv.dbcv_size = ctypes.sizeof(DEV_BROADCAST_VOLUME)
+            dbv.dbcv_devicetype = DBT_DEVTYP_VOLUME
+
+            handle = user32.RegisterDeviceNotificationW(
+                hwnd,
+                ctypes.byref(dbv),
+                0
+            )
+
+            if not handle:
+                err = ctypes.get_last_error()
+                logging.error(f"[SafeRemovalPatch] RegisterDeviceNotification 失败: {err}")
+                return False
+
+            self._notification_handle = handle
+            logging.info("[SafeRemovalPatch] 已注册设备通知，将拦截系统安全弹出并附加硬盘停转")
+            return True
+        except Exception as e:
+            logging.error(f"[SafeRemovalPatch] 注册设备通知异常: {e}")
+            return False
+
+    def unregister(self):
+        if self._notification_handle:
+            try:
+                user32 = ctypes.WinDLL('user32', use_last_error=True)
+                user32.UnregisterDeviceNotification(self._notification_handle)
+                logging.info("[SafeRemovalPatch] 已注销设备通知")
+            except Exception as e:
+                logging.error(f"[SafeRemovalPatch] 注销设备通知异常: {e}")
+            finally:
+                self._notification_handle = None
+
+    def handle_wm_devicechange(self, wparam, lparam):
+        if not self._enabled:
+            return False
+
+        event_code = wparam
+
+        if event_code == DBT_DEVICEQUERYREMOVE:
+            return self._on_query_remove(lparam)
+
+        if event_code == DBT_DEVICEREMOVECOMPLETE:
+            return self._on_remove_complete(lparam)
+
+        return False
+
+    def _on_query_remove(self, lparam):
+        drive_letter = SafeRemovalPatcher._extract_drive_letter(lparam)
+        if not drive_letter:
+            return False
+
+        disk_index = SafeRemovalPatcher._find_physical_disk_for_drive(drive_letter)
+        if disk_index is None:
+            return False
+
+        if not SafeRemovalPatcher._is_external_disk(disk_index):
+            logging.debug(
+                f"[SafeRemovalPatch] 磁盘 {disk_index} (卷 {drive_letter}) 不是外置设备，跳过"
+            )
+            return False
+
+        if disk_index in self._processed_disks:
+            logging.debug(
+                f"[SafeRemovalPatch] 磁盘 {disk_index} 已在本次移除流程中处理过，跳过"
+            )
+            return False
+
+        self._processed_disks.add(disk_index)
+
+        logging.info(
+            f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: PhysicalDrive{disk_index} (卷 {drive_letter})"
+        )
+        logging.info(f"[SafeRemovalPatch] 正在发送 FLUSH CACHE + SLEEP 停转命令...")
+
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index) as cmd:
+                if cmd.sleep():
+                    logging.info(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} 停转成功，允许系统继续移除"
+                    )
+                else:
+                    logging.warning(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} 停转命令失败，仍允许系统继续移除"
+                    )
+        except Exception as e:
+            logging.warning(
+                f"[SafeRemovalPatch] 磁盘 {disk_index} 停转异常: {e}，仍允许系统继续移除"
+            )
+
+        return False
+
+    def _on_remove_complete(self, lparam):
+        self._processed_disks.clear()
+        return False
+
+    @staticmethod
+    def _extract_drive_letter(lparam):
+        try:
+            dbv = ctypes.cast(lparam, ctypes.POINTER(DEV_BROADCAST_VOLUME)).contents
+            mask = dbv.dbcv_unitmask
+            if mask == 0:
+                return None
+
+            for bit in range(26):
+                if mask & (1 << bit):
+                    return chr(ord('A') + bit) + ":"
+
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _find_physical_disk_for_drive(drive_letter):
+        try:
+            import wmi
+            c = wmi.WMI()
+            mapped_volume = drive_letter.rstrip(":\\/")
+
+            for drive in c.Win32_DiskDrive():
+                try:
+                    index = int(drive.DeviceID.upper().replace("\\\\.\\PHYSICALDRIVE", ""))
+                except ValueError:
+                    continue
+
+                for partition in drive.associators("Win32_DiskDriveToDiskPartition"):
+                    for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
+                        ld_device = logical_disk.DeviceID.rstrip(":")
+                        if ld_device.upper() == mapped_volume.upper():
+                            return index
+
+            return None
+        except Exception as e:
+            logging.debug(f"[SafeRemovalPatch] 查找卷对应物理磁盘失败: {e}")
+            return None
+
+    @staticmethod
+    def _is_external_disk(disk_index):
+        try:
+            import wmi
+            c = wmi.WMI()
+            for drive in c.Win32_DiskDrive(Index=disk_index):
+                pnp_id = drive.PNPDeviceID or ""
+                return Win32API.is_external_device(pnp_id)
+            return False
+        except Exception:
+            return False

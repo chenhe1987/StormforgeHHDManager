@@ -42,7 +42,8 @@ class ConfigManager:
             "intervals": {}, # {serial: seconds}
             "sleep_timers": {}, # {serial: minutes}
             "autostart": False,
-            "shutdown_eject": False
+            "shutdown_eject": False,
+            "safe_remove_spindown": True
         }
         if not os.path.exists(self.filename):
             return default_config
@@ -226,4 +227,13 @@ class ConfigManager:
     def set_shutdown_eject(self, enabled):
         """保存关机自动弹出设置"""
         self.config["shutdown_eject"] = enabled
+        self.save_config()
+
+    def get_safe_remove_spindown(self):
+        """获取安全弹出停转补丁设置"""
+        return self.config.get("safe_remove_spindown", True)
+
+    def set_safe_remove_spindown(self, enabled):
+        """保存安全弹出停转补丁设置"""
+        self.config["safe_remove_spindown"] = enabled
         self.save_config()

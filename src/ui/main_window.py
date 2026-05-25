@@ -18,7 +18,7 @@ import threading
 from ctypes import wintypes
 from datetime import datetime
 
-from src.hal.win32_api import Win32API
+from src.hal.win32_api import Win32API, SafeRemovalPatcher, WM_DEVICECHANGE
 from src.core.monitor_service import MonitorService
 from src.core.device_manager import DeviceManager
 from src.core.config_manager import ConfigManager
@@ -433,8 +433,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
-        self.version = "1.3.59"
-        self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version} (关机保护版)")
+        self.version = "1.3.60"
+        self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version} (停转补丁版)")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
         
@@ -586,6 +586,19 @@ class MainWindow(QMainWindow):
         self.shutdown_eject_checkbox.setChecked(self.config_manager.get_shutdown_eject())
         self.shutdown_eject_checkbox.stateChanged.connect(self.on_shutdown_eject_changed)
         self.settings_layout.addWidget(self.shutdown_eject_checkbox)
+
+        # 6. Safe Removal Spin-Down Patch Checkbox
+        self.spindown_patch_checkbox = QCheckBox("系统弹出时附加硬盘停转")
+        self.spindown_patch_checkbox.setStyleSheet("color: #aaaaaa; font-size: 12px; padding: 5px;")
+        self.spindown_patch_checkbox.setChecked(self.config_manager.get_safe_remove_spindown())
+        self.spindown_patch_checkbox.setToolTip(
+            "启用后，当您通过 Windows 系统托盘安全删除硬件时，\n"
+            "程序会自动先发送 FLUSH CACHE + SLEEP 停转命令，\n"
+            "确保硬盘磁头归位、盘片停止旋转后再完成弹出。\n"
+            "特别适用于 2074+1153E 组合的硬盘柜。"
+        )
+        self.spindown_patch_checkbox.stateChanged.connect(self.on_spindown_patch_changed)
+        self.settings_layout.addWidget(self.spindown_patch_checkbox)
         
         # Add Settings Container to Sidebar (Fixed height by content, NO stretch)
         self.sidebar_layout.addWidget(self.settings_container, 0)
@@ -792,6 +805,11 @@ class MainWindow(QMainWindow):
         # Tray Icon Setup
         logging.info("正在设置系统托盘...")
         self.setup_tray()
+
+        # Safe Removal Spin-Down Patcher
+        self.spindown_patcher = SafeRemovalPatcher()
+        self.spindown_patcher.enabled = self.config_manager.get_safe_remove_spindown()
+        QTimer.singleShot(1000, self._register_spindown_patcher)
 
         self.current_disk_serial = None # Track currently selected disk
         
@@ -1138,33 +1156,46 @@ class MainWindow(QMainWindow):
         self.config_manager.set_shutdown_eject(enabled)
         logging.info(f"关机自动休眠设置已更新: {enabled}")
 
+    @Slot(int)
+    def on_spindown_patch_changed(self, state):
+        enabled = (state == Qt.Checked)
+        self.config_manager.set_safe_remove_spindown(enabled)
+        self.spindown_patcher.enabled = enabled
+        logging.info(f"系统弹出附加停转补丁设置已更新: {enabled}")
+
+    def _register_spindown_patcher(self):
+        try:
+            hwnd = int(self.winId())
+            self.spindown_patcher.register(hwnd)
+        except Exception as e:
+            logging.warning(f"注册停转补丁失败: {e}")
+
     def nativeEvent(self, eventType, message):
         """Handle Windows native events to detect shutdown"""
         try:
             if eventType.data() == b"windows_generic_MSG":
                 msg = MSG.from_address(int(message))
+
                 if msg.message == WM_QUERYENDSESSION:
                     logging.info("收到系统关机信号 (WM_QUERYENDSESSION)")
                     if self.config_manager.get_shutdown_eject():
-                        # 再次确认阻塞原因 (部分 Windows 版本需要在此处再次调用)
                         hwnd = int(self.winId())
                         reason = "正在为您执行硬盘关机休眠保护，请稍候..."
                         ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
-                        
-                        # 同步执行关机休眠保护
                         self.eject_all_removable_disks()
-                        
-                    # 允许关机
                     return True, 1
-                    
+
                 elif msg.message == WM_ENDSESSION:
                     logging.info(f"系统会话结束 (WM_ENDSESSION, wParam={msg.wParam})")
-                    if msg.wParam: # 确认系统真的要关机
-                        # 如果已经在弹出中，这里做最后的等待
+                    if msg.wParam:
                         pass
+
+                elif msg.message == WM_DEVICECHANGE:
+                    if self.spindown_patcher.handle_wm_devicechange(msg.wParam, msg.lParam):
+                        return True, 0
         except Exception as e:
             logging.error(f"nativeEvent error: {e}")
-            
+
         return super().nativeEvent(eventType, message)
 
     def eject_all_removable_disks(self):
@@ -1570,7 +1601,8 @@ class MainWindow(QMainWindow):
             
         self.tray_icon.setIcon(icon)
         self.tray_icon.setToolTip("疾风知硬盘柜管理程序")
-        
+        self.tray_icon.activated.connect(self.on_tray_activated)
+
         show_action = QAction("显示主界面", self)
         quit_action = QAction("退出程序", self)
         
@@ -1586,6 +1618,12 @@ class MainWindow(QMainWindow):
         self.tray_icon.show()
         
         logging.info("系统托盘图标已初始化")
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
 
     def show_notification(self, title, message):
         # This might be called from a background thread
