@@ -1641,7 +1641,9 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event):
-        # Minimize to tray instead of closing
+        if hasattr(self, 'monitor_service') and self.monitor_service.shutdown_mode:
+            event.accept()
+            return
         if self.tray_icon.isVisible():
             self.hide()
             event.ignore()
