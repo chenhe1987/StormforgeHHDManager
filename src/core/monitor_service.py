@@ -104,19 +104,11 @@ class MonitorService(threading.Thread):
         self.check_all_smart(target_disks=disks)
 
     def _get_cached_or_scan_disks(self, force=False):
-        """
-        获取磁盘列表。
-        只要存在手动休眠的硬盘，后台就完全冻结自动重新枚举，直到用户手动唤醒或执行刷新。
-        """
         now = time.time()
 
         if self.shutdown_mode:
             logging.info("关机静默模式下复用现有磁盘缓存，不再重新枚举")
             return self._filter_excluded_disks(self.cached_disks)
-
-        if self.sleeping_disks and not force:
-            logging.info(f"检测到 {len(self.sleeping_disks)} 个手动休眠硬盘，后台停止自动重扫，直接复用缓存")
-            return list(self.cached_disks)
 
         if force or not self.cached_disks or now - self.last_inventory_scan_time >= self.device_inventory_interval:
             self.cached_disks = DeviceManager.get_physical_disks()

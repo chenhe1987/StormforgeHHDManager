@@ -1426,16 +1426,12 @@ class MainWindow(QMainWindow):
     def on_spin_down_clicked(self):
         if not hasattr(self, 'current_disk_index'):
             return
-            
-        # 检查当前是否已经是休眠状态
+
         current_item = self.sidebar.currentItem()
         if current_item:
             disk = current_item.data(Qt.UserRole)
             if disk.get("status") == "Sleeping":
-                # 执行唤醒逻辑
-                if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                    self.monitor_service.mark_disk_awake(self.current_disk_serial)
-                    self.monitor_service.check_all_smart(force=True)
+                self._wake_sleeping_disk()
                 return
 
         reply = QMessageBox.question(
@@ -1584,6 +1580,39 @@ class MainWindow(QMainWindow):
             "建议客户在“控制面板 -> 电源选项 -> 更改计划设置 -> 更改高级电源设置 -> 硬盘 -> 在此时间后关闭硬盘”中，"
             "把对应项改为 600-1200 秒（10-20 分钟）。"
         )
+
+    def _wake_sleeping_disk(self):
+        if not hasattr(self, 'monitor_service'):
+            return
+
+        serial = self.current_disk_serial
+        disk_index = self.current_disk_index
+
+        self.spin_down_button.setEnabled(False)
+        self.spin_down_button.setText("正在唤醒...")
+        self.status_label.setText(f"正在唤醒硬盘 {disk_index}，请稍候...")
+        QApplication.processEvents()
+
+        instance_id = Win32API.get_device_instance_path(disk_index)
+        if instance_id:
+            logging.info(f"唤醒硬盘: 正在硬件复位设备节点 {instance_id}")
+            reset_ok = Win32API.reset_devnode(instance_id)
+            if reset_ok:
+                logging.info(f"唤醒硬盘: 设备节点复位成功，等待系统重新枚举...")
+            else:
+                logging.warning(f"唤醒硬盘: 设备节点复位失败，尝试 pnputil...")
+                Win32API.restart_device_via_pnputil(instance_id)
+
+            for _ in range(30):
+                time.sleep(0.2)
+                QApplication.processEvents()
+
+        self.monitor_service.mark_disk_awake(serial)
+        self.monitor_service.check_all_smart(force=True)
+
+        self.spin_down_button.setText("立即休眠硬盘")
+        self.spin_down_button.setEnabled(True)
+        self.status_label.setText("就绪")
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
