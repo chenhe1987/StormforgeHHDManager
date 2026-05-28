@@ -102,12 +102,12 @@ class ConfigManager:
     def _get_autostart_command(self):
         """构造当前版本应写入注册表的启动命令。"""
         if getattr(sys, 'frozen', False):
-            return f'"{os.path.abspath(sys.executable)}"'
+            return f'"{os.path.abspath(sys.executable)}" --silent'
 
         path = os.path.abspath(sys.argv[0])
         if path.endswith('.py'):
-            return f'"{sys.executable}" "{path}"'
-        return f'"{path}"'
+            return f'"{sys.executable}" "{path}" --silent'
+        return f'"{path}" --silent'
 
     def _normalize_autostart_command(self, command):
         if not command:

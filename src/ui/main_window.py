@@ -94,25 +94,6 @@ class UpdateCheckThread(QThread):
         except Exception:
             return 0
 
-class EjectThread(QThread):
-    """后台线程执行弹出操作，防止 UI 卡死"""
-    finished_signal = Signal(bool, str)
-
-    def __init__(self, disk_index, model=None, serial=None):
-        super().__init__()
-        self.disk_index = disk_index
-        self.model = model
-        self.serial = serial
-
-    def run(self):
-        try:
-            from src.core.device_manager import DeviceManager
-            success, message = DeviceManager.safe_eject_disk(self.disk_index, model=self.model, serial=self.serial)
-            self.finished_signal.emit(success, message)
-        except Exception as e:
-            logging.error(f"弹出线程执行异常: {e}")
-            self.finished_signal.emit(False, str(e))
-
 class ListHandler(logging.Handler):
     def __init__(self, log_list=None):
         super().__init__()
@@ -430,11 +411,12 @@ class MainWindow(QMainWindow):
     # Signal to update UI from background thread
     update_data_signal = Signal(list)
 
-    def __init__(self):
+    def __init__(self, silent_mode=False):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
+        self._silent_mode = silent_mode
         self.version = "1.3.60"
-        self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version} (停转补丁版)")
+        self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
         
@@ -726,15 +708,6 @@ class MainWindow(QMainWindow):
         self.spin_down_button.clicked.connect(self.on_spin_down_clicked)
         self.spin_down_button.setEnabled(False) # Default disabled
         self.actions_layout.addWidget(self.spin_down_button)
-        
-        self.actions_layout.addSpacing(10)
-        
-        self.eject_button = QPushButton("安全弹出设备")
-        self.eject_button.setObjectName("EjectButton")
-        self.eject_button.setFixedWidth(180)
-        self.eject_button.clicked.connect(self.on_eject_clicked)
-        self.eject_button.setEnabled(False) # Default disabled
-        self.actions_layout.addWidget(self.eject_button)
         self.actions_layout.addStretch()
         self.detail_layout.addLayout(self.actions_layout)
         
@@ -1161,6 +1134,9 @@ class MainWindow(QMainWindow):
         enabled = (state == Qt.Checked)
         self.config_manager.set_safe_remove_spindown(enabled)
         self.spindown_patcher.enabled = enabled
+        if enabled:
+            self.config_manager.set_autostart(True)
+            self.autostart_checkbox.setChecked(True)
         logging.info(f"系统弹出附加停转补丁设置已更新: {enabled}")
 
     def _register_spindown_patcher(self):
@@ -1275,33 +1251,19 @@ class MainWindow(QMainWindow):
 
     def on_disk_selected(self, item):
         if not item:
-            self.eject_button.setEnabled(False)
             self.spin_down_button.setEnabled(False)
             return
         
         disk = item.data(Qt.UserRole)
         self.title_label.setText(disk.get("model", "未知型号"))
         
-        # 如果硬盘处于休眠状态，允许点击按钮来“唤醒”或重新检测
+        # 如果硬盘处于休眠状态，允许点击按钮来"唤醒"或重新检测
         status = disk.get("status", "")
-        is_removable = disk.get("is_removable", False)
         
         if status == "Sleeping":
             self.spin_down_button.setText("唤醒/刷新硬盘")
-            self.eject_button.setEnabled(False) 
-            self.eject_button.setToolTip("硬盘处于休眠状态，请先唤醒")
         else:
             self.spin_down_button.setText("立即休眠硬盘")
-            if is_removable:
-                self.eject_button.setEnabled(True)
-                self.eject_button.setToolTip("安全弹出并停止该外置硬盘")
-                self.eject_button.show()
-            else:
-                self.eject_button.setEnabled(False)
-                self.eject_button.setToolTip("内置硬盘不支持安全弹出")
-                # 也可以选择隐藏，或者只是禁用。这里选择禁用并显示提示。
-                # 如果用户希望区分更明显，可以考虑隐藏
-                # self.eject_button.hide()
             
         self.spin_down_button.setEnabled(True)
         self.current_disk_index = disk.get("index") # Store current index
@@ -1462,79 +1424,6 @@ class MainWindow(QMainWindow):
                 if hasattr(self, 'monitor_service') and self.current_disk_serial:
                     self.monitor_service.mark_disk_awake(self.current_disk_serial)
                 QMessageBox.warning(self, "操作失败", message)
-
-    def on_eject_clicked(self):
-        if not hasattr(self, 'current_disk_index'):
-            return
-            
-        reply = QMessageBox.question(
-            self, '确认弹出', 
-            f"确定要安全弹出磁盘 {self.current_disk_index} 吗？\n所有关联的分区都将被卸载。",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
-            logging.info(f"用户触发弹出磁盘 {self.current_disk_index}")
-            
-            # 1. 首先在监控服务中屏蔽该硬盘
-            if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                self.monitor_service.mark_disk_sleeping(self.current_disk_serial)
-
-            # 2. 禁用按钮，显示等待状态
-            self.eject_button.setEnabled(False)
-            self.eject_button.setText("正在弹出...")
-            self.status_label.setText(f"正在尝试安全弹出磁盘 {self.current_disk_index}，请稍候...")
-
-            # 3. 启动后台线程执行弹出逻辑
-            self.eject_thread = EjectThread(
-                self.current_disk_index, 
-                model=self.current_disk_model, 
-                serial=self.current_disk_serial
-            )
-            self.eject_thread.finished_signal.connect(self.on_eject_finished)
-            self.eject_thread.start()
-
-    @Slot(bool, str)
-    def on_eject_finished(self, success, message):
-        """弹出操作完成的回调"""
-        # 恢复按钮状态
-        self.eject_button.setText("安全弹出设备")
-        self.eject_button.setEnabled(True)
-        self.status_label.setText("就绪")
-
-        if success:
-            if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                self.monitor_service.mark_disk_ejected(self.current_disk_serial)
-            QMessageBox.information(
-                self, 
-                "弹出成功", 
-                f"设备已安全弹出。\n\n{message}\n\n您现在可以安全地拔掉硬盘或关闭电源了。"
-            )
-            # 立即从当前 UI 中移除已弹出的磁盘，避免主线程执行完整刷新导致界面卡顿。
-            self._remove_ejected_disk_from_ui(self.current_disk_serial, self.current_disk_index)
-            self.status_label.setText("设备已弹出")
-            QTimer.singleShot(1500, lambda: self.status_label.setText("就绪"))
-        else:
-            # 如果失败了，尝试在监控中恢复（以便下次重试或继续监控）
-            if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                self.monitor_service.mark_disk_awake(self.current_disk_serial)
-            
-            QMessageBox.warning(self, "弹出失败", f"无法安全弹出设备：\n{message}\n\n请确保没有程序正在使用该磁盘中的文件。")
-
-    def _remove_ejected_disk_from_ui(self, serial, disk_index):
-        """先本地更新列表，避免成功弹出后同步刷新阻塞 UI。"""
-        if not hasattr(self, "disk_data") or not self.disk_data:
-            self.sidebar.clearSelection()
-            return
-
-        remaining_disks = [
-            disk for disk in self.disk_data
-            if not (
-                (serial and disk.get("serial") == serial) or
-                (disk_index is not None and disk.get("index") == disk_index)
-            )
-        ]
-        self.handle_data_update(remaining_disks)
 
     def _mark_current_disk_sleeping_in_ui(self):
         """本地直接把当前磁盘标记为休眠，避免立即触发一次全盘扫描导致再次唤醒。"""

@@ -107,10 +107,15 @@ def main():
             from PySide6.QtGui import QIcon
             app.setWindowIcon(QIcon(icon_path))
 
-        window = MainWindow()
-        window.show()
-        window.activateWindow()
-        window.raise_()
+        silent_mode = "--silent" in sys.argv
+        if silent_mode:
+            logging.info("检测到 --silent 参数，以托盘模式启动")
+
+        window = MainWindow(silent_mode=silent_mode)
+        if not silent_mode:
+            window.show()
+            window.activateWindow()
+            window.raise_()
         
         exit_code = app.exec()
         logging.info(f"程序正常退出，代码: {exit_code}")
