@@ -1256,6 +1256,11 @@ class SafeRemovalPatcher:
             logging.info(f"[SafeRemovalPatch] 缓存已刷新: {len(new_cache)} 个外置卷映射")
         except Exception as e:
             logging.debug(f"[SafeRemovalPatch] 缓存刷新失败: {e}")
+        finally:
+            try:
+                del c
+            except Exception:
+                pass
 
     def register(self, hwnd):
         try:

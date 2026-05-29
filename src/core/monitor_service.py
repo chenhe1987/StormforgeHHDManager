@@ -33,7 +33,7 @@ class MonitorService(threading.Thread):
         self.ejected_disks = set() # {serial} - Disks successfully ejected; ignore until manual refresh
         self.cached_disks = []
         self.last_inventory_scan_time = 0
-        self.device_inventory_interval = 60
+        self.device_inventory_interval = 300
         self.scan_lock = threading.Lock()
 
     def run(self):
@@ -42,6 +42,7 @@ class MonitorService(threading.Thread):
         self.check_all_smart(force=True)
         self.check_event_logs()
         self.last_event_check = time.time()
+        ml_cleanup_counter = 0
 
         while self.running:
             if self.shutdown_mode:
@@ -58,6 +59,16 @@ class MonitorService(threading.Thread):
             # 2. Check SMART (Per-disk interval)
             # We don't check ALL at once anymore, we check individually if interval expired
             self.check_disks_schedule()
+
+            # 3. 定期释放 COM 引用，防止 WMI 提供者持有设备句柄导致弹出失败
+            ml_cleanup_counter += 1
+            if ml_cleanup_counter >= 6:
+                try:
+                    import pythoncom
+                    pythoncom.CoFreeUnusedLibraries()
+                except Exception:
+                    pass
+                ml_cleanup_counter = 0
                 
             time.sleep(10) # Wake up every 10 seconds to check timers
 
@@ -309,6 +320,11 @@ class MonitorService(threading.Thread):
                                 attributes = SmartParser.parse_powershell_nvme(data)
                         except Exception as e:
                             logging.debug(f"WMI NVMe fallback failed: {e}")
+                        finally:
+                            try:
+                                del w
+                            except Exception:
+                                pass
                             
                         # 如果 WMI 失败，尝试 PowerShell 作为最后手段
                         if not attributes:

@@ -81,6 +81,16 @@ class DeviceManager:
             logging.debug(f"磁盘枚举完成，共找到 {len(disks)} 个磁盘")
         except Exception as e:
             logging.error(f"Error enumerating disks: {e}", exc_info=True)
+        finally:
+            try:
+                del c
+            except Exception:
+                pass
+            try:
+                import pythoncom
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception:
+                pass
         return disks
 
     @staticmethod
@@ -97,6 +107,11 @@ class DeviceManager:
             logging.debug(f"磁盘 {disk_index} 上的卷: {volumes}")
         except Exception as e:
             logging.error(f"获取磁盘 {disk_index} 的卷失败: {e}")
+        finally:
+            try:
+                del c
+            except Exception:
+                pass
         return volumes
 
     @staticmethod
