@@ -3,6 +3,7 @@ from ctypes import wintypes
 import logging
 import subprocess
 import re
+import threading
 import time
 
 # Windows Constants
@@ -1196,10 +1197,11 @@ class SafeRemovalPatcher:
     在外置 USB-SATA 硬盘被系统移除前发送 FLUSH CACHE + SLEEP 停转命令。
 
     关键设计：
-    - DBT_DEVICEQUERYREMOVE 期间：open→send SLEEP→close→return False
-      PhysicalDrive 句柄在函数返回前已关闭，不会导致 veto
-    - 导致 veto 的是 WMI COM 引用（持久存在），不是瞬时的 PhysicalDrive 句柄
-    - 通过预缓存的卷→磁盘映射避免在事件中做 WMI 查询
+    - DBT_DEVICEQUERYREMOVE 是 PnP Manager 同步广播，处理函数必须极快返回。
+      在回调中一直阻塞执行 SLEEP（2-3 秒）会导致部分机器的 PnP 检测窗口
+      捕捉到 PhysicalDrive 打开句柄从而否决弹出。
+    - 解决方案：回调中启动守护线程执行 SLEEP，nativeEvent 几乎不阻塞立即返回。
+    - 通过预缓存卷→磁盘映射避免 WMI 查询。
     """
 
     _instance = None
@@ -1337,25 +1339,33 @@ class SafeRemovalPatcher:
             logging.info(
                 f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: PhysicalDrive{disk_index}"
             )
-            logging.info(f"[SafeRemovalPatch] 正在发送 FLUSH CACHE + SLEEP 停转命令...")
+            logging.info(f"[SafeRemovalPatch] 启动后台线程发送停转命令...")
 
-            try:
-                from src.hal.asm_commander import ASMCommander
-                with ASMCommander(disk_index) as cmd:
-                    if cmd.sleep():
-                        logging.info(
-                            f"[SafeRemovalPatch] 磁盘 {disk_index} 停转成功，允许系统继续移除"
-                        )
-                    else:
-                        logging.warning(
-                            f"[SafeRemovalPatch] 磁盘 {disk_index} 停转命令失败，仍允许系统继续移除"
-                        )
-            except Exception as e:
-                logging.warning(
-                    f"[SafeRemovalPatch] 磁盘 {disk_index} 停转异常: {e}，仍允许系统继续移除"
-                )
+            threading.Thread(
+                target=SafeRemovalPatcher._do_sleep,
+                args=(disk_index,),
+                daemon=True,
+            ).start()
 
         return False
+
+    @staticmethod
+    def _do_sleep(disk_index):
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index) as cmd:
+                if cmd.sleep():
+                    logging.info(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} 停转成功"
+                    )
+                else:
+                    logging.warning(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} 停转命令失败"
+                    )
+        except Exception as e:
+            logging.warning(
+                f"[SafeRemovalPatch] 磁盘 {disk_index} 停转异常: {e}"
+            )
 
     @staticmethod
     def _extract_drive_letter(lparam):
