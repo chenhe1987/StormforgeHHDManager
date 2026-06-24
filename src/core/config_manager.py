@@ -42,7 +42,7 @@ class ConfigManager:
             "intervals": {}, # {serial: seconds}
             "sleep_timers": {}, # {serial: minutes}
             "autostart": False,
-            "shutdown_eject": False,
+            "shutdown_eject": True,
             "safe_remove_spindown": True
         }
         if not os.path.exists(self.filename):

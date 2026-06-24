@@ -434,6 +434,7 @@ class ASMCommander:
         """
         Send ATA SLEEP (0xE6) command. 
         Drive will enter lowest power state and won't wake up until reset/power cycle.
+        Falls back to STANDBY IMMEDIATE if SLEEP fails.
         """
         if not self.handle:
             return False
@@ -456,6 +457,9 @@ class ASMCommander:
         
         logging.info(f"Drive {self.drive_index}: Sending ATA SLEEP...")
         success, _ = self.send_scsi_command(sleep_cdb, None, data_direction=SCSI_IOCTL_DATA_OUT)
+        if not success:
+            logging.warning(f"Drive {self.drive_index}: ATA SLEEP failed, falling back to STANDBY IMMEDIATE...")
+            return self.spin_down()
         return success
 
     def set_standby_timer(self, minutes):
