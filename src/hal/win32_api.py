@@ -3,6 +3,7 @@ from ctypes import wintypes
 import logging
 import subprocess
 import re
+import threading
 import time
 
 # Windows Constants
@@ -1193,13 +1194,14 @@ class DEV_BROADCAST_VOLUME(ctypes.Structure):
 class SafeRemovalPatcher:
     """
     拦截 Windows 安全弹出的 DBT_DEVICEQUERYREMOVE 消息，
-    在外置 USB-SATA 硬盘被系统移除前发送停转命令。
+    在外置 USB-SATA 硬盘被系统移除前发送 FLUSH CACHE + SLEEP 停转命令。
 
     关键设计：
-    - 使用 STANDBY IMMEDIATE (0xE0) 而非 SLEEP (0xE6)，速度快 10 倍以上 (<200ms)
-    - FLUSH CACHE 由 Windows 弹出流程自身处理（FS dismount 前自动 flush）
+    - 同步发送 FLUSH CACHE (<100ms)，保证数据安全
+    - SLEEP 在 daemon 线程中异步执行（2-3s），利用 veto 通过后的短暂窗口
+    - ASMT 105x/1153E 桥接芯片 PASS-THROUGH 兼容 STANDBY IMMEDIATE 过滤
+      但正确传递 SLEEP → 用 SLEEP 替代 STANDBY 实现可靠停转
     - 通过预缓存卷→磁盘映射避免 WMI 查询
-    - 同步在 nativeEvent 中执行（够快不会触发 veto），不依赖 daemon 线程
     """
 
     _instance = None
@@ -1337,22 +1339,24 @@ class SafeRemovalPatcher:
             logging.info(
                 f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: PhysicalDrive{disk_index}"
             )
-            logging.info(f"[SafeRemovalPatch] 正在发送 STANDBY IMMEDIATE 停转命令...")
+            logging.info(f"[SafeRemovalPatch] 正在发送 FLUSH CACHE...")
 
             try:
                 from src.hal.asm_commander import ASMCommander
                 with ASMCommander(disk_index) as cmd:
-                    if cmd.spin_down():
-                        logging.info(
-                            f"[SafeRemovalPatch] 磁盘 {disk_index} 停转成功，允许系统继续移除"
-                        )
-                    else:
-                        logging.warning(
-                            f"[SafeRemovalPatch] 磁盘 {disk_index} 停转命令失败，仍允许系统继续移除"
-                        )
+                    cmd.flush_cache()
+                    logging.info(
+                        f"[SafeRemovalPatch] FLUSH CACHE 完成，启动后台线程发送 SLEEP..."
+                    )
+
+                threading.Thread(
+                    target=SafeRemovalPatcher._do_sleep,
+                    args=(disk_index,),
+                    daemon=True,
+                ).start()
             except Exception as e:
                 logging.warning(
-                    f"[SafeRemovalPatch] 磁盘 {disk_index} 停转异常: {e}，仍允许系统继续移除"
+                    f"[SafeRemovalPatch] FLUSH CACHE 异常: {e}，仍允许系统继续移除"
                 )
 
         return False
@@ -1372,3 +1376,21 @@ class SafeRemovalPatcher:
             return None
         except Exception:
             return None
+
+    @staticmethod
+    def _do_sleep(disk_index):
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index) as cmd:
+                if cmd.sleep():
+                    logging.info(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 成功"
+                    )
+                else:
+                    logging.warning(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 失败"
+                    )
+        except Exception as e:
+            logging.warning(
+                f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 异常: {e}"
+            )

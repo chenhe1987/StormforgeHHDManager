@@ -121,7 +121,6 @@ class DeviceManager:
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
-                # 使用 sleep() 代替 spin_down() 以实现更彻底的停转
                 if cmd.sleep():
                     logging.info(f"磁盘 {disk_index} 休眠命令发送成功")
                     return True, "硬盘已进入休眠状态"

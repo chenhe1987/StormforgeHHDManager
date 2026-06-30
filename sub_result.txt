@@ -1,0 +1,10 @@
+rc=0
+stdout_len=0
+stderr_len=209
+STDOUT
+
+STDERR
+118 INFO: PyInstaller: 6.18.0, contrib hooks: 2026.0
+118 INFO: Python: 3.11.9
+137 INFO: Platform: Windows-10-10.0.26200-SP0
+137 INFO: Python environment: C:\Users\chenh\AppData\Local\Programs\Python\Python311

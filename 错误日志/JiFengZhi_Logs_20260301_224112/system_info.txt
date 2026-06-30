@@ -1,3 +1,0 @@
-OS: Windows
-Time: 20260301_224112
-App Version: v1.3.26

@@ -430,6 +430,18 @@ class ASMCommander:
         success, _ = self.send_scsi_command(cdb)
         return success
 
+    def idle(self):
+        """Send ATA IDLE IMMEDIATE (0xE1) to wake the drive from STANDBY/SLEEP."""
+        if not self.handle:
+            return False
+        cdb = [0] * 16
+        cdb[0] = 0x85
+        cdb[1] = (3 << 1)
+        cdb[14] = 0xE1
+        logging.info(f"Drive {self.drive_index}: Sending ATA IDLE IMMEDIATE (wake)...")
+        success, _ = self.send_scsi_command(cdb, None, data_direction=SCSI_IOCTL_DATA_OUT)
+        return success
+
     def sleep(self):
         """
         Send ATA SLEEP (0xE6) command. 

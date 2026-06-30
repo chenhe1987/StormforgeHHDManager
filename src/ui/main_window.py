@@ -415,7 +415,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.66"
+        self.version = "1.3.67"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -1482,26 +1482,56 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"正在唤醒硬盘 {disk_index}，请稍候...")
         QApplication.processEvents()
 
-        instance_id = Win32API.get_device_instance_path(disk_index)
-        if instance_id:
-            logging.info(f"唤醒硬盘: 正在硬件复位设备节点 {instance_id}")
-            reset_ok = Win32API.reset_devnode(instance_id)
-            if reset_ok:
-                logging.info(f"唤醒硬盘: 设备节点复位成功，等待系统重新枚举...")
-            else:
-                logging.warning(f"唤醒硬盘: 设备节点复位失败，尝试 pnputil...")
-                Win32API.restart_device_via_pnputil(instance_id)
+        self._wake_result = None
+        self._wake_serial = serial
+        self._wake_disk_index = disk_index
 
-            for _ in range(30):
-                time.sleep(0.2)
-                QApplication.processEvents()
+        threading.Thread(
+            target=self._wake_disk_thread,
+            args=(disk_index,),
+            daemon=True,
+        ).start()
 
-        self.monitor_service.mark_disk_awake(serial)
-        self.monitor_service.check_all_smart(force=True)
+    def _wake_disk_thread(self, disk_index):
+        result = [False]
+
+        def worker():
+            import pythoncom
+            pythoncom.CoInitialize()
+            try:
+                instance_id = Win32API.get_device_instance_path(disk_index)
+                if instance_id:
+                    result[0] = Win32API.reset_devnode(instance_id)
+            except Exception as e:
+                logging.error(f"唤醒线程异常: {e}")
+            finally:
+                pythoncom.CoUninitialize()
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(timeout=10)
+        self._wake_result = result[0]
+        QTimer.singleShot(0, self._on_wake_complete)
+
+    def _on_wake_complete(self):
+        serial = self._wake_serial
+
+        if self._wake_result:
+            logging.info("唤醒硬盘: 设备节点复位成功")
+            self.monitor_service.mark_disk_awake(serial)
+            self.monitor_service.check_all_smart(force=True)
+        else:
+            logging.warning("唤醒硬盘: 设备节点复位失败")
+            self.monitor_service.mark_disk_ejected(serial)
+            QMessageBox.information(
+                self, "唤醒失败",
+                "PnP 复位无法完成，硬盘可能处于深度休眠。\n\n"
+                "请尝试重新插拔 USB 线或重启硬盘柜电源。"
+            )
 
         self.spin_down_button.setText("立即休眠硬盘")
         self.spin_down_button.setEnabled(True)
-        self.status_label.setText("就绪")
+        self.status_label.setText("就绪" if self._wake_result else "唤醒失败，请重新插拔 USB")
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():

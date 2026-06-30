@@ -178,7 +178,7 @@ class MonitorService(threading.Thread):
                 continue
             
             # Check if disk is marked as sleeping
-            if serial in self.sleeping_disks and not force:
+            if serial in self.sleeping_disks:
                 logging.info(f"跳过检测处于休眠状态的硬盘: {disk.model} ({serial})")
                 # Still add to ui_data but with a "Sleeping" status
                 disk_info = {
