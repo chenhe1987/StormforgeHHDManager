@@ -410,6 +410,7 @@ QMessageBox QPushButton:hover {
 class MainWindow(QMainWindow):
     # Signal to update UI from background thread
     update_data_signal = Signal(list)
+    _wake_done_signal = Signal(bool)
 
     def __init__(self, silent_mode=False):
         logging.info("正在初始化 MainWindow...")
@@ -447,6 +448,7 @@ class MainWindow(QMainWindow):
         
         # Connect signal
         self.update_data_signal.connect(self.handle_data_update)
+        self._wake_done_signal.connect(self._on_wake_complete)
         
         # UI Setup
         central_widget = QWidget()
@@ -1478,53 +1480,89 @@ class MainWindow(QMainWindow):
         disk_index = self.current_disk_index
 
         self.spin_down_button.setEnabled(False)
-        self.spin_down_button.setText("正在唤醒...")
-        self.status_label.setText(f"正在唤醒硬盘 {disk_index}，请稍候...")
+        self.spin_down_button.setText("正在等待唤醒...")
+        self.status_label.setText(f"硬盘 {disk_index} 已解除黑名单，等待系统 I/O 自动唤醒...")
         QApplication.processEvents()
 
-        self._wake_serial = serial
         self._wake_disk_index = disk_index
+        self.monitor_service.mark_disk_awake(serial)
 
         threading.Thread(
-            target=self._wake_io_thread,
-            args=(disk_index, serial),
+            target=self._wake_poll_thread,
+            args=(disk_index,),
             daemon=True,
         ).start()
 
-    def _wake_io_thread(self, disk_index, serial):
-        """通过 I/O 重试唤醒 SLEEP 中的硬盘（ASMT 105x 固件行为，~6s）"""
-        result = [False]
+    def _wake_poll_thread(self, disk_index):
+        """轻量级 SCSI TUR 轮询检测盘是否已被 Windows I/O 唤醒"""
+        import pythoncom
+        pythoncom.CoInitialize()
+        import ctypes as _ct
+        from ctypes import wintypes as _W
 
-        def worker():
-            import pythoncom
-            pythoncom.CoInitialize()
+        GENERIC_RW = 0xC0000000
+        open_existing = 3
+
+        class SPTD(_ct.Structure):
+            _pack_ = 1
+            _fields_ = [
+                ("Length", _W.USHORT), ("ScsiStatus", _ct.c_ubyte),
+                ("PathId", _ct.c_ubyte), ("TargetId", _ct.c_ubyte),
+                ("Lun", _ct.c_ubyte), ("CdbLength", _ct.c_ubyte),
+                ("SenseInfoLength", _ct.c_ubyte), ("DataIn", _ct.c_ubyte),
+                ("DataTransferLength", _W.ULONG), ("TimeOutValue", _W.ULONG),
+                ("DataBuffer", _ct.c_void_p), ("SenseInfoOffset", _W.ULONG),
+                ("Cdb", _ct.c_ubyte * 16),
+            ]
+
+        def tur(handle):
+            class S(_ct.Structure):
+                _pack_ = 1
+                _fields_ = [("s", SPTD), ("sn", _ct.c_ubyte * 32)]
+            s = S()
+            s.s.Length = _ct.sizeof(SPTD)
+            s.s.CdbLength = 6
+            s.s.DataIn = 1  # SCSI_IOCTL_DATA_IN
+            s.s.TimeOutValue = 2  # 2秒超时，不阻塞太久
+            s.s.SenseInfoLength = 32
+            s.s.SenseInfoOffset = _ct.sizeof(SPTD)
+            s.s.Cdb[0] = 0x00  # TEST UNIT READY
+            s.s.DataTransferLength = 0
+            s.s.DataBuffer = None
+            br = _W.DWORD(0)
+            r = _ct.windll.kernel32.DeviceIoControl(
+                handle, 0x4D014,
+                _ct.byref(s), _ct.sizeof(s),
+                _ct.byref(s), _ct.sizeof(s),
+                _ct.byref(br), None
+            )
+            return r != 0
+
+        alive = False
+        for attempt in range(15):
+            _tm = __import__('time')
+            _tm.sleep(1)
             try:
-                self.monitor_service.mark_disk_awake(serial)
-                from src.hal.asm_commander import ASMCommander
-                for attempt in range(15):
+                h = _ct.windll.kernel32.CreateFileW(
+                    f"\\\\.\\PhysicalDrive{disk_index}",
+                    GENERIC_RW, 3, None, open_existing, 0, None
+                )
+                if h and h != -1:
                     try:
-                        with ASMCommander(disk_index) as cmd:
-                            if cmd.spin_down():
-                                result[0] = True
-                                logging.info(f"唤醒成功: Disk {disk_index} 尝试 {attempt+1} 次")
-                                break
-                    except Exception:
-                        pass
-                    tm = __import__('time')
-                    tm.sleep(1)
-            except Exception as e:
-                logging.error(f"I/O 唤醒异常: {e}")
-            finally:
-                pythoncom.CoUninitialize()
+                        if tur(h):
+                            alive = True
+                            logging.info(f"唤醒检测成功: Disk {disk_index} 尝试 {attempt+1}")
+                            break
+                    finally:
+                        _ct.windll.kernel32.CloseHandle(h)
+            except Exception:
+                pass
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        t.join(timeout=20)
-        self._wake_io_result = result[0]
-        QTimer.singleShot(0, self._on_wake_complete)
+        pythoncom.CoUninitialize()
+        self._wake_done_signal.emit(alive)
 
-    def _on_wake_complete(self):
-        if self._wake_io_result:
+    def _on_wake_complete(self, alive):
+        if alive:
             logging.info("I/O 唤醒成功")
             self.status_label.setText("就绪")
             self.spin_down_button.setText("立即休眠硬盘")
@@ -1534,15 +1572,14 @@ class MainWindow(QMainWindow):
                 daemon=True,
             ).start()
         else:
-            logging.warning("I/O 唤醒失败")
-            self.status_label.setText("唤醒失败，请重试")
-            self.spin_down_button.setText("唤醒/刷新硬盘")
+            logging.warning("I/O 唤醒超时")
+            self.status_label.setText("就绪")
+            self.spin_down_button.setText("立即休眠硬盘")
             self.spin_down_button.setEnabled(True)
-            QMessageBox.information(
-                self, "唤醒失败",
-                "I/O 无法恢复硬盘，硬盘可能处于深度休眠。\n\n"
-                "请重新插拔 USB 线或重启硬盘柜电源。"
-            )
+            threading.Thread(
+                target=lambda: self.monitor_service.check_all_smart(force=True),
+                daemon=True,
+            ).start()
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
