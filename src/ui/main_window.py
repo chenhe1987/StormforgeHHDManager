@@ -410,7 +410,7 @@ QMessageBox QPushButton:hover {
 class MainWindow(QMainWindow):
     # Signal to update UI from background thread
     update_data_signal = Signal(list)
-    _wake_done_signal = Signal(bool)
+    _wake_done_signal = Signal(dict)
 
     def __init__(self, silent_mode=False):
         logging.info("正在初始化 MainWindow...")
@@ -1480,98 +1480,43 @@ class MainWindow(QMainWindow):
         disk_index = self.current_disk_index
 
         self.spin_down_button.setEnabled(False)
-        self.spin_down_button.setText("正在等待唤醒...")
-        self.status_label.setText(f"硬盘 {disk_index} 已解除黑名单，等待系统 I/O 自动唤醒...")
+        self.spin_down_button.setText("正在唤醒...")
+        self.status_label.setText(f"正在解除休眠黑名单并发送 SMART 查询唤醒硬盘 {disk_index}...")
         QApplication.processEvents()
 
-        self._wake_disk_index = disk_index
         self.monitor_service.mark_disk_awake(serial)
 
         threading.Thread(
-            target=self._wake_poll_thread,
-            args=(disk_index,),
+            target=self._wake_via_smart_thread,
+            args=(disk_index, serial),
             daemon=True,
         ).start()
 
-    def _wake_poll_thread(self, disk_index):
-        """轻量级 SCSI TUR 轮询检测盘是否已被 Windows I/O 唤醒"""
+    def _wake_via_smart_thread(self, disk_index, serial):
+        """移出黑名单后立刻发送 SMART 查询 = I/O 唤醒"""
         import pythoncom
         pythoncom.CoInitialize()
-        import ctypes as _ct
-        from ctypes import wintypes as _W
+        try:
+            from src.hal.asm_commander import ASMCommander
 
-        GENERIC_RW = 0xC0000000
-        open_existing = 3
+            with ASMCommander(disk_index) as cmd:
+                data = cmd.get_smart_data()
+                logging.info(f"SMART 唤醒: Disk {disk_index}, SMART={'OK' if data else 'FAIL'}")
+                self._wake_done_signal.emit({
+                    "success": True,
+                    "serial": serial,
+                    "data": data,
+                })
+        except Exception as e:
+            logging.error(f"SMART 唤醒异常: {e}")
+            self._wake_done_signal.emit({"success": False, "serial": serial})
+        finally:
+            pythoncom.CoUninitialize()
 
-        class SPTD(_ct.Structure):
-            _pack_ = 1
-            _fields_ = [
-                ("Length", _W.USHORT), ("ScsiStatus", _ct.c_ubyte),
-                ("PathId", _ct.c_ubyte), ("TargetId", _ct.c_ubyte),
-                ("Lun", _ct.c_ubyte), ("CdbLength", _ct.c_ubyte),
-                ("SenseInfoLength", _ct.c_ubyte), ("DataIn", _ct.c_ubyte),
-                ("DataTransferLength", _W.ULONG), ("TimeOutValue", _W.ULONG),
-                ("DataBuffer", _ct.c_void_p), ("SenseInfoOffset", _W.ULONG),
-                ("Cdb", _ct.c_ubyte * 16),
-            ]
-
-        def tur(handle):
-            class S(_ct.Structure):
-                _pack_ = 1
-                _fields_ = [("s", SPTD), ("sn", _ct.c_ubyte * 32)]
-            s = S()
-            s.s.Length = _ct.sizeof(SPTD)
-            s.s.CdbLength = 6
-            s.s.DataIn = 1  # SCSI_IOCTL_DATA_IN
-            s.s.TimeOutValue = 2  # 2秒超时，不阻塞太久
-            s.s.SenseInfoLength = 32
-            s.s.SenseInfoOffset = _ct.sizeof(SPTD)
-            s.s.Cdb[0] = 0x00  # TEST UNIT READY
-            s.s.DataTransferLength = 0
-            s.s.DataBuffer = None
-            br = _W.DWORD(0)
-            r = _ct.windll.kernel32.DeviceIoControl(
-                handle, 0x4D014,
-                _ct.byref(s), _ct.sizeof(s),
-                _ct.byref(s), _ct.sizeof(s),
-                _ct.byref(br), None
-            )
-            return r != 0
-
-        alive = False
-        for attempt in range(15):
-            _tm = __import__('time')
-            _tm.sleep(1)
-            try:
-                h = _ct.windll.kernel32.CreateFileW(
-                    f"\\\\.\\PhysicalDrive{disk_index}",
-                    GENERIC_RW, 3, None, open_existing, 0, None
-                )
-                if h and h != -1:
-                    try:
-                        if tur(h):
-                            alive = True
-                            logging.info(f"唤醒检测成功: Disk {disk_index} 尝试 {attempt+1}")
-                            break
-                    finally:
-                        _ct.windll.kernel32.CloseHandle(h)
-            except Exception:
-                pass
-
-        pythoncom.CoUninitialize()
-        self._wake_done_signal.emit(alive)
-
-    def _on_wake_complete(self, alive):
-        if alive:
-            logging.info("I/O 唤醒成功")
-        else:
-            logging.warning("I/O 唤醒超时")
-
-        self.spin_down_button.setText("立即休眠硬盘")
-        self.spin_down_button.setEnabled(True)
+    def _on_wake_complete(self, result):
+        wake_serial = result.get("serial")
 
         updated_disks = []
-        wake_serial = self.current_disk_serial
         for disk in (self.disk_data if hasattr(self, 'disk_data') and self.disk_data else []):
             d = dict(disk)
             if d.get("serial") == wake_serial and d.get("status") == "Sleeping":
@@ -1584,6 +1529,8 @@ class MainWindow(QMainWindow):
         if updated_disks:
             self.handle_data_update(updated_disks)
 
+        self.spin_down_button.setText("立即休眠硬盘")
+        self.spin_down_button.setEnabled(True)
         self.status_label.setText("就绪")
 
         threading.Thread(
