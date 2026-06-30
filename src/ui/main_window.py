@@ -415,7 +415,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.68"
+        self.version = "1.3.69"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -1526,18 +1526,23 @@ class MainWindow(QMainWindow):
     def _on_wake_complete(self):
         if self._wake_io_result:
             logging.info("I/O 唤醒成功")
-            self.monitor_service.check_all_smart(force=True)
+            self.status_label.setText("就绪")
+            self.spin_down_button.setText("立即休眠硬盘")
+            self.spin_down_button.setEnabled(True)
+            threading.Thread(
+                target=lambda: self.monitor_service.check_all_smart(force=True),
+                daemon=True,
+            ).start()
         else:
             logging.warning("I/O 唤醒失败")
+            self.status_label.setText("唤醒失败，请重试")
+            self.spin_down_button.setText("唤醒/刷新硬盘")
+            self.spin_down_button.setEnabled(True)
             QMessageBox.information(
                 self, "唤醒失败",
                 "I/O 无法恢复硬盘，硬盘可能处于深度休眠。\n\n"
                 "请重新插拔 USB 线或重启硬盘柜电源。"
             )
-
-        self.spin_down_button.setText("立即休眠硬盘")
-        self.spin_down_button.setEnabled(True)
-        self.status_label.setText("就绪" if self._wake_io_result else "唤醒失败，请重试")
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
