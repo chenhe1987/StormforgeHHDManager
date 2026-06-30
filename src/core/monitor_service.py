@@ -29,8 +29,12 @@ class MonitorService(threading.Thread):
         
         self.disk_health_status = {} # {serial: summary}
         self.disk_last_check_times = {} # {serial: timestamp}
-        self.sleeping_disks = set() # {serial} - Disks that should not be polled
-        self.ejected_disks = set() # {serial} - Disks successfully ejected; ignore until manual refresh
+        # 从持久化配置加载休眠状态（跨程序重启保持）
+        persisted = []
+        if self.config_manager:
+            persisted = self.config_manager.get_sleeping_disks()
+        self.sleeping_disks = set(persisted) # {serial}
+        self.ejected_disks = set() # {serial}
         self.cached_disks = []
         self.last_inventory_scan_time = 0
         self.device_inventory_interval = 300
@@ -384,7 +388,10 @@ class MonitorService(threading.Thread):
                                 self.callback_notify("硬盘 SMART 预警", msg)
                     else:
                         logging.warning(f"无法读取硬盘 {disk.index} 的数据")
-                        disk_info["status"] = "Read Failed"
+                        if serial in self.sleeping_disks:
+                            disk_info["status"] = "Sleeping"
+                        else:
+                            disk_info["status"] = "Read Failed"
             except Exception as e:
                 logging.error(f"检测硬盘 {disk.index} 时发生异常: {e}", exc_info=True)
                 disk_info["status"] = "Error"
@@ -404,11 +411,15 @@ class MonitorService(threading.Thread):
             logging.info(f"将硬盘标记为休眠: {serial}")
             self.ejected_disks.discard(serial)
             self.sleeping_disks.add(serial)
+            if self.config_manager:
+                self.config_manager.add_sleeping_disk(serial)
 
     def mark_disk_ejected(self, serial):
         if serial:
             logging.info(f"将硬盘标记为已弹出: {serial}")
             self.sleeping_disks.discard(serial)
+            if self.config_manager:
+                self.config_manager.remove_sleeping_disk(serial)
             self.ejected_disks.add(serial)
             self.cached_disks = [
                 disk for disk in self.cached_disks
@@ -425,25 +436,30 @@ class MonitorService(threading.Thread):
             logging.info(f"pnputil 唤醒后清除所有休眠标记: {self.sleeping_disks}")
             self.sleeping_disks.clear()
             self.last_inventory_scan_time = 0
+            if self.config_manager:
+                self.config_manager.set_sleeping_disks([])
 
     def mark_disk_awake(self, serial):
         changed = False
         if serial in self.sleeping_disks:
             logging.info(f"将硬盘标记为唤醒: {serial}")
             self.sleeping_disks.remove(serial)
+            if self.config_manager:
+                self.config_manager.remove_sleeping_disk(serial)
             changed = True
         if serial in self.ejected_disks:
             logging.info(f"将硬盘从已弹出名单移除: {serial}")
             self.ejected_disks.remove(serial)
             changed = True
         if changed:
-            # 醒来后尽快允许下一次重新枚举，保证设备列表及时同步。
             self.last_inventory_scan_time = 0
 
     def clear_disk_exclusions(self):
         """手动刷新时清空休眠/已弹出屏蔽名单，允许系统重新发现设备。"""
         self.sleeping_disks.clear()
         self.ejected_disks.clear()
+        if self.config_manager:
+            self.config_manager.set_sleeping_disks([])
         self.last_inventory_scan_time = 0
 
     def _filter_excluded_disks(self, disks):

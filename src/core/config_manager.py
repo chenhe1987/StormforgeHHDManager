@@ -67,13 +67,33 @@ class ConfigManager:
             logging.error(f"Failed to save config: {e}")
 
     def get_disk_interval(self, serial):
-        # Default 24 hours (86400s)
         return self.config.get("intervals", {}).get(serial, 86400)
         
     def set_disk_interval(self, serial, seconds):
         if "intervals" not in self.config:
             self.config["intervals"] = {}
         self.config["intervals"][serial] = int(seconds)
+        self.save_config()
+
+    def get_sleeping_disks(self):
+        """返回持久化的休眠硬盘序列号列表"""
+        return self.config.get("sleeping_disks", [])
+
+    def set_sleeping_disks(self, serials):
+        """持久化保存休眠硬盘序列号列表"""
+        self.config["sleeping_disks"] = list(serials)
+        self.save_config()
+
+    def add_sleeping_disk(self, serial):
+        disks = set(self.config.get("sleeping_disks", []))
+        disks.add(serial)
+        self.config["sleeping_disks"] = list(disks)
+        self.save_config()
+
+    def remove_sleeping_disk(self, serial):
+        disks = set(self.config.get("sleeping_disks", []))
+        disks.discard(serial)
+        self.config["sleeping_disks"] = list(disks)
         self.save_config()
 
     def get_sleep_timer(self, serial):
