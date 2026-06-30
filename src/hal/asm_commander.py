@@ -442,6 +442,15 @@ class ASMCommander:
         success, _ = self.send_scsi_command(cdb, None, data_direction=SCSI_IOCTL_DATA_OUT)
         return success
 
+    def is_responding(self):
+        """Lightweight SCSI TEST UNIT READY to check if drive is actually not sleeping."""
+        if not self.handle:
+            return False
+        cdb = [0] * 6
+        cdb[0] = 0x00  # TEST UNIT READY
+        success, _ = self.send_scsi_command(cdb, None, data_direction=1, timeout=3)
+        return success
+
     def sleep(self):
         """
         Send ATA SLEEP (0xE6) command. 

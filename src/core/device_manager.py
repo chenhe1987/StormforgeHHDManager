@@ -116,17 +116,25 @@ class DeviceManager:
 
     @staticmethod
     def spin_down_disk(disk_index, model=None, serial=None):
-        """仅发送停转命令，不弹出设备"""
+        """发送停转命令并验证盘是否真的停了"""
         logging.info(f"正在尝试让磁盘 {disk_index} 进入休眠...")
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
-                if cmd.sleep():
-                    logging.info(f"磁盘 {disk_index} 休眠命令发送成功")
-                    return True, "硬盘已进入休眠状态"
-                else:
+                if not cmd.sleep():
                     logging.warning(f"磁盘 {disk_index} 休眠命令发送失败")
                     return False, "休眠命令发送失败"
+
+                logging.info(f"磁盘 {disk_index} 休眠命令发送成功，验证停转...")
+                import time
+                time.sleep(0.5)
+
+                if not cmd.is_responding():
+                    logging.info(f"磁盘 {disk_index} 验证通过：盘确已停转")
+                    return True, "硬盘已进入休眠状态"
+                else:
+                    logging.warning(f"磁盘 {disk_index} 休眠后盘仍在响应（被 Windows I/O 唤醒）")
+                    return False, "休眠命令已发送，但硬盘被系统立即唤醒\n\n可能原因：后台程序正在访问该硬盘。\n建议：关闭所有文件管理器窗口后重试。"
         except Exception as e:
             logging.error(f"磁盘 {disk_index} 休眠操作发生异常: {e}")
             return False, f"操作异常: {e}"

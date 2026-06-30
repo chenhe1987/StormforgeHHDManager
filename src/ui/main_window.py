@@ -416,7 +416,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.69"
+        self.version = "1.3.70"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -1259,16 +1259,16 @@ class MainWindow(QMainWindow):
         disk = item.data(Qt.UserRole)
         self.title_label.setText(disk.get("model", "未知型号"))
         
-        # 如果硬盘处于休眠状态，允许点击按钮来"唤醒"或重新检测
         status = disk.get("status", "")
         
         if status == "Sleeping":
             self.spin_down_button.setText("唤醒/刷新硬盘")
+            self.spin_down_button.setEnabled(True)
         else:
             self.spin_down_button.setText("立即休眠硬盘")
+            self.spin_down_button.setEnabled(True)
             
-        self.spin_down_button.setEnabled(True)
-        self.current_disk_index = disk.get("index") # Store current index
+        self.current_disk_index = disk.get("index")
         self.current_disk_serial = disk.get("serial")
         self.current_disk_model = disk.get("model")
 
@@ -1406,26 +1406,48 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.Yes:
             logging.info(f"用户触发磁盘 {self.current_disk_index} 休眠")
-            # 1. 首先在监控服务中屏蔽该硬盘，防止刚停转就被唤醒
             if hasattr(self, 'monitor_service') and self.current_disk_serial:
                 self.monitor_service.mark_disk_sleeping(self.current_disk_serial)
+
+            self.spin_down_button.setEnabled(False)
+            self.spin_down_button.setText("正在休眠...")
+            self.status_label.setText("正在发送休眠命令并验证停转...")
+            QApplication.processEvents()
             
-            # 2. 发送停转指令
+            threading.Thread(
+                target=self._spin_down_and_verify_thread,
+                args=(self.current_disk_index, self.current_disk_model, self.current_disk_serial),
+                daemon=True,
+            ).start()
+
+    def _spin_down_and_verify_thread(self, disk_index, model, serial):
+        result = {}
+        try:
             success, message = DeviceManager.spin_down_disk(
-                self.current_disk_index, 
-                model=self.current_disk_model, 
-                serial=self.current_disk_serial
+                disk_index, model=model, serial=serial
             )
-            
-            if success:
-                self._mark_current_disk_sleeping_in_ui()
-                full_message = message + self._build_windows_sleep_guidance()
-                QMessageBox.information(self, "操作成功", full_message)
-            else:
-                # 如果失败了，恢复监控
-                if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                    self.monitor_service.mark_disk_awake(self.current_disk_serial)
-                QMessageBox.warning(self, "操作失败", message)
+            result = {"success": success, "message": message, "serial": serial}
+        except Exception as e:
+            result = {"success": False, "message": str(e), "serial": serial}
+        QTimer.singleShot(0, lambda: self._on_spin_down_complete(result))
+
+    def _on_spin_down_complete(self, result):
+        success = result.get("success", False)
+        message = result.get("message", "")
+        serial = result.get("serial")
+
+        if success:
+            self._mark_current_disk_sleeping_in_ui()
+            full_message = message + self._build_windows_sleep_guidance()
+            QMessageBox.information(self, "休眠成功", full_message)
+        else:
+            if hasattr(self, 'monitor_service') and serial:
+                self.monitor_service.mark_disk_awake(serial)
+            QMessageBox.warning(self, "休眠失败", message)
+
+        self.spin_down_button.setText("立即休眠硬盘")
+        self.spin_down_button.setEnabled(True)
+        self.status_label.setText("就绪" if success else "休眠失败")
 
     def _mark_current_disk_sleeping_in_ui(self):
         """本地直接把当前磁盘标记为休眠，避免立即触发一次全盘扫描导致再次唤醒。"""
