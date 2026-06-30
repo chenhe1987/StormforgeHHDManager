@@ -419,6 +419,13 @@ class MonitorService(threading.Thread):
             # 允许后续正常扫描剩余设备，但不要再把已弹出的设备重新加回来，直到用户手动刷新。
             self.last_inventory_scan_time = 0
 
+    def clear_all_sleeping(self):
+        """pnputil 重启设备后所有盘一起醒来"""
+        if self.sleeping_disks:
+            logging.info(f"pnputil 唤醒后清除所有休眠标记: {self.sleeping_disks}")
+            self.sleeping_disks.clear()
+            self.last_inventory_scan_time = 0
+
     def mark_disk_awake(self, serial):
         changed = False
         if serial in self.sleeping_disks:

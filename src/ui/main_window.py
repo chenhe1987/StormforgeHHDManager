@@ -415,7 +415,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.67"
+        self.version = "1.3.68"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -1474,64 +1474,66 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'monitor_service'):
             return
 
+        reply = QMessageBox.question(
+            self, "确认唤醒",
+            "使用 pnputil 重启设备会重置整个硬盘柜的 USB 连接，\n"
+            "柜内所有硬盘将同时被唤醒。\n\n"
+            "确定要继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return
+
         serial = self.current_disk_serial
         disk_index = self.current_disk_index
 
         self.spin_down_button.setEnabled(False)
         self.spin_down_button.setText("正在唤醒...")
-        self.status_label.setText(f"正在唤醒硬盘 {disk_index}，请稍候...")
+        self.status_label.setText("正在通过 pnputil 重启设备唤醒所有硬盘，请稍候...")
         QApplication.processEvents()
 
-        self._wake_result = None
         self._wake_serial = serial
-        self._wake_disk_index = disk_index
 
         threading.Thread(
-            target=self._wake_disk_thread,
+            target=self._wake_pnputil_thread,
             args=(disk_index,),
             daemon=True,
         ).start()
 
-    def _wake_disk_thread(self, disk_index):
+    def _wake_pnputil_thread(self, disk_index):
         result = [False]
 
         def worker():
             import pythoncom
             pythoncom.CoInitialize()
             try:
-                instance_id = Win32API.get_device_instance_path(disk_index)
-                if instance_id:
-                    result[0] = Win32API.reset_devnode(instance_id)
+                parent_id = Win32API.get_usbstor_parent_device_id(disk_index)
+                if parent_id:
+                    Win32API.restart_device_via_pnputil(parent_id)
+                result[0] = True
             except Exception as e:
-                logging.error(f"唤醒线程异常: {e}")
+                logging.error(f"pnputil 唤醒线程异常: {e}")
             finally:
                 pythoncom.CoUninitialize()
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-        t.join(timeout=10)
-        self._wake_result = result[0]
+        t.join(timeout=30)
+        self._wake_pnputil_result = result[0]
         QTimer.singleShot(0, self._on_wake_complete)
 
     def _on_wake_complete(self):
-        serial = self._wake_serial
-
-        if self._wake_result:
-            logging.info("唤醒硬盘: 设备节点复位成功")
-            self.monitor_service.mark_disk_awake(serial)
+        if self._wake_pnputil_result:
+            logging.info("pnputil 设备重启完成，正在重新检测所有硬盘...")
+            # pnputil 重启了整个 USBSTOR 父设备，柜内所有盘都醒了
+            self.monitor_service.clear_all_sleeping()
             self.monitor_service.check_all_smart(force=True)
         else:
-            logging.warning("唤醒硬盘: 设备节点复位失败")
-            self.monitor_service.mark_disk_ejected(serial)
-            QMessageBox.information(
-                self, "唤醒失败",
-                "PnP 复位无法完成，硬盘可能处于深度休眠。\n\n"
-                "请尝试重新插拔 USB 线或重启硬盘柜电源。"
-            )
+            logging.warning("pnputil 设备重启失败")
 
         self.spin_down_button.setText("立即休眠硬盘")
         self.spin_down_button.setEnabled(True)
-        self.status_label.setText("就绪" if self._wake_result else "唤醒失败，请重新插拔 USB")
+        self.status_label.setText("就绪" if self._wake_pnputil_result else "唤醒失败，请重试")
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():

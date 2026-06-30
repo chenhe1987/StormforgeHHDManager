@@ -622,10 +622,30 @@ class Win32API:
         try:
             c = wmi.WMI()
             for drive in c.Win32_DiskDrive(Index=disk_index):
-                # PNPDeviceID 通常是设备实例路径
                 return drive.PNPDeviceID
         except Exception:
             return None
+        return None
+
+    @staticmethod
+    def get_usbstor_parent_device_id(disk_index):
+        """获取磁盘对应的 USBSTOR 父设备实例 ID，用于 pnputil 重启"""
+        import subprocess as _sp
+        try:
+            r = _sp.run(
+                f'wmic path Win32_DiskDrive where Index={disk_index} get PNPDeviceID /value',
+                capture_output=True, text=True, shell=True, timeout=10
+            )
+            for line in r.stdout.split('\n'):
+                if 'PNPDeviceID=' in line:
+                    pid = line.split('=')[1].strip()
+                    # Walk up the device tree
+                    parts = pid.rsplit('\\', 1)
+                    parent_id = parts[0] if len(parts) == 2 else pid
+                    logging.info(f"USBSTOR parent for disk {disk_index}: {parent_id}")
+                    return parent_id
+        except Exception as e:
+            logging.warning(f"获取 USBSTOR 父设备失败: {e}")
         return None
 
     @staticmethod
