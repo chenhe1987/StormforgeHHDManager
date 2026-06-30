@@ -1564,22 +1564,32 @@ class MainWindow(QMainWindow):
     def _on_wake_complete(self, alive):
         if alive:
             logging.info("I/O 唤醒成功")
-            self.status_label.setText("就绪")
-            self.spin_down_button.setText("立即休眠硬盘")
-            self.spin_down_button.setEnabled(True)
-            threading.Thread(
-                target=lambda: self.monitor_service.check_all_smart(force=True),
-                daemon=True,
-            ).start()
         else:
             logging.warning("I/O 唤醒超时")
-            self.status_label.setText("就绪")
-            self.spin_down_button.setText("立即休眠硬盘")
-            self.spin_down_button.setEnabled(True)
-            threading.Thread(
-                target=lambda: self.monitor_service.check_all_smart(force=True),
-                daemon=True,
-            ).start()
+
+        self.spin_down_button.setText("立即休眠硬盘")
+        self.spin_down_button.setEnabled(True)
+
+        updated_disks = []
+        wake_serial = self.current_disk_serial
+        for disk in (self.disk_data if hasattr(self, 'disk_data') and self.disk_data else []):
+            d = dict(disk)
+            if d.get("serial") == wake_serial and d.get("status") == "Sleeping":
+                d["status"] = "Healthy"
+                d["temp"] = "---"
+                d["reallocated"] = "---"
+                d["pending"] = "---"
+            updated_disks.append(d)
+
+        if updated_disks:
+            self.handle_data_update(updated_disks)
+
+        self.status_label.setText("就绪")
+
+        threading.Thread(
+            target=lambda: self.monitor_service.check_all_smart(force=True),
+            daemon=True,
+        ).start()
 
     def setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
