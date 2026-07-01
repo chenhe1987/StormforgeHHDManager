@@ -462,6 +462,25 @@ class MonitorService(threading.Thread):
             self.config_manager.set_sleeping_disks([])
         self.last_inventory_scan_time = 0
 
+    def pause_for_removal(self, disk_index):
+        """系统即将移除设备，立即释放该盘所有资源"""
+        logging.info(f"暂停监控以允许设备移除: PhysicalDrive{disk_index}")
+        self.last_inventory_scan_time = time.time() + 120
+        self.cached_disks = [
+            d for d in self.cached_disks
+            if getattr(d, "index", None) != disk_index
+        ]
+        try:
+            import pythoncom
+            pythoncom.CoFreeUnusedLibraries()
+        except Exception:
+            pass
+
+    def resume_after_removal(self):
+        """设备移除完成后恢复扫描"""
+        logging.info("设备移除完毕，恢复监控扫描")
+        self.last_inventory_scan_time = 0
+
     def _filter_excluded_disks(self, disks):
         if not self.ejected_disks:
             return list(disks)

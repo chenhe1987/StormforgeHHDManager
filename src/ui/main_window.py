@@ -781,11 +781,6 @@ class MainWindow(QMainWindow):
         logging.info("正在设置系统托盘...")
         self.setup_tray()
 
-        # Safe Removal Spin-Down Patcher
-        self.spindown_patcher = SafeRemovalPatcher()
-        self.spindown_patcher.enabled = self.config_manager.get_safe_remove_spindown()
-        QTimer.singleShot(1000, self._register_spindown_patcher)
-
         self.current_disk_serial = None # Track currently selected disk
         
         # Start Monitor Service
@@ -795,6 +790,13 @@ class MainWindow(QMainWindow):
             callback_update_ui=self.emit_update_signal
         )
         self.monitor_service.start()
+
+        # Safe Removal Spin-Down Patcher — always register to intercept removal events
+        # and pause monitor service to release device refs. _enabled only controls FLUSH+SLEEP.
+        self.spindown_patcher = SafeRemovalPatcher()
+        self.spindown_patcher.monitor_service = self.monitor_service
+        self.spindown_patcher.enabled = self.config_manager.get_safe_remove_spindown()
+        QTimer.singleShot(1000, self._register_spindown_patcher)
         
         self.status_label.setText("监控服务运行中 (系统日志实时监控)")
         logging.info("MainWindow 初始化完成")

@@ -1237,9 +1237,10 @@ class SafeRemovalPatcher:
             return
         self._notification_handle = None
         self._hwnd = None
-        self._enabled = True
+        self._enabled = True  # controls FLUSH+SLEEP only
         self._pending_volumes = {}
         self._volume_disk_cache = {}
+        self.monitor_service = None  # set by main_window
         self._initialized = True
 
     @property
@@ -1249,11 +1250,6 @@ class SafeRemovalPatcher:
     @enabled.setter
     def enabled(self, value):
         self._enabled = bool(value)
-        if self._enabled and self._hwnd:
-            if not self._notification_handle:
-                self.register(self._hwnd)
-        else:
-            self.unregister()
 
     def refresh_cache(self):
         try:
@@ -1287,10 +1283,6 @@ class SafeRemovalPatcher:
         try:
             user32 = ctypes.WinDLL('user32', use_last_error=True)
             self._hwnd = hwnd
-
-            if not self._enabled:
-                logging.info("[SafeRemovalPatch] 功能未启用，跳过注册设备通知")
-                return False
 
             self.refresh_cache()
 
@@ -1326,9 +1318,6 @@ class SafeRemovalPatcher:
                 self._notification_handle = None
 
     def handle_wm_devicechange(self, wparam, lparam):
-        if not self._enabled:
-            return False
-
         event_code = wparam
 
         if event_code == DBT_DEVICEARRIVAL:
@@ -1340,46 +1329,65 @@ class SafeRemovalPatcher:
 
         if event_code == DBT_DEVICEREMOVECOMPLETE:
             self._pending_volumes.clear()
+            if self.monitor_service:
+                self.monitor_service.resume_after_removal()
             return False
 
         return False
 
     def _on_query_remove(self, lparam):
+        reply = False  # do not veto; let Windows proceed
+
         drive_letter = SafeRemovalPatcher._extract_drive_letter(lparam)
         if not drive_letter:
-            return False
+            return reply
 
         vol = drive_letter[0].upper()
         disk_index = self._volume_disk_cache.get(vol)
         if disk_index is None:
-            return False
+            return reply
 
-        if not self._pending_volumes:
-            self._pending_volumes["_"] = True
-            logging.info(
-                f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: PhysicalDrive{disk_index}"
-            )
-            logging.info(f"[SafeRemovalPatch] 正在发送 FLUSH CACHE...")
+        logging.info(
+            f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: {drive_letter} (PhysicalDrive{disk_index})"
+        )
 
-            try:
-                from src.hal.asm_commander import ASMCommander
-                with ASMCommander(disk_index) as cmd:
-                    cmd.flush_cache()
-                    logging.info(
-                        f"[SafeRemovalPatch] FLUSH CACHE 完成，启动后台线程发送 SLEEP..."
-                    )
+        if self.monitor_service:
+            self.monitor_service.pause_for_removal(disk_index)
 
-                threading.Thread(
-                    target=SafeRemovalPatcher._do_sleep,
-                    args=(disk_index,),
-                    daemon=True,
-                ).start()
-            except Exception as e:
-                logging.warning(
-                    f"[SafeRemovalPatch] FLUSH CACHE 异常: {e}，仍允许系统继续移除"
+        try:
+            import pythoncom
+            pythoncom.CoFreeUnusedLibraries()
+        except Exception:
+            pass
+
+        if not self._enabled:
+            return reply
+
+        if self._pending_volumes:
+            return reply
+
+        self._pending_volumes["_"] = True
+        logging.info(f"[SafeRemovalPatch] 正在发送 FLUSH CACHE...")
+
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index) as cmd:
+                cmd.flush_cache()
+                logging.info(
+                    f"[SafeRemovalPatch] FLUSH CACHE 完成，启动后台线程发送 SLEEP..."
                 )
 
-        return False
+            threading.Thread(
+                target=SafeRemovalPatcher._do_sleep,
+                args=(disk_index,),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            logging.warning(
+                f"[SafeRemovalPatch] FLUSH CACHE 异常: {e}，仍允许系统继续移除"
+            )
+
+        return reply
 
     @staticmethod
     def _extract_drive_letter(lparam):
