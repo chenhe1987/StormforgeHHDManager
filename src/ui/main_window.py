@@ -1442,14 +1442,14 @@ class MainWindow(QMainWindow):
             self._mark_current_disk_sleeping_in_ui()
             full_message = message + self._build_windows_sleep_guidance()
             QMessageBox.information(self, "休眠成功", full_message)
+            self.status_label.setText("硬盘已进入休眠状态")
         else:
             if hasattr(self, 'monitor_service') and serial:
                 self.monitor_service.mark_disk_awake(serial)
             QMessageBox.warning(self, "休眠失败", message)
-
-        self.spin_down_button.setText("立即休眠硬盘")
-        self.spin_down_button.setEnabled(True)
-        self.status_label.setText("就绪" if success else "休眠失败")
+            self.spin_down_button.setText("立即休眠硬盘")
+            self.spin_down_button.setEnabled(True)
+            self.status_label.setText("休眠失败")
 
     def _mark_current_disk_sleeping_in_ui(self):
         """本地直接把当前磁盘标记为休眠，避免立即触发一次全盘扫描导致再次唤醒。"""
