@@ -910,23 +910,14 @@ class MainWindow(QMainWindow):
         minutes = self.sleep_timer_slider.value()
         logging.info(f"Setting sleep timer for {self.current_disk_serial} to {minutes} min")
         
-        # 1. 保存到配置
         self.config_manager.set_sleep_timer(self.current_disk_serial, minutes)
-        
-        # 2. 立即应用到硬件
-        success, message = DeviceManager.set_standby_timer(
-            self.current_disk_index, 
-            minutes,
-            model=self.current_disk_model, 
-            serial=self.current_disk_serial
-        )
-        
-        if success:
-            self.sleep_timer_label.setStyleSheet("color: #9147ff; font-size: 13px; font-weight: bold;")
-            # self.tray_icon.showMessage("设置成功", f"硬盘休眠时间已设置为 {minutes} 分钟", QSystemTrayIcon.Information, 3000)
-        else:
-            self.sleep_timer_label.setStyleSheet("color: #ffaa00; font-size: 13px; font-weight: bold;")
-            QMessageBox.warning(self, "设置失败", message)
+
+        if hasattr(self, 'monitor_service'):
+            self.monitor_service.reset_idle_timer(
+                self.current_disk_serial, disk_index=self.current_disk_index
+            )
+
+        self.sleep_timer_label.setStyleSheet("color: #9147ff; font-size: 13px; font-weight: bold;")
     @Slot()
     def on_refresh_clicked(self):
         """处理刷新按钮点击：重新扫描硬件并更新列表"""

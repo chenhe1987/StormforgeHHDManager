@@ -459,10 +459,7 @@ class MonitorService(threading.Thread):
             changed = True
         if changed:
             self.last_inventory_scan_time = 0
-            # 唤醒后重置空闲追踪器——如果盘 I/O 恢复则重新计时
-            for idx, tracker in list(self._idle_tracker.items()):
-                if tracker.get("serial") == serial:
-                    del self._idle_tracker[idx]
+            self.reset_idle_timer(serial)
 
     def clear_disk_exclusions(self):
         """手动刷新时清空休眠/已弹出屏蔽名单，允许系统重新发现设备。"""
@@ -492,27 +489,8 @@ class MonitorService(threading.Thread):
         self.last_inventory_scan_time = 0
 
     def _check_idle_timers(self):
-        """Software idle timer: reads IOCTL_DISK_PERFORMANCE to detect idle disks"""
+        """简单倒计时——超时后触发休眠（等同于点击立即休眠按钮）"""
         try:
-            import ctypes
-            from ctypes import wintypes
-            IOCTL_DISK_PERFORMANCE = 0x70020
-            GENERIC_READ = 0x80000000
-            OPEN_EXISTING = 3
-            FILE_SHARE_READ = 1
-            FILE_SHARE_WRITE = 2
-
-            class DISK_PERFORMANCE(ctypes.Structure):
-                _fields_ = [
-                    ("BytesRead", ctypes.c_longlong), ("BytesWritten", ctypes.c_longlong),
-                    ("ReadTime", ctypes.c_longlong), ("WriteTime", ctypes.c_longlong),
-                    ("IdleTime", ctypes.c_longlong),
-                    ("ReadCount", wintypes.DWORD), ("WriteCount", wintypes.DWORD),
-                    ("QueueDepth", wintypes.DWORD), ("SplitCount", wintypes.DWORD),
-                    ("QueryTime", ctypes.c_longlong), ("StorageDeviceNumber", wintypes.DWORD),
-                    ("StorageManagerName", wintypes.WCHAR * 8),
-                ]
-
             disks = self._get_cached_or_scan_disks(force=False)
             now = time.time()
 
@@ -520,11 +498,7 @@ class MonitorService(threading.Thread):
                 idx = disk.index
                 serial = disk.serial_number
 
-                # Skip sleeping and ejected disks
-                if serial in self.sleeping_disks:
-                    self._idle_tracker.pop(idx, None)
-                    continue
-                if serial in self.ejected_disks:
+                if serial in self.sleeping_disks or serial in self.ejected_disks:
                     self._idle_tracker.pop(idx, None)
                     continue
 
@@ -533,63 +507,48 @@ class MonitorService(threading.Thread):
                     self._idle_tracker.pop(idx, None)
                     continue
 
-                h = ctypes.windll.kernel32.CreateFileW(
-                    f"\\\\.\\PhysicalDrive{idx}",
-                    GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    None, OPEN_EXISTING, 0, None
-                )
-                if not h or h == -1:
+                tracker = self._idle_tracker.get(idx)
+                if tracker is None:
+                    self._idle_tracker[idx] = {"start": now, "timeout": timeout_mins}
+                    logging.info(
+                        f"Idle timer started: Disk {idx} -> SLEEP in {timeout_mins} min"
+                    )
                     continue
 
-                try:
-                    dp = DISK_PERFORMANCE()
-                    br = wintypes.DWORD(0)
-                    ok = ctypes.windll.kernel32.DeviceIoControl(
-                        h, IOCTL_DISK_PERFORMANCE,
-                        None, 0, ctypes.byref(dp), ctypes.sizeof(dp), ctypes.byref(br), None
+                current_timeout = self.config_manager.get_sleep_timer(serial)
+                if current_timeout != tracker.get("timeout"):
+                    tracker["timeout"] = current_timeout
+                    tracker["start"] = now
+
+                elapsed = now - tracker["start"]
+                if elapsed >= tracker["timeout"] * 60:
+                    logging.info(
+                        f"Idle timer fired: Disk {idx}, timeout={tracker['timeout']}min, "
+                        f"elapsed={elapsed:.0f}s"
                     )
-                    if not ok:
-                        continue
-
-                    r = dp.ReadCount + dp.WriteCount
-                    tracker = self._idle_tracker.get(idx)
-
-                    if tracker is None:
-                        self._idle_tracker[idx] = {
-                            "last_rw": r, "idle_since": now,
-                            "timeout": timeout_mins, "serial": serial
-                        }
-                        continue
-
-                    if r != tracker.get("last_rw", -1):
-                        tracker["last_rw"] = r
-                        tracker["idle_since"] = now
-                        tracker["timeout"] = timeout_mins
-                        tracker["serial"] = serial
-                    else:
-                        elapsed = now - tracker["idle_since"]
-                        if elapsed >= timeout_mins * 60:
-                            logging.info(
-                                f"Idle timeout: Disk {idx} ({disk.model}) idle for "
-                                f"{elapsed:.0f}s > {timeout_mins}min, sending SLEEP"
-                            )
-                            self.mark_disk_sleeping(serial)
-                            try:
-                                from src.hal.asm_commander import ASMCommander
-                                with ASMCommander(idx) as cmd:
-                                    if cmd.sleep():
-                                        logging.info(f"Auto-sleep OK: Disk {idx}")
-                                    else:
-                                        logging.warning(f"Auto-sleep FAIL: Disk {idx}")
-                            except Exception as e:
-                                logging.warning(f"Auto-sleep exception: {e}")
-                            self._idle_tracker.pop(idx, None)
-                finally:
-                    ctypes.windll.kernel32.CloseHandle(h)
+                    self.mark_disk_sleeping(serial)
+                    try:
+                        from src.hal.asm_commander import ASMCommander
+                        with ASMCommander(idx) as cmd:
+                            if cmd.sleep():
+                                logging.info(f"Auto-sleep OK: Disk {idx}")
+                            else:
+                                logging.warning(f"Auto-sleep FAIL: Disk {idx}")
+                    except Exception as e:
+                        logging.warning(f"Auto-sleep exception: {e}")
+                    self._idle_tracker.pop(idx, None)
 
         except Exception as e:
             logging.debug(f"Idle timer check failed: {e}")
+
+    def reset_idle_timer(self, serial, disk_index=None):
+        """用户修改休眠时间或唤醒后调用——重新开始倒计时"""
+        if disk_index is not None:
+            self._idle_tracker.pop(disk_index, None)
+            return
+        for idx, tracker in list(self._idle_tracker.items()):
+            if tracker.get("serial") == serial:
+                del self._idle_tracker[idx]
 
     def _filter_excluded_disks(self, disks):
         if not self.ejected_disks:
