@@ -30,6 +30,8 @@ logging.info("Win32API 导入成功")
 # Win32 Constants
 WM_QUERYENDSESSION = 0x0011
 WM_ENDSESSION = 0x0016
+WM_POWERBROADCAST = 0x0218
+PBT_APMSUSPEND = 0x0004
 
 class MSG(ctypes.Structure):
     _fields_ = [
@@ -1161,6 +1163,13 @@ class MainWindow(QMainWindow):
                     if msg.wParam:
                         pass
 
+                elif msg.message == WM_POWERBROADCAST:
+                    if msg.wParam == PBT_APMSUSPEND:
+                        logging.info("收到系统休眠信号 (PBT_APMSUSPEND)")
+                        if self.config_manager.get_shutdown_eject():
+                            self.eject_all_removable_disks(is_system_sleep=True)
+                    return True, 0
+
                 elif msg.message == WM_DEVICECHANGE:
                     if self.spindown_patcher.handle_wm_devicechange(msg.wParam, msg.lParam):
                         return True, 0
@@ -1169,17 +1178,18 @@ class MainWindow(QMainWindow):
 
         return super().nativeEvent(eventType, message)
 
-    def eject_all_removable_disks(self):
-        """Synchronously execute sleep commands for all removable disks during shutdown"""
-        logging.info("正在执行关机保护(休眠所有硬盘)...")
-        
-        # 尝试设置关机阻塞原因 (提升用户体验)
-        hwnd = int(self.winId())
-        try:
-            reason = "正在为您执行硬盘关机休眠保护，请稍候..."
-            ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
-        except Exception as e:
-            logging.warning(f"设置关机阻塞提示失败: {e}")
+    def eject_all_removable_disks(self, is_system_sleep=False):
+        """Synchronously execute sleep commands for all removable disks during shutdown/sleep"""
+        event_type = "系统休眠" if is_system_sleep else "关机"
+        logging.info(f"正在执行{event_type}保护(休眠所有硬盘)...")
+
+        if not is_system_sleep:
+            hwnd = int(self.winId())
+            try:
+                reason = "正在为您执行硬盘关机休眠保护，请稍候..."
+                ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
+            except Exception as e:
+                logging.warning(f"设置关机阻塞提示失败: {e}")
 
         try:
             if hasattr(self, 'monitor_service'):
