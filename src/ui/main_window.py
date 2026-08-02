@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.70"
+        self.version = "1.3.71"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -1179,12 +1179,15 @@ class MainWindow(QMainWindow):
         return super().nativeEvent(eventType, message)
 
     def eject_all_removable_disks(self, is_system_sleep=False):
-        """Synchronously execute sleep commands for all removable disks during shutdown/sleep"""
+        """关机/系统休眠时休眠所有外置硬盘：SLEEP → 等待盘停转(~12s) → 断电"""
         event_type = "系统休眠" if is_system_sleep else "关机"
         logging.info(f"正在执行{event_type}保护(休眠所有硬盘)...")
 
-        if not is_system_sleep:
-            hwnd = int(self.winId())
+        # 硬盘柜实际停转需要约 10 秒，设 12 秒余量
+        SPIN_DOWN_WAIT_SEC = 12
+
+        hwnd = int(self.winId()) if not is_system_sleep else None
+        if not is_system_sleep and hwnd is not None:
             try:
                 reason = "正在为您执行硬盘关机休眠保护，请稍候..."
                 ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
@@ -1210,49 +1213,70 @@ class MainWindow(QMainWindow):
                 logging.info("没有需要休眠的外置硬盘")
                 return
 
-            import threading
-            from src.hal.asm_commander import ASMCommander
-
-            if hasattr(self, 'monitor_service'):
-                for _, _, serial in eject_list:
-                    self.monitor_service.mark_disk_sleeping(serial)
+            # Phase 1: 并发发送 SLEEP 命令
+            results = []
+            sleep_sent_time = time.time()
 
             def sleep_worker(disk_index, model, serial):
                 try:
-                    logging.info(f"关机保护: 正在尝试休眠硬盘 {model} (Index: {disk_index})...")
-                    with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
-                        success = cmd.sleep()
-                        if success:
-                            logging.info(f"关机保护: 硬盘 {disk_index} 已成功进入休眠状态。")
-                        else:
-                            logging.warning(f"关机保护: 硬盘 {disk_index} 休眠命令失败。")
+                    logging.info(f"{event_type}保护: 正在休眠硬盘 {model} (Index: {disk_index})...")
+                    success, msg = DeviceManager.spin_down_disk(
+                        disk_index, model=model, serial=serial
+                    )
+                    results.append((disk_index, model, serial, success, msg))
+                    if success:
+                        logging.info(f"{event_type}保护: 硬盘 {disk_index} SLEEP 已发送（桥已接受）")
+                    else:
+                        logging.warning(f"{event_type}保护: 硬盘 {disk_index} SLEEP 失败 — {msg}")
                 except Exception as e:
-                    logging.error(f"磁盘 {disk_index} 关机休眠异常: {e}")
+                    logging.error(f"磁盘 {disk_index} {event_type}休眠异常: {e}")
+                    results.append((disk_index, model, serial, False, str(e)))
 
             threads = []
-            # 并发执行所有硬盘的休眠操作，节省关机等待时间
             for disk_index, model, serial in eject_list:
                 t = threading.Thread(target=sleep_worker, args=(disk_index, model, serial))
                 t.start()
                 threads.append(t)
-            
-            # 等待所有线程完成，严格控制最大总等待时间为 4 秒（Windows 关机超时通常为 5 秒）
-            import time
-            start_time = time.time()
+
             for t in threads:
-                remaining = 4.0 - (time.time() - start_time)
+                remaining = 5.0 - (time.time() - sleep_sent_time)
                 if remaining > 0:
                     t.join(timeout=remaining)
-                
-            logging.info("关机休眠保护执行完毕")
+
+            # Phase 2: 等待硬盘实际停转（不发送任何 I/O，纯等待）
+            elapsed = time.time() - sleep_sent_time
+            remaining_wait = max(0, SPIN_DOWN_WAIT_SEC - elapsed)
+            if remaining_wait > 0:
+                logging.info(
+                    f"{event_type}保护: SLEEP 已全部发送，等待 {remaining_wait:.1f} 秒让硬盘停转..."
+                )
+                time.sleep(remaining_wait)
+
+            # 汇总：标记 SLEEP 成功的盘
+            slept_serials = []
+            for _, _, serial, success, msg in results:
+                if success:
+                    slept_serials.append(serial)
+                else:
+                    logging.error(f"{event_type}保护: {serial} SLEEP 失败，不标记为 Sleeping")
+
+            if hasattr(self, 'monitor_service'):
+                for serial in slept_serials:
+                    self.monitor_service.mark_disk_sleeping(serial)
+
+            total_wait = time.time() - sleep_sent_time
+            logging.info(
+                f"{event_type}保护完成: {len(slept_serials)}/{len(eject_list)} 块硬盘已休眠"
+                f"（总等待 {total_wait:.1f} 秒），可安全断电"
+            )
         except Exception as e:
-            logging.error(f"关机休眠保护执行异常: {e}")
+            logging.error(f"{event_type}休眠保护执行异常: {e}")
         finally:
-            # 无论成功失败，都移除阻塞原因
-            try:
-                ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
-            except:
-                pass
+            if not is_system_sleep and hwnd is not None:
+                try:
+                    ctypes.windll.user32.ShutdownBlockReasonDestroy(hwnd)
+                except:
+                    pass
 
     def on_disk_selected(self, item):
         if not item:
