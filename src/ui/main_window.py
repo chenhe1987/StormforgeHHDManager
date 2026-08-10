@@ -1183,8 +1183,8 @@ class MainWindow(QMainWindow):
         event_type = "系统休眠" if is_system_sleep else "关机"
         logging.info(f"正在执行{event_type}保护(休眠所有硬盘)...")
 
-        # 硬盘柜实际停转需要约 10 秒，设 12 秒余量
-        SPIN_DOWN_WAIT_SEC = 12
+        # 硬盘柜实际停转需要约 10 秒，设 20 秒余量（覆盖停转较慢的盘）
+        SPIN_DOWN_WAIT_SEC = 20
 
         hwnd = int(self.winId()) if not is_system_sleep else None
         if not is_system_sleep and hwnd is not None:
@@ -1203,14 +1203,26 @@ class MainWindow(QMainWindow):
                 logging.warning("关机保护缺少磁盘缓存，跳过自动休眠以避免重新扫描唤醒硬盘")
                 return
 
+            # 跳过已休眠/已弹出的硬盘——向它们发送 FLUSH CACHE 等任何 SCSI 命令都会唤醒硬盘，
+            # 导致"唤醒再休眠"的重复动作。它们已在 sleeping_disks 中确认休眠，无需再发命令。
+            already_asleep = set()
+            if hasattr(self, 'monitor_service'):
+                already_asleep = (
+                    self.monitor_service.sleeping_disks
+                    | self.monitor_service.ejected_disks
+                )
+
             eject_list = [
                 (d.get("index"), d.get("model"), d.get("serial"))
                 for d in self.disk_data
-                if d.get("is_removable")
+                if d.get("is_removable") and d.get("serial") not in already_asleep
             ]
 
             if not eject_list:
-                logging.info("没有需要休眠的外置硬盘")
+                logging.info(
+                    f"没有需要休眠的外置硬盘"
+                    f"（已确认休眠/弹出的盘会跳过，共 {len(already_asleep)} 块）"
+                )
                 return
 
             # Phase 1: 并发发送 SLEEP 命令
