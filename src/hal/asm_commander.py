@@ -10,13 +10,19 @@ from .win32_api import (
 )
 
 class ASMCommander:
-    def __init__(self, drive_index, model_hint=None, serial_hint=None):
+    def __init__(self, drive_index, model_hint=None, serial_hint=None, existing_handle=None):
         self.drive_index = drive_index
         self.model_hint = model_hint
         self.serial_hint = serial_hint
         self.handle = None
+        self._external_handle = existing_handle  # 复用已打开的句柄（系统弹出场景）
 
     def __enter__(self):
+        if self._external_handle:
+            # 系统弹出场景：设备正处于 QUERYREMOVE 阶段，重新打开 PhysicalDriveN
+            # 可能失败（设备已锁定，报 1117），直接复用 SafeRemovalPatcher 已注册的句柄。
+            self.handle = self._external_handle
+            return self
         self.handle = Win32API.open_physical_drive(self.drive_index)
         if not self.handle:
             err = ctypes.get_last_error()
@@ -24,7 +30,7 @@ class ASMCommander:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.handle:
+        if self.handle and not self._external_handle:
             Win32API.close_handle(self.handle)
             self.handle = None
 
@@ -481,6 +487,31 @@ class ASMCommander:
         if not success:
             logging.warning(f"Drive {self.drive_index}: ATA SLEEP failed, falling back to STANDBY IMMEDIATE...")
             return self.spin_down()
+        return success
+
+    def sleep_only(self):
+        """只发送 ATA SLEEP (0xE6)，不 FLUSH CACHE。
+        用于系统弹出场景：Windows 在 FS dismount 前已 flush 卷，无需重复 flush，
+        且 SLEEP 的 IOCTL 快速返回，不会阻塞 DBT_DEVICEQUERYREMOVE 导致弹出被否决。"""
+        if not self.handle:
+            return False
+
+        sleep_cdb = [0] * 16
+        sleep_cdb[0] = 0x85  # ATA PASS-THROUGH (16)
+        sleep_cdb[1] = (3 << 1)  # PROTOCOL=3 (Non-data)
+        sleep_cdb[14] = 0xE6  # Command - SLEEP
+
+        logging.info(f"Drive {self.drive_index}: Sending ATA SLEEP (only)...")
+        # 弹出场景：只做一次快速尝试，失败立即返回，绝不回退到 STANDBY/START-STOP。
+        # 原因：QUERYREMOVE 是同步窗口，多次 I/O 尝试会拖慢响应导致 Windows 弹出超时被否决
+        # （系统事件日志 225）。且设备一旦开始移除，后续 I/O 会报 1117 (ERROR_IO_DEVICE)。
+        success, _ = self.send_scsi_command(sleep_cdb, None, data_direction=SCSI_IOCTL_DATA_OUT, timeout=3)
+        if not success:
+            logging.warning(
+                f"Drive {self.drive_index}: ATA SLEEP 失败（弹出场景不回退），"
+                f"将立即返回以允许系统继续移除"
+            )
+            return False
         return success
 
     def set_standby_timer(self, minutes):

@@ -87,8 +87,18 @@ class DeviceManager:
             except Exception:
                 pass
             try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+            try:
                 import pythoncom
                 pythoncom.CoFreeUnusedLibraries()
+                # 只在后台监控线程反初始化 COM，彻底释放 WMI 提供者持有的磁盘句柄；
+                # 避免在主线程(UI/STA)反初始化影响 Qt。
+                import threading
+                if threading.current_thread() is not threading.main_thread():
+                    pythoncom.CoUninitialize()
             except Exception:
                 pass
         return disks

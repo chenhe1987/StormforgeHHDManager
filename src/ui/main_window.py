@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.71"
+        self.version = "1.3.72"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -557,33 +557,33 @@ class MainWindow(QMainWindow):
         self.export_logs_btn.clicked.connect(self.export_logs)
         self.settings_layout.addWidget(self.export_logs_btn)
 
-        # 4. Autostart Checkbox
+        # 4. Autostart Checkbox — 驱动级功能：固定启用，无需 UI 操作
         from PySide6.QtWidgets import QCheckBox
-        self.autostart_checkbox = QCheckBox("随系统启动")
-        self.autostart_checkbox.setStyleSheet("color: #aaaaaa; font-size: 12px; padding: 5px;")
-        is_enabled = self.config_manager.is_autostart_enabled()
-        self.autostart_checkbox.setChecked(is_enabled)
-        self.autostart_checkbox.stateChanged.connect(self.on_autostart_changed)
+        self.autostart_checkbox = QCheckBox("随系统启动（驱动级，固定开启）")
+        self.autostart_checkbox.setStyleSheet("color: #888888; font-size: 12px; padding: 5px;")
+        self.autostart_checkbox.setChecked(True)
+        self.autostart_checkbox.setEnabled(False)
+        self.autostart_checkbox.setToolTip("程序已注册为开机自启动，静默运行守护硬盘休眠保护。")
         self.settings_layout.addWidget(self.autostart_checkbox)
 
-        # 5. Shutdown Auto-Eject Checkbox
-        self.shutdown_eject_checkbox = QCheckBox("关机时自动休眠硬盘")
-        self.shutdown_eject_checkbox.setStyleSheet("color: #aaaaaa; font-size: 12px; padding: 5px;")
-        self.shutdown_eject_checkbox.setChecked(self.config_manager.get_shutdown_eject())
-        self.shutdown_eject_checkbox.stateChanged.connect(self.on_shutdown_eject_changed)
+        # 5. Shutdown Auto-Eject Checkbox — 驱动级功能：固定启用
+        self.shutdown_eject_checkbox = QCheckBox("关机/休眠时自动休眠硬盘（驱动级，固定开启）")
+        self.shutdown_eject_checkbox.setStyleSheet("color: #888888; font-size: 12px; padding: 5px;")
+        self.shutdown_eject_checkbox.setChecked(True)
+        self.shutdown_eject_checkbox.setEnabled(False)
+        self.shutdown_eject_checkbox.setToolTip("系统关机或休眠时，自动向所有外置硬盘发送 SLEEP 停转保护。")
         self.settings_layout.addWidget(self.shutdown_eject_checkbox)
 
-        # 6. Safe Removal Spin-Down Patch Checkbox
-        self.spindown_patch_checkbox = QCheckBox("系统弹出时附加硬盘停转")
-        self.spindown_patch_checkbox.setStyleSheet("color: #aaaaaa; font-size: 12px; padding: 5px;")
-        self.spindown_patch_checkbox.setChecked(self.config_manager.get_safe_remove_spindown())
+        # 6. Safe Removal Spin-Down Patch Checkbox — 驱动级功能：固定启用
+        self.spindown_patch_checkbox = QCheckBox("系统弹出时附加硬盘停转（驱动级，固定开启）")
+        self.spindown_patch_checkbox.setStyleSheet("color: #888888; font-size: 12px; padding: 5px;")
+        self.spindown_patch_checkbox.setChecked(True)
+        self.spindown_patch_checkbox.setEnabled(False)
         self.spindown_patch_checkbox.setToolTip(
-            "启用后，当您通过 Windows 系统托盘安全删除硬件时，\n"
-            "程序会自动先发送 FLUSH CACHE + SLEEP 停转命令，\n"
-            "确保硬盘磁头归位、盘片停止旋转后再完成弹出。\n"
-            "特别适用于 2074+1153E 组合的硬盘柜。"
+            "当您通过 Windows 系统托盘安全删除硬件时，\n"
+            "程序会自动发送 SLEEP 停转命令，确保磁头归位、盘片停转。\n"
+            "该功能为驱动级常驻，无需手动开启。"
         )
-        self.spindown_patch_checkbox.stateChanged.connect(self.on_spindown_patch_changed)
         self.settings_layout.addWidget(self.spindown_patch_checkbox)
         
         # Add Settings Container to Sidebar (Fixed height by content, NO stretch)
@@ -797,8 +797,21 @@ class MainWindow(QMainWindow):
         # and pause monitor service to release device refs. _enabled only controls FLUSH+SLEEP.
         self.spindown_patcher = SafeRemovalPatcher()
         self.spindown_patcher.monitor_service = self.monitor_service
-        self.spindown_patcher.enabled = self.config_manager.get_safe_remove_spindown()
+        # 驱动级功能：系统弹出停转始终启用，不受 UI 设置影响。
+        self.spindown_patcher.enabled = True
         QTimer.singleShot(1000, self._register_spindown_patcher)
+
+        # 驱动级常驻：启动即注册开机自启动（--silent 静默运行），
+        # 并强制固化配置，确保关机/休眠保护与系统弹出停转始终生效。
+        try:
+            if not self.config_manager.is_autostart_enabled():
+                if self.config_manager.set_autostart(True):
+                    logging.info("已自动注册开机自启动（驱动级常驻）")
+            self.config_manager.set_shutdown_eject(True)
+            self.config_manager.set_safe_remove_spindown(True)
+            logging.info("驱动级保护配置已固化：开机自启 + 关机休眠 + 弹出停转")
+        except Exception as e:
+            logging.warning(f"驱动级常驻配置失败: {e}")
         
         self.status_label.setText("监控服务运行中 (系统日志实时监控)")
         logging.info("MainWindow 初始化完成")
@@ -1151,11 +1164,11 @@ class MainWindow(QMainWindow):
 
                 if msg.message == WM_QUERYENDSESSION:
                     logging.info("收到系统关机信号 (WM_QUERYENDSESSION)")
-                    if self.config_manager.get_shutdown_eject():
-                        hwnd = int(self.winId())
-                        reason = "正在为您执行硬盘关机休眠保护，请稍候..."
-                        ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
-                        self.eject_all_removable_disks()
+                    # 驱动级功能：无论 UI 设置如何，关机时始终休眠外置硬盘。
+                    hwnd = int(self.winId())
+                    reason = "正在为您执行硬盘关机休眠保护，请稍候..."
+                    ctypes.windll.user32.ShutdownBlockReasonCreate(hwnd, ctypes.c_wchar_p(reason))
+                    self.eject_all_removable_disks()
                     return True, 1
 
                 elif msg.message == WM_ENDSESSION:
@@ -1166,13 +1179,17 @@ class MainWindow(QMainWindow):
                 elif msg.message == WM_POWERBROADCAST:
                     if msg.wParam == PBT_APMSUSPEND:
                         logging.info("收到系统休眠信号 (PBT_APMSUSPEND)")
-                        if self.config_manager.get_shutdown_eject():
-                            self.eject_all_removable_disks(is_system_sleep=True)
+                        # 驱动级功能：系统休眠时始终休眠外置硬盘。
+                        self.eject_all_removable_disks(is_system_sleep=True)
                     return True, 0
 
                 elif msg.message == WM_DEVICECHANGE:
-                    if self.spindown_patcher.handle_wm_devicechange(msg.wParam, msg.lParam):
-                        return True, 0
+                    # 已处理。注意 DBT_DEVICEQUERYREMOVE 的返回值语义与普通消息相反：
+                    #   返回 TRUE (result=1) = 允许移除设备
+                    #   返回 FALSE/0 (result=0) = 否决移除（Windows 显示"设备正在使用中"）
+                    # 程序从不否决弹出，因此统一返回 (True, 1)。
+                    self.spindown_patcher.handle_wm_devicechange(msg.wParam, msg.lParam)
+                    return True, 1
         except Exception as e:
             logging.error(f"nativeEvent error: {e}")
 
@@ -1198,8 +1215,13 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'monitor_service'):
                 self.monitor_service.shutdown_mode = True
 
-            # 关机阶段严格只使用缓存，避免再次在线扫描唤醒硬盘
-            if not hasattr(self, 'disk_data') or not self.disk_data:
+            # 关机阶段严格只使用缓存，避免再次在线扫描唤醒硬盘。
+            # 优先使用 monitor_service.cached_disks（物理盘缓存，始终保持最新），
+            # 避免依赖 UI disk_data（仅在 SMART 检测时刷新，silent 模式下可能过期）。
+            cached = []
+            if hasattr(self, 'monitor_service') and self.monitor_service:
+                cached = getattr(self.monitor_service, 'cached_disks', []) or []
+            if not cached:
                 logging.warning("关机保护缺少磁盘缓存，跳过自动休眠以避免重新扫描唤醒硬盘")
                 return
 
@@ -1212,11 +1234,14 @@ class MainWindow(QMainWindow):
                     | self.monitor_service.ejected_disks
                 )
 
-            eject_list = [
-                (d.get("index"), d.get("model"), d.get("serial"))
-                for d in self.disk_data
-                if d.get("is_removable") and d.get("serial") not in already_asleep
-            ]
+            eject_list = []
+            for d in cached:
+                idx = getattr(d, 'index', None)
+                serial = getattr(d, 'serial_number', None)
+                model = getattr(d, 'model', None) or getattr(d, 'model_hint', None) or ('Disk' + str(idx))
+                is_removable = getattr(d, 'is_removable', False)
+                if idx is not None and is_removable and serial not in already_asleep:
+                    eject_list.append((idx, model, serial))
 
             if not eject_list:
                 logging.info(

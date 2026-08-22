@@ -568,6 +568,161 @@ class Win32API:
             return False
 
     @staticmethod
+    def get_volume_disk_mapping():
+        """
+        用 Win32 API 枚举所有卷，返回 {盘符(单字母, 大写): 物理磁盘序号} 映射。
+        完全不依赖 WMI/COM，可在任意线程调用，避免 UI 线程 COM 输入同步错误
+        (RPC_E_CANTCALLOUT_ININPUTSYNC)。
+        """
+        mapping = {}
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+        kernel32.FindFirstVolumeW.restype = ctypes.c_void_p
+        kernel32.FindFirstVolumeW.argtypes = [wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.FindNextVolumeW.restype = wintypes.BOOL
+        kernel32.FindNextVolumeW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD]
+        kernel32.FindVolumeClose.restype = wintypes.BOOL
+        kernel32.FindVolumeClose.argtypes = [ctypes.c_void_p]
+
+        kernel32.GetVolumePathNamesForVolumeNameW.restype = wintypes.BOOL
+        kernel32.GetVolumePathNamesForVolumeNameW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+        ]
+
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+
+        class DISK_EXTENT(ctypes.Structure):
+            _fields_ = [
+                ("DiskNumber", wintypes.DWORD),
+                ("StartingOffset", ctypes.c_longlong),
+                ("ExtentLength", ctypes.c_longlong),
+            ]
+
+        class VOLUME_DISK_EXTENTS(ctypes.Structure):
+            _fields_ = [
+                ("NumberOfDiskExtents", wintypes.DWORD),
+                ("Extents", DISK_EXTENT * 8),
+            ]
+
+        INVALID = ctypes.c_void_p(INVALID_HANDLE_VALUE).value
+
+        vol_buf = ctypes.create_unicode_buffer(512)
+        search_handle = kernel32.FindFirstVolumeW(vol_buf, 512)
+        if search_handle == 0 or search_handle == INVALID:
+            return mapping
+
+        try:
+            while True:
+                volume_guid = vol_buf.value
+                if volume_guid:
+                    # 获取该卷挂载的盘符（多字符串，取第一个，如 "C:\\"）
+                    path_buf = ctypes.create_unicode_buffer(512)
+                    needed = wintypes.DWORD(0)
+                    ok = kernel32.GetVolumePathNamesForVolumeNameW(
+                        volume_guid, path_buf, 512, ctypes.byref(needed)
+                    )
+                    drive_letter = ""
+                    if ok and path_buf.value:
+                        first = path_buf.value
+                        letter = first.strip().rstrip("\\:").upper()
+                        if len(letter) == 1 and letter.isalpha():
+                            drive_letter = letter
+
+                    if drive_letter:
+                        vol_path = f"\\\\.\\{drive_letter}:"
+                        h = kernel32.CreateFileW(
+                            vol_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            None, OPEN_EXISTING, 0, None
+                        )
+                        if h and h != INVALID:
+                            try:
+                                extents = VOLUME_DISK_EXTENTS()
+                                result, _, _ = Win32API.device_io_control(
+                                    h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                                    None, 0, ctypes.byref(extents), ctypes.sizeof(extents)
+                                )
+                                if result and extents.NumberOfDiskExtents >= 1:
+                                    mapping[drive_letter] = extents.Extents[0].DiskNumber
+                            finally:
+                                kernel32.CloseHandle(h)
+
+                if not kernel32.FindNextVolumeW(search_handle, vol_buf, 512):
+                    break
+        finally:
+            kernel32.FindVolumeClose(search_handle)
+
+        return mapping
+
+    @staticmethod
+    def get_disk_number_from_device_path(device_path):
+        """从磁盘/卷设备接口路径 (GUID_DEVINTERFACE_DISK/VOLUME 的 dbcc_name) 打开设备，
+        用 IOCTL_STORAGE_GET_DEVICE_NUMBER 获取物理磁盘序号。用于 DBT_DEVICEQUERYREMOVE
+        时把 DEV_BROADCAST_DEVICEINTERFACE.dbcc_name 映射到 PhysicalDriveN。"""
+        if not device_path:
+            return None
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        INVALID = ctypes.c_void_p(-1).value
+        h = kernel32.CreateFileW(
+            device_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None
+        )
+        if not h or h == INVALID:
+            return None
+
+        try:
+            sdn = STORAGE_DEVICE_NUMBER()
+            result, _, _ = Win32API.device_io_control(
+                h, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                None, 0, ctypes.byref(sdn), ctypes.sizeof(sdn)
+            )
+            if result:
+                return int(sdn.DeviceNumber)
+            return None
+        finally:
+            kernel32.CloseHandle(h)
+
+    @staticmethod
+    def disable_content_indexing(drive_letter):
+        """为卷根目录设置 FILE_ATTRIBUTE_NOT_CONTENT_INDEXED (0x2000)，
+        阻止 Windows Search 索引该卷，避免 svchost.exe(WSearch) 占用外置硬盘
+        导致“设备正在使用中”而无法安全弹出。"""
+        volume_root = Win32API.normalize_volume_root(drive_letter)
+        if not volume_root:
+            return False
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.GetFileAttributesW.restype = wintypes.DWORD
+        kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+        kernel32.SetFileAttributesW.restype = wintypes.BOOL
+        kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+
+        attrs = kernel32.GetFileAttributesW(volume_root)
+        if attrs == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES
+            return False
+
+        new_attrs = attrs | 0x2000  # FILE_ATTRIBUTE_NOT_CONTENT_INDEXED
+        if new_attrs == attrs:
+            return True
+        return bool(kernel32.SetFileAttributesW(volume_root, new_attrs))
+
+    @staticmethod
     def get_windows_disk_idle_settings():
         """
         读取当前电源计划中“在此时间后关闭硬盘”的 AC/DC 设置。
@@ -980,7 +1135,12 @@ class Win32API:
     @staticmethod
     def close_handle(handle):
         if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            # 必须显式设置签名，否则 64 位句柄被按 32 位截断，
+            # CloseHandle 失败导致磁盘句柄泄漏，进而导致“设备正在使用中”。
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(handle)
 
     @staticmethod
     def device_io_control(handle, ioctl_code, in_buffer, in_buffer_size, out_buffer, out_buffer_size):
@@ -1193,6 +1353,8 @@ DBT_DEVICEQUERYREMOVE = 0x8001
 DBT_DEVICEREMOVEPENDING = 0x8003
 DBT_DEVICEREMOVECOMPLETE = 0x8004
 DBT_DEVTYP_VOLUME = 0x00000002
+DBT_DEVTYP_HANDLE = 0x00000006
+DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
 
 DBT_CONFIGCHANGED = 0x0018
 DBT_DEVICEARRIVAL = 0x8000
@@ -1201,6 +1363,33 @@ DBT_DEVICEREMOVECOMPLETE_BROADCAST = 0x8004
 DEVICE_NOTIFY_WINDOW_HANDLE = 0
 DEVICE_NOTIFY_SERVICE_HANDLE = 1
 
+# GUID_DEVINTERFACE_VOLUME: {53F5630D-B6BF-11D0-94F2-00A0C91EFB8B}
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+GUID_DEVINTERFACE_VOLUME = GUID(
+    0x53F5630D, 0xB6BF, 0x11D0,
+    (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B),
+)
+
+# GUID_DEVINTERFACE_DISK: {53F56307-B6BF-11D0-94F2-00A0C91EFB8B}
+GUID_DEVINTERFACE_DISK = GUID(
+    0x53F56307, 0xB6BF, 0x11D0,
+    (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B),
+)
+
+class DEV_BROADCAST_HDR(ctypes.Structure):
+    _fields_ = [
+        ("dbch_size", wintypes.DWORD),
+        ("dbch_devicetype", wintypes.DWORD),
+        ("dbch_reserved", wintypes.DWORD),
+    ]
+
 class DEV_BROADCAST_VOLUME(ctypes.Structure):
     _fields_ = [
         ("dbcv_size", wintypes.DWORD),
@@ -1208,6 +1397,32 @@ class DEV_BROADCAST_VOLUME(ctypes.Structure):
         ("dbcv_reserved", wintypes.DWORD),
         ("dbcv_unitmask", wintypes.DWORD),
         ("dbcv_flags", wintypes.WORD),
+    ]
+
+class DEV_BROADCAST_DEVICEINTERFACE(ctypes.Structure):
+    _fields_ = [
+        ("dbcc_size", wintypes.DWORD),
+        ("dbcc_devicetype", wintypes.DWORD),
+        ("dbcc_reserved", wintypes.DWORD),
+        ("dbcc_classguid", GUID),
+        ("dbcc_name", ctypes.c_wchar * 1),
+    ]
+
+class DEV_BROADCAST_HANDLE(ctypes.Structure):
+    """DBT_DEVTYP_HANDLE 通知负载。
+    注册打开的设备句柄后，Windows 在设备移除前会向该句柄的所有者
+    发送 DBT_DEVICEQUERYREMOVE (devicetype=DBT_DEVTYP_HANDLE)。
+    这是唯一能在系统托盘弹出 USB 硬盘柜时可靠收到 QUERYREMOVE 的机制——
+    接口通知(GUID_DEVINTERFACE_*)在 Windows 11 25H2 上只收到 REMOVECOMPLETE。"""
+    _fields_ = [
+        ("dbch_size", wintypes.DWORD),
+        ("dbch_devicetype", wintypes.DWORD),
+        ("dbch_reserved", wintypes.DWORD),
+        ("dbch_handle", wintypes.HANDLE),
+        ("dbch_hdevnotify", ctypes.c_void_p),
+        ("dbch_eventguid", ctypes.c_ubyte * 16),
+        ("dbch_nameoffset", wintypes.LONG),
+        ("dbch_data", ctypes.c_ubyte * 1),
     ]
 
 
@@ -1235,12 +1450,17 @@ class SafeRemovalPatcher:
     def __init__(self):
         if self._initialized:
             return
-        self._notification_handle = None
+        self._notification_handles = []
         self._hwnd = None
         self._enabled = True  # controls FLUSH+SLEEP only
         self._pending_volumes = {}
         self._volume_disk_cache = {}
         self.monitor_service = None  # set by main_window
+        # 句柄通知：{dbch_handle: disk_index} —— 系统托盘弹出 USB 硬盘柜时，
+        # 只有持有设备句柄并注册 DBT_DEVTYP_HANDLE 通知的窗口才会收到 QUERYREMOVE。
+        # 接口通知(GUID_DEVINTERFACE_*)在 Win11 25H2 上只收到 REMOVECOMPLETE。
+        self._handle_disk_map = {}       # CreateFileW 句柄 -> 磁盘序号
+        self._handle_notify_map = {}     # 通知句柄 -> CreateFileW 句柄
         self._initialized = True
 
     @property
@@ -1252,32 +1472,39 @@ class SafeRemovalPatcher:
         self._enabled = bool(value)
 
     def refresh_cache(self):
+        """用 Win32 API 重建 盘符→磁盘序号 映射（无 WMI/COM，任意线程安全）"""
         try:
-            import wmi
-            c = wmi.WMI()
-            new_cache = {}
-            for drive in c.Win32_DiskDrive():
-                try:
-                    index = int(drive.DeviceID.upper().replace("\\\\.\\PHYSICALDRIVE", ""))
-                except ValueError:
-                    continue
-                pnp_id = getattr(drive, "PNPDeviceID", "") or ""
-                if not Win32API.is_external_device(pnp_id):
-                    continue
-                for partition in drive.associators("Win32_DiskDriveToDiskPartition"):
-                    for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
-                        vol = logical_disk.DeviceID.strip().rstrip(":").upper()
-                        if vol:
-                            new_cache[vol] = index
-            self._volume_disk_cache = new_cache
-            logging.info(f"[SafeRemovalPatch] 缓存已刷新: {len(new_cache)} 个外置卷映射")
+            self._volume_disk_cache = Win32API.get_volume_disk_mapping()
+            logging.info(
+                f"[SafeRemovalPatch] 缓存已刷新: {len(self._volume_disk_cache)} 个卷映射"
+            )
+            self._disable_indexing_for_external_disks()
         except Exception as e:
-            logging.debug(f"[SafeRemovalPatch] 缓存刷新失败: {e}")
-        finally:
-            try:
-                del c
-            except Exception:
-                pass
+            logging.warning(f"[SafeRemovalPatch] 缓存刷新失败: {e}")
+
+    def _disable_indexing_for_external_disks(self):
+        """为外置硬盘的卷禁用 Windows Search 内容索引，
+        避免 svchost.exe(WSearch) 占用外置硬盘导致无法安全弹出。"""
+        removable_indexes = set()
+        if self.monitor_service:
+            for d in getattr(self.monitor_service, 'cached_disks', []) or []:
+                if getattr(d, 'is_removable', False):
+                    idx = getattr(d, 'index', None)
+                    if idx is not None:
+                        removable_indexes.add(idx)
+
+        if not removable_indexes:
+            return
+
+        for letter, idx in self._volume_disk_cache.items():
+            if idx in removable_indexes:
+                try:
+                    ok = Win32API.disable_content_indexing(letter + ":")
+                    logging.info(
+                        f"[SafeRemovalPatch] 已禁用外置盘 {letter}: 的内容索引 (结果={ok})"
+                    )
+                except Exception as e:
+                    logging.warning(f"[SafeRemovalPatch] 禁用 {letter}: 索引失败: {e}")
 
     def register(self, hwnd):
         try:
@@ -1286,42 +1513,198 @@ class SafeRemovalPatcher:
 
             self.refresh_cache()
 
-            dbv = DEV_BROADCAST_VOLUME()
-            dbv.dbcv_size = ctypes.sizeof(DEV_BROADCAST_VOLUME)
-            dbv.dbcv_devicetype = DBT_DEVTYP_VOLUME
+            # 显式设置签名，避免 64 位句柄被按 32 位截断。
+            user32.RegisterDeviceNotificationW.restype = ctypes.c_void_p
+            user32.RegisterDeviceNotificationW.argtypes = [
+                wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD
+            ]
 
-            handle = user32.RegisterDeviceNotificationW(
-                hwnd, ctypes.byref(dbv), 0
-            )
+            # 同时注册磁盘接口和卷接口，确保能收到安全弹出时的 DBT_DEVICEQUERYREMOVE。
+            guids = [
+                ("GUID_DEVINTERFACE_DISK", GUID_DEVINTERFACE_DISK),
+                ("GUID_DEVINTERFACE_VOLUME", GUID_DEVINTERFACE_VOLUME),
+            ]
+            for name, guid in guids:
+                dbcc = DEV_BROADCAST_DEVICEINTERFACE()
+                dbcc.dbcc_size = ctypes.sizeof(DEV_BROADCAST_DEVICEINTERFACE)
+                dbcc.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE
+                dbcc.dbcc_reserved = 0
+                dbcc.dbcc_classguid = guid
+                handle = user32.RegisterDeviceNotificationW(
+                    hwnd, ctypes.byref(dbcc), DEVICE_NOTIFY_WINDOW_HANDLE
+                )
+                if handle:
+                    self._notification_handles.append(handle)
+                    logging.info(f"[SafeRemovalPatch] 已注册设备接口通知 ({name})")
+                else:
+                    err = ctypes.get_last_error()
+                    logging.error(
+                        f"[SafeRemovalPatch] RegisterDeviceNotification ({name}) 失败: {err}"
+                    )
 
-            if not handle:
-                err = ctypes.get_last_error()
-                logging.error(f"[SafeRemovalPatch] RegisterDeviceNotification 失败: {err}")
-                return False
+            # 关键：为每个外置磁盘打开句柄并注册 DBT_DEVTYP_HANDLE 通知。
+            # Windows 11 25H2 上，系统托盘弹出 USB 硬盘柜时，接口通知只收到
+            # REMOVECOMPLETE（设备已移除，来不及发 SLEEP）；只有持有设备句柄并
+            # 注册句柄通知的窗口才会在移除前收到 DBT_DEVICEQUERYREMOVE。
+            self._register_handle_notifications()
 
-            self._notification_handle = handle
-            logging.info("[SafeRemovalPatch] 已注册设备通知")
-            return True
+            return len(self._notification_handles) > 0 or bool(self._handle_notify_map)
         except Exception as e:
             logging.error(f"[SafeRemovalPatch] 注册设备通知异常: {e}")
             return False
 
+    def _register_handle_notifications(self):
+        """为每个外置磁盘打开句柄并注册 DBT_DEVTYP_HANDLE 设备通知。
+
+        这是让“系统托盘安全弹出 → 附加硬盘停转”真正生效的关键：
+        - 接口通知(GUID_DEVINTERFACE_DISK/VOLUME/USB_DEV)在 Win11 25H2 上，
+          弹出 USB 硬盘柜时只收到 REMOVECOMPLETE（此时设备已移除，无法发 SLEEP）。
+        - 打开设备句柄并注册 DEV_BROADCAST_HANDLE 后，Windows 会在设备移除前
+          向句柄所有者发送 DBT_DEVICEQUERYREMOVE (devicetype=DBT_DEVTYP_HANDLE)。
+        句柄用 0 访问 + FILE_SHARE_READ|WRITE 打开，不会阻塞弹出。"""
+        try:
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CreateFileW.restype = ctypes.c_void_p
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p
+            ]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            INVALID = ctypes.c_void_p(-1).value
+            # 从监控服务的缓存中收集外置磁盘序号
+            disk_indexes = set()
+            if self.monitor_service:
+                for d in getattr(self.monitor_service, 'cached_disks', []) or []:
+                    if getattr(d, 'is_removable', False):
+                        idx = getattr(d, 'index', None)
+                        if idx is not None:
+                            disk_indexes.add(idx)
+            # 兜底：把映射缓存里的磁盘序号也加入
+            for idx in self._volume_disk_cache.values():
+                disk_indexes.add(idx)
+
+            for disk_index in sorted(disk_indexes):
+                try:
+                    path = f"\\\\.\\PhysicalDrive{disk_index}"
+                    h = kernel32.CreateFileW(
+                    # 用 GENERIC_READ|WRITE 打开（IOCTL_SCSI_PASS_THROUGH 需要该权限），
+                        path, 0x80000000 | 0x40000000, 1 | 2, None, 3, 0, None  # GENERIC_READ|WRITE, share R|W
+                    )
+                    if not h or h == INVALID:
+                        logging.debug(
+                            f"[SafeRemovalPatch] PhysicalDrive{disk_index} 打开失败 err={ctypes.get_last_error()}"
+                        )
+                        continue
+                    # 注册句柄通知
+                    dbh = DEV_BROADCAST_HANDLE()
+                    dbh.dbch_size = ctypes.sizeof(DEV_BROADCAST_HANDLE)
+                    dbh.dbch_devicetype = DBT_DEVTYP_HANDLE
+                    dbh.dbch_handle = h
+                    dbh.dbch_hdevnotify = None
+                    notify = user32.RegisterDeviceNotificationW(
+                        self._hwnd, ctypes.byref(dbh), DEVICE_NOTIFY_WINDOW_HANDLE
+                    )
+                    if notify:
+                        self._handle_disk_map[h] = disk_index
+                        self._handle_notify_map[notify] = h
+                        logging.info(
+                            f"[SafeRemovalPatch] 已注册句柄通知: PhysicalDrive{disk_index} "
+                            f"(h=0x{h:X}, notify=0x{notify:X})"
+                        )
+                    else:
+                        err = ctypes.get_last_error()
+                        logging.warning(
+                            f"[SafeRemovalPatch] PhysicalDrive{disk_index} 句柄通知注册失败: {err}"
+                        )
+                        kernel32.CloseHandle(h)
+                except Exception as e:
+                    logging.warning(
+                        f"[SafeRemovalPatch] PhysicalDrive{disk_index} 句柄通知异常: {e}"
+                    )
+
+            logging.info(
+                f"[SafeRemovalPatch] 句柄通知注册完成: {len(self._handle_notify_map)} 个外置盘"
+            )
+        except Exception as e:
+            logging.error(f"[SafeRemovalPatch] 注册句柄通知异常: {e}")
+
+    def _release_handle_for_disk(self, disk_index):
+        """注销并关闭指定磁盘的句柄通知（在 QUERYREMOVE 时调用，
+        让 Windows 认为程序不再占用设备，允许移除继续进行）。"""
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.UnregisterDeviceNotification.restype = wintypes.BOOL
+        user32.UnregisterDeviceNotification.argtypes = [ctypes.c_void_p]
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        for notify, h in list(self._handle_notify_map.items()):
+            if self._handle_disk_map.get(h) == disk_index:
+                try:
+                    user32.UnregisterDeviceNotification(notify)
+                except Exception:
+                    pass
+                try:
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+                self._handle_notify_map.pop(notify, None)
+                self._handle_disk_map.pop(h, None)
+                logging.info(
+                    f"[SafeRemovalPatch] 已释放句柄通知: PhysicalDrive{disk_index} (h=0x{h:X})"
+                )
+                break
+
     def unregister(self):
-        if self._notification_handle:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        user32.UnregisterDeviceNotification.restype = wintypes.BOOL
+        user32.UnregisterDeviceNotification.argtypes = [ctypes.c_void_p]
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        # 注销句柄通知并关闭设备句柄
+        for notify, h in list(self._handle_notify_map.items()):
             try:
-                user32 = ctypes.WinDLL('user32', use_last_error=True)
-                user32.UnregisterDeviceNotification(self._notification_handle)
-                logging.info("[SafeRemovalPatch] 已注销设备通知")
+                user32.UnregisterDeviceNotification(notify)
+            except Exception:
+                pass
+            try:
+                kernel32.CloseHandle(h)
+            except Exception:
+                pass
+        self._handle_notify_map.clear()
+        self._handle_disk_map.clear()
+        for handle in self._notification_handles:
+            try:
+                user32.UnregisterDeviceNotification(handle)
             except Exception as e:
                 logging.error(f"[SafeRemovalPatch] 注销设备通知异常: {e}")
-            finally:
-                self._notification_handle = None
+        self._notification_handles = []
+        self._hwnd = None
 
     def handle_wm_devicechange(self, wparam, lparam):
         event_code = wparam
 
+        # 诊断日志：记录每个设备事件，帮助定位 QUERYREMOVE 是否到达。
+        event_names = {
+            DBT_DEVICEARRIVAL: "DEVICEARRIVAL",
+            DBT_DEVICEQUERYREMOVE: "DEVICEQUERYREMOVE",
+            DBT_DEVICEREMOVEPENDING: "DEVICEREMOVEPENDING",
+            DBT_DEVICEREMOVECOMPLETE: "DEVICEREMOVECOMPLETE",
+            DBT_CONFIGCHANGED: "CONFIGCHANGED",
+        }
+        event_name = event_names.get(event_code, f"0x{event_code:04X}")
+        logging.info(
+            f"[SafeRemovalPatch] WM_DEVICECHANGE: {event_name} (wParam=0x{event_code:04X})"
+        )
+
         if event_code == DBT_DEVICEARRIVAL:
             self.refresh_cache()
+            # 设备插回后重新打开句柄并注册通知，保持句柄映射有效
+            if not self._handle_notify_map and self._hwnd:
+                self._register_handle_notifications()
             return False
 
         if event_code == DBT_DEVICEQUERYREMOVE:
@@ -1329,6 +1712,26 @@ class SafeRemovalPatcher:
 
         if event_code == DBT_DEVICEREMOVECOMPLETE:
             self._pending_volumes.clear()
+            # 清理已移除磁盘的句柄通知（避免句柄泄漏）
+            if self._handle_notify_map:
+                kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                kernel32.CloseHandle.restype = wintypes.BOOL
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                user32 = ctypes.WinDLL('user32', use_last_error=True)
+                user32.UnregisterDeviceNotification.restype = wintypes.BOOL
+                user32.UnregisterDeviceNotification.argtypes = [ctypes.c_void_p]
+                for notify, h in list(self._handle_notify_map.items()):
+                    try:
+                        user32.UnregisterDeviceNotification(notify)
+                    except Exception:
+                        pass
+                    try:
+                        kernel32.CloseHandle(h)
+                    except Exception:
+                        pass
+                self._handle_notify_map.clear()
+                self._handle_disk_map.clear()
+                logging.info("[SafeRemovalPatch] 设备移除完毕，已清理句柄通知")
             if self.monitor_service:
                 self.monitor_service.resume_after_removal()
             return False
@@ -1338,17 +1741,63 @@ class SafeRemovalPatcher:
     def _on_query_remove(self, lparam):
         reply = False  # do not veto; let Windows proceed
 
-        drive_letter = SafeRemovalPatcher._extract_drive_letter(lparam)
-        if not drive_letter:
+        # 读取 DEV_BROADCAST_HDR.dbch_devicetype 区分事件负载类型。
+        try:
+            hdr = ctypes.cast(lparam, ctypes.POINTER(DEV_BROADCAST_HDR)).contents
+            devicetype = int(hdr.dbch_devicetype)
+        except Exception:
+            logging.warning("[SafeRemovalPatch] 无法解析 QUERYREMOVE 的 DEV_BROADCAST_HDR")
             return reply
 
-        vol = drive_letter[0].upper()
-        disk_index = self._volume_disk_cache.get(vol)
-        if disk_index is None:
+        logging.info(f"[SafeRemovalPatch] QUERYREMOVE devicetype={devicetype}")
+
+        disk_index = None
+        drive_desc = None
+
+        if devicetype == DBT_DEVTYP_DEVICEINTERFACE:
+            device_path = SafeRemovalPatcher._extract_interface_path(lparam)
+            if not device_path:
+                logging.warning("[SafeRemovalPatch] 无法从 DEVICEINTERFACE 提取设备路径")
+                return reply
+            logging.info(f"[SafeRemovalPatch] 设备接口路径: {device_path}")
+            disk_index = Win32API.get_disk_number_from_device_path(device_path)
+            if disk_index is None:
+                logging.warning(f"[SafeRemovalPatch] 无法从设备路径反查磁盘序号: {device_path}")
+                return reply
+            drive_desc = device_path
+        elif devicetype == DBT_DEVTYP_VOLUME:
+            drive_letter = SafeRemovalPatcher._extract_drive_letter(lparam)
+            if not drive_letter:
+                logging.warning("[SafeRemovalPatch] 无法从 VOLUME 提取盘符")
+                return reply
+            vol = drive_letter[0].upper()
+            disk_index = self._volume_disk_cache.get(vol)
+            if disk_index is None:
+                logging.warning(f"[SafeRemovalPatch] 盘符 {drive_letter} 无对应磁盘映射")
+                return reply
+            drive_desc = drive_letter
+        elif devicetype == DBT_DEVTYP_HANDLE:
+            # 系统托盘弹出 USB 硬盘柜时，Windows 向持有设备句柄并注册了
+            # DEV_BROADCAST_HANDLE 通知的窗口发送此类型 QUERYREMOVE。
+            try:
+                dbh = ctypes.cast(lparam, ctypes.POINTER(DEV_BROADCAST_HANDLE)).contents
+                dev_handle = int(dbh.dbch_handle)
+            except Exception:
+                logging.warning("[SafeRemovalPatch] 无法解析 HANDLE 类型 QUERYREMOVE")
+                return reply
+            disk_index = self._handle_disk_map.get(dev_handle)
+            if disk_index is None:
+                logging.warning(
+                    f"[SafeRemovalPatch] 句柄 0x{dev_handle:X} 无对应磁盘映射"
+                )
+                return reply
+            drive_desc = f"handle=0x{dev_handle:X}"
+        else:
+            logging.info(f"[SafeRemovalPatch] 忽略 devicetype={devicetype} 的 QUERYREMOVE")
             return reply
 
         logging.info(
-            f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: {drive_letter} (PhysicalDrive{disk_index})"
+            f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: {drive_desc} (PhysicalDrive{disk_index})"
         )
 
         if self.monitor_service:
@@ -1360,32 +1809,47 @@ class SafeRemovalPatcher:
         except Exception:
             pass
 
-        if not self._enabled:
+        # 系统弹出停转是“驱动级”功能，始终启用，不再受 UI 开关控制。
+        dedup_key = f"disk_{disk_index}"
+        if dedup_key in self._pending_volumes:
             return reply
+        self._pending_volumes[dedup_key] = True
 
-        if self._pending_volumes:
-            return reply
+        logging.info("[SafeRemovalPatch] 正在同步发送 SLEEP...")
 
-        self._pending_volumes["_"] = True
-        logging.info(f"[SafeRemovalPatch] 正在发送 FLUSH CACHE...")
-
+        # 在 QUERYREMOVE 同步窗口内完成 SLEEP，确保设备真正移除前命令已发出。
+        # 用 sleep_only（只发 SLEEP 0xE6，不 FLUSH CACHE）：Windows 弹出流程已 flush 卷，
+        # 且 SLEEP IOCTL 快速返回，避免阻塞导致弹出被否决。
+        # 优先复用句柄通知注册的 GENERIC_READ 句柄（有权限执行 IOCTL），
+        # 避免 QUERYREMOVE 阶段重新打开设备可能遇到的 1117 (I/O 设备错误)。
+        existing_handle = None
+        if devicetype == DBT_DEVTYP_HANDLE:
+            for h, idx in self._handle_disk_map.items():
+                if idx == disk_index:
+                    existing_handle = h
+                    break
         try:
             from src.hal.asm_commander import ASMCommander
-            with ASMCommander(disk_index) as cmd:
-                cmd.flush_cache()
-                logging.info(
-                    f"[SafeRemovalPatch] FLUSH CACHE 完成，启动后台线程发送 SLEEP..."
-                )
-
-            threading.Thread(
-                target=SafeRemovalPatcher._do_sleep,
-                args=(disk_index,),
-                daemon=True,
-            ).start()
+            with ASMCommander(disk_index, existing_handle=existing_handle) as cmd:
+                if cmd.sleep_only():
+                    logging.info(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 成功，已停转"
+                    )
+                else:
+                    logging.warning(
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 失败"
+                    )
         except Exception as e:
             logging.warning(
-                f"[SafeRemovalPatch] FLUSH CACHE 异常: {e}，仍允许系统继续移除"
+                f"[SafeRemovalPatch] SLEEP 异常: {e}，仍允许系统继续移除"
             )
+
+        # SLEEP 发送完成后，注销句柄通知并关闭设备句柄。
+        # Windows 在 QUERYREMOVE 阶段会检查该句柄是否仍打开，
+        # 若仍持有则判定设备被占用，弹出会被否决（事件日志 225）。
+        # 注意：必须在 SLEEP 之后释放——先释放会导致后续 I/O 报 1117 错误。
+        if devicetype == DBT_DEVTYP_HANDLE:
+            self._release_handle_for_disk(disk_index)
 
         return reply
 
@@ -1406,19 +1870,14 @@ class SafeRemovalPatcher:
             return None
 
     @staticmethod
-    def _do_sleep(disk_index):
+    def _extract_interface_path(lparam):
         try:
-            from src.hal.asm_commander import ASMCommander
-            with ASMCommander(disk_index) as cmd:
-                if cmd.sleep():
-                    logging.info(
-                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 成功"
-                    )
-                else:
-                    logging.warning(
-                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 失败"
-                    )
-        except Exception as e:
-            logging.warning(
-                f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 异常: {e}"
-            )
+            dbcc = ctypes.cast(lparam, ctypes.POINTER(DEV_BROADCAST_DEVICEINTERFACE)).contents
+            base = ctypes.addressof(dbcc)
+            # 注意：部分精简版 Python 的 ctypes 缺少 offsetof()，
+            # 因此这里手动按结构布局计算 dbcc_name 的字节偏移：
+            #   dbcc_size(4) + dbcc_devicetype(4) + dbcc_reserved(4) + dbcc_classguid(GUID 16)
+            offset = 4 + 4 + 4 + ctypes.sizeof(GUID)
+            return ctypes.wstring_at(base + offset)
+        except Exception:
+            return None
