@@ -300,3 +300,35 @@ DBT_DEVICEQUERYREMOVE 的返回值语义与普通消息相反：
 7. 不要用关键字参数调 ctypes WinDLL 函数
 8. QUERYREMOVE 必须：反查磁盘 → SLEEP → 释放句柄
 9. 关机休眠：cached_disks + 无条件执行 + 跳过已休眠盘
+
+
+---
+
+## 14. 自启动方案（2026-08-23 修复：必须用计划任务）
+
+### 问题
+程序以管理员权限运行（uac_admin=True / asInvoker 提权）。HKCU Run 注册表自启动
+在开机时启动的程序**无法自动提权**——Windows 弹出 UAC 确认框，开机时无人点击，
+程序不启动 → 驱动级功能（弹出休眠/关机休眠）不生效，需要手动打开程序。
+
+### 正确方案：任务计划程序（已验证）
+    schtasks /Create /F /TN "JiFengZhiHDDManager" /TR "\"exe路径\" --silent" /SC ONLOGON /RL HIGHEST /DELAY 0005:00
+
+关键参数：
+- /SC ONLOGON —— 用户登录时触发
+- /RL HIGHEST —— 以最高权限运行（计划任务启动提权程序不需要 UAC 交互！）
+- /DELAY 0005:00 —— 延迟 5 分钟，等待系统就绪
+
+验证要点（schtasks /Query /TN ... /XML）：
+- <RunLevel>HighestAvailable</RunLevel> 存在
+- <LogonTrigger> 登录触发器
+- 手动 schtasks /Run 可无 UAC 启动 exe
+
+### 代码位置（src/core/config_manager.py）
+- set_autostart(True)：创建计划任务，成功后删除旧注册表项；失败回退注册表
+- is_autostart_enabled()：优先检查计划任务，检测到旧注册表项自动迁移
+- _fix_task_path()：计划任务指向旧路径时自动重建
+
+### 修改红线补充
+10. 不要改回 HKCU Run 注册表自启动（uac_admin 程序开机不启动）
+11. 不要删除 set_autostart 里的"创建后清理注册表项"逻辑（避免双启动）

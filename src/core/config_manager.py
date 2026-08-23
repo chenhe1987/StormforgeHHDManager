@@ -148,88 +148,133 @@ class ConfigManager:
         return command.split(" ")[0]
 
     def set_autostart(self, enabled):
-        """设置或取消开机自启动 (使用注册表 HKCU\Software\Microsoft\Windows\CurrentVersion\Run)"""
+        """设置或取消开机自启动。
+
+        注意：程序以管理员权限运行(uac_admin=True)，HKCU Run 注册表自启动
+        会在开机时触发 UAC 弹窗拦截导致程序不启动，因此必须使用任务计划程序
+        (schtasks /SC ONLOGON /RL HIGHEST) —— 计划任务以最高权限运行，
+        登录时自动启动且不需要 UAC 交互。
+        """
         try:
-            # 1. 无论如何，都尝试清理旧的计划任务 (如果存在)
-            try:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                cmd = f'schtasks /Delete /F /TN "{self.task_name}"'
-                subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
-                logging.info("已清理旧版计划任务自启动项")
-            except Exception as e:
-                logging.debug(f"清理计划任务失败 (可能不存在): {e}")
-
-            # 2. 操作注册表
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            task_name = self.task_name
             if enabled:
-                path = self._get_autostart_command()
-
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
-                winreg.SetValueEx(key, self.app_name, 0, winreg.REG_SZ, path)
-                winreg.CloseKey(key)
-                
-                logging.info(f"已设置注册表自启动: {path}")
-                self.config["autostart"] = True
-                self.save_config()
-                return True
-            else:
+                exe_path = self._get_autostart_command()
+                # 创建计划任务：登录时以最高权限运行
+                cmd = (
+                    f'schtasks /Create /F /TN "{task_name}" '
+                    f'/TR "{exe_path}" /SC ONLOGON /RL HIGHEST '
+                    f'/DELAY 0005:00'
+                )
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        startupinfo=startupinfo, shell=True,
+                                        timeout=30)
+                if result.returncode == 0:
+                    logging.info(f"已创建计划任务自启动: {task_name} -> {exe_path}")
+                    # 删除旧版注册表自启动项（避免 UAC 弹窗干扰）
+                    try:
+                        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+                        winreg.DeleteValue(key, self.app_name)
+                        winreg.CloseKey(key)
+                        logging.info("已清理旧版注册表自启动项")
+                    except FileNotFoundError:
+                        pass
+                    self.config["autostart"] = True
+                    self.save_config()
+                    return True
+                logging.error(f"创建计划任务失败: {result.stderr or result.stdout}")
+                # 回退：尝试注册表（部分系统计划任务被策略禁用时）
                 try:
+                    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(key, self.app_name, 0, winreg.REG_SZ, exe_path)
+                    winreg.CloseKey(key)
+                    logging.info(f"回退使用注册表自启动: {exe_path}")
+                    self.config["autostart"] = True
+                    self.save_config()
+                    return True
+                except Exception as e2:
+                    logging.error(f"注册表自启动回退失败: {e2}")
+                    return False
+            else:
+                # 删除计划任务
+                cmd = f'schtasks /Delete /F /TN "{task_name}"'
+                subprocess.run(cmd, capture_output=True, text=True,
+                               startupinfo=startupinfo, shell=True, timeout=30)
+                # 同时删除注册表项（兼容旧版）
+                try:
+                    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
                     key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
                     winreg.DeleteValue(key, self.app_name)
                     winreg.CloseKey(key)
                 except FileNotFoundError:
                     pass
-                
-                logging.info("已取消注册表自启动")
+                logging.info("已取消自启动（计划任务 + 注册表）")
                 self.config["autostart"] = False
                 self.save_config()
                 return True
-                
         except Exception as e:
             logging.error(f"设置自启动异常: {e}")
             return False
 
+    def _task_exists(self):
+        """检查计划任务是否存在且指向当前程序"""
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            cmd = f'schtasks /Query /TN "{self.task_name}"'
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    startupinfo=startupinfo, shell=True, timeout=30)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _fix_task_path(self):
+        """计划任务存在但指向旧路径时重建为当前路径"""
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            cmd = f'schtasks /Query /TN "{self.task_name}" /XML'
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    startupinfo=startupinfo, shell=True, timeout=30)
+            expected = self._get_autostart_command()
+            if result.returncode == 0 and expected:
+                if expected.split('"')[1] not in result.stdout:
+                    logging.warning("检测到计划任务路径已过期，正在重建")
+                    return self.set_autostart(True)
+            return True
+        except Exception:
+            return False
+
     def is_autostart_enabled(self):
-        """检查注册表确认是否已设置自启动"""
-        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        """检查自启动状态：优先计划任务，其次注册表（兼容旧版）"""
         is_enabled = False
         try:
-            reg_value = None
-            # 1. 检查注册表
-            try:
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
-                reg_value, _ = winreg.QueryValueEx(key, self.app_name)
-                winreg.CloseKey(key)
+            # 1. 计划任务（当前方案）
+            if self._task_exists():
                 is_enabled = True
-            except FileNotFoundError:
-                pass
-
-            # 如果注册表存在，但仍指向旧版本 EXE，则自动修复为当前版本路径。
-            if is_enabled and reg_value:
-                expected_command = self._get_autostart_command()
-                current_path = self._extract_command_path(reg_value)
-                command_matches = self._normalize_autostart_command(reg_value) == self._normalize_autostart_command(expected_command)
-                path_exists = os.path.exists(current_path) if current_path else False
-
-                if not command_matches or not path_exists:
-                    logging.warning(
-                        f"检测到自启动项路径已过期或失效，当前值: {reg_value}，期望值: {expected_command}"
-                    )
-                    repaired = self.set_autostart(True)
-                    if repaired:
-                        is_enabled = True
-                    else:
-                        is_enabled = False
-            
-            # 2. 如果注册表没有，检查计划任务 (为了兼容旧版状态显示)
+                self._fix_task_path()
+            # 2. 注册表（旧版兼容）
             if not is_enabled:
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                cmd = f'schtasks /Query /TN "{self.task_name}"'
-                result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, shell=True)
-                if result.returncode == 0:
-                    is_enabled = True
+                try:
+                    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
+                    reg_value, _ = winreg.QueryValueEx(key, self.app_name)
+                    winreg.CloseKey(key)
+                    if reg_value:
+                        # 路径有效则迁移到计划任务方案
+                        current_path = self._extract_command_path(reg_value)
+                        if current_path and os.path.exists(current_path):
+                            is_enabled = True
+                            logging.info("检测到旧版注册表自启动，正在迁移到计划任务")
+                            self.set_autostart(True)
+                        else:
+                            # 路径失效，清理
+                            self.set_autostart(False)
+                except FileNotFoundError:
+                    pass
 
             # 同步配置文件状态
             if self.config.get("autostart") != is_enabled:
