@@ -361,3 +361,28 @@ REMOVECOMPLETE (0x8004)，休眠逻辑（挂在 QUERYREMOVE 上）不触发。
 ### 修改红线补充
 12. 不要删除 _on_devnodes_changed（Win10 22H2 弹出休眠依赖它）
 13. 0x0007 处理必须用 TUR 探测甄别（直接对所有盘 SLEEP 会误休眠）
+
+
+---
+
+## 16. Event ID 129（磁盘重置）与休眠标记（2026-08-27）
+
+### ID 129 含义
+- 来源：storahci/storport 存储控制器
+- 内容："Reset to device, \\Device\\RaidPortX, was issued"
+- 原因：磁盘在超时时间内未响应 I/O 请求（微软官方《Understanding Storage Timeouts and Event 129 Errors》）
+- 与休眠的关系：磁盘进入 SLEEP 后，若有程序访问（如 SMART 检测），盘无法及时响应 → 控制器超时 → 发 Reset → ID 129
+
+### 修复
+SLEEP 成功后调用 monitor_service.mark_disk_sleeping(serial)（_on_query_remove 和 _on_devnodes_changed 两处），
+监控服务检测到 sleeping_disks 中的盘会跳过 SMART 检测，不再访问已休眠盘 → 不触发 ID 129。
+
+### Win10 关机休眠
+- 关机休眠走 WM_QUERYENDSESSION（系统级消息，Win10/Win11 都发），不依赖 QUERYREMOVE
+- 外置判定改为：is_removable OR pnp_id 含 USB/UASP
+  （覆盖 USB 硬盘柜连接的 IDE 盘——WMI 显示 Interface: IDE 但 PnP 路径含 USB；
+   内置 SATA/NVMe 直连盘的 PnP 路径不含 USB，不会被误休眠）
+
+### 修改红线补充
+14. 不要删除 SLEEP 后的 mark_disk_sleeping（否则监控访问休眠盘触发 ID 129）
+15. 外置判定必须含 USB PnP（否则 Win10 多盘位硬盘柜的盘全部 is_removable=False，关机不生效）

@@ -1576,10 +1576,15 @@ class SafeRemovalPatcher:
 
             INVALID = ctypes.c_void_p(-1).value
             # 从监控服务的缓存中收集外置磁盘序号
+            # 外置判定：is_removable 或 PnP 路径含 USB（覆盖 USB 硬盘柜连接的 IDE 盘）
             disk_indexes = set()
             if self.monitor_service:
                 for d in getattr(self.monitor_service, 'cached_disks', []) or []:
-                    if getattr(d, 'is_removable', False):
+                    pnp_id = getattr(d, 'pnp_id', '') or ''
+                    is_external = (getattr(d, 'is_removable', False)
+                                   or 'USB' in pnp_id.upper()
+                                   or 'UASP' in pnp_id.upper())
+                    if is_external:
                         idx = getattr(d, 'index', None)
                         if idx is not None:
                             disk_indexes.add(idx)
@@ -1772,6 +1777,22 @@ class SafeRemovalPatcher:
 
         return False
 
+    def _mark_disk_sleeping_by_index(self, disk_index):
+        """SLEEP 成功后，用磁盘序号反查 serial 并通知监控服务标记休眠，
+        避免监控服务后续 SMART 检测访问已休眠盘触发 Event ID 129。"""
+        if not self.monitor_service:
+            return
+        try:
+            serial = None
+            for d in getattr(self.monitor_service, 'cached_disks', []) or []:
+                if getattr(d, 'index', None) == disk_index:
+                    serial = getattr(d, 'serial_number', None)
+                    break
+            if serial:
+                self.monitor_service.mark_disk_sleeping(serial)
+        except Exception as e:
+            logging.warning(f"[SafeRemovalPatch] 标记休眠失败 (disk {disk_index}): {e}")
+
     def _on_devnodes_changed(self):
         """处理 DBT_DEVNODES_CHANGED (0x0007)：
         在 Win10 22H2 上，"安全删除硬件"弹出 USB 硬盘柜不发送 QUERYREMOVE，
@@ -1827,6 +1848,8 @@ class SafeRemovalPatcher:
                             logging.info(
                                 f"[SafeRemovalPatch] DEVNODES_CHANGED: PhysicalDrive{disk_index} SLEEP 成功"
                             )
+                            # 标记休眠，避免监控服务 SMART 检测访问已休眠盘触发 Event ID 129
+                            self._mark_disk_sleeping_by_index(disk_index)
                         else:
                             logging.warning(
                                 f"[SafeRemovalPatch] DEVNODES_CHANGED: PhysicalDrive{disk_index} SLEEP 失败"
@@ -1935,6 +1958,8 @@ class SafeRemovalPatcher:
                     logging.info(
                         f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 成功，已停转"
                     )
+                    # 标记休眠，避免监控服务 SMART 检测访问已休眠盘触发 Event ID 129
+                    self._mark_disk_sleeping_by_index(disk_index)
                 else:
                     logging.warning(
                         f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 失败"

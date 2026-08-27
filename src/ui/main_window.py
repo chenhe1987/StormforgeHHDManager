@@ -1240,7 +1240,12 @@ class MainWindow(QMainWindow):
                 serial = getattr(d, 'serial_number', None)
                 model = getattr(d, 'model', None) or getattr(d, 'model_hint', None) or ('Disk' + str(idx))
                 is_removable = getattr(d, 'is_removable', False)
-                if idx is not None and is_removable and serial not in already_asleep:
+                # 外置判定：is_removable 或 PnP 路径含 USB（覆盖 USB 硬盘柜连接的
+                # IDE 接口盘——WMI 显示 Interface: IDE 但实际通过 USB 硬盘柜连接）。
+                # 内置 SATA/NVMe 直连盘的 PnP 路径不含 USB，不会被误休眠。
+                pnp_id = getattr(d, 'pnp_id', '') or ''
+                is_external = is_removable or 'USB' in pnp_id.upper() or 'UASP' in pnp_id.upper()
+                if idx is not None and is_external and serial not in already_asleep:
                     eject_list.append((idx, model, serial))
 
             if not eject_list:
