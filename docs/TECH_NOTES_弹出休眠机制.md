@@ -332,3 +332,32 @@ DBT_DEVICEQUERYREMOVE 的返回值语义与普通消息相反：
 ### 修改红线补充
 10. 不要改回 HKCU Run 注册表自启动（uac_admin 程序开机不启动）
 11. 不要删除 set_autostart 里的"创建后清理注册表项"逻辑（避免双启动）
+
+
+---
+
+## 15. Windows 10 22H2 兼容：DEVNODES_CHANGED 补发 SLEEP（2026-08-27）
+
+### 问题
+Win10 22H2 上"安全删除硬件"弹出多盘位 USB 硬盘柜时，**不发送 DBT_DEVICEQUERYREMOVE**
+（与 Win11 25H2 不同）。接口通知 + 句柄通知都注册了，但弹出时只收到
+REMOVECOMPLETE (0x8004)，休眠逻辑（挂在 QUERYREMOVE 上）不触发。
+
+### 事件序列（实测）
+    DEVNODES_CHANGED (0x0007) → ~1秒后 → REMOVECOMPLETE (0x8004) × N
+
+0x0007 是弹出前唯一的提前信号（比 REMOVECOMPLETE 早约 1 秒，设备尚可访问）。
+
+### 方案：TUR 探测 + 精准 SLEEP（src/hal/win32_api.py _on_devnodes_changed）
+- 收到 0x0007 时，对每个已注册句柄的盘发 TEST UNIT READY (TUR)
+- TUR 失败的盘 = 正在被移除 → 只对这些盘发 SLEEP
+- TUR 正常的盘不受影响（避免误休眠——0x0007 也因其他设备变化触发）
+- 复用已注册的 RW 句柄发 SLEEP（避免弹出窗口内重新打开失败 1117）
+- 防抖：10 秒内不重复探测
+
+### 验证（打桩测试）
+    模拟 7 个盘，盘 3 TUR 失败 → 只对盘 3 发 SLEEP，其余 6 盘不动 → 防抖生效
+
+### 修改红线补充
+12. 不要删除 _on_devnodes_changed（Win10 22H2 弹出休眠依赖它）
+13. 0x0007 处理必须用 TUR 探测甄别（直接对所有盘 SLEEP 会误休眠）

@@ -1357,6 +1357,7 @@ DBT_DEVTYP_HANDLE = 0x00000006
 DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
 
 DBT_CONFIGCHANGED = 0x0018
+DBT_DEVNODES_CHANGED = 0x0007
 DBT_DEVICEARRIVAL = 0x8000
 DBT_DEVICEREMOVECOMPLETE_BROADCAST = 0x8004
 
@@ -1710,8 +1711,41 @@ class SafeRemovalPatcher:
         if event_code == DBT_DEVICEQUERYREMOVE:
             return self._on_query_remove(lparam)
 
+        if event_code == DBT_DEVNODES_CHANGED:
+            # Windows 10 22H2 上，系统托盘"安全删除硬件"弹出多盘位 USB 硬盘柜时，
+            # 不发送 DBT_DEVICEQUERYREMOVE（Win11 25H2 才会发）。此时唯一能提前
+            # 感知的信号是 DBT_DEVNODES_CHANGED (0x0007)——设备节点开始变化，
+            # 设备尚未真正移除，此刻发送 SLEEP 仍有效。
+            self._on_devnodes_changed()
+            return False
+
         if event_code == DBT_DEVICEREMOVECOMPLETE:
             self._pending_volumes.clear()
+            # Win10 22H2 上"安全删除硬件"不发送 QUERYREMOVE，弹出时只收到
+            # REMOVECOMPLETE。此时设备虽已开始移除，但多盘位硬盘柜的盘
+            # (PhysicalDriveN) 在 USB 总线断连前仍有短暂可访问窗口——
+            # 立即尝试对所有已注册句柄的外置盘发送 SLEEP（快速失败）。
+            if self._handle_disk_map:
+                logging.info(
+                    f"[SafeRemovalPatch] REMOVECOMPLETE: 设备已移除，尝试向 "
+                    f"{len(self._handle_disk_map)} 个外置盘补发 SLEEP（Win10 兼容路径）..."
+                )
+                from src.hal.asm_commander import ASMCommander
+                for h, disk_index in list(self._handle_disk_map.items()):
+                    try:
+                        with ASMCommander(disk_index, existing_handle=h) as cmd:
+                            if cmd.sleep_only():
+                                logging.info(
+                                    f"[SafeRemovalPatch] REMOVECOMPLETE: PhysicalDrive{disk_index} SLEEP 成功"
+                                )
+                            else:
+                                logging.warning(
+                                    f"[SafeRemovalPatch] REMOVECOMPLETE: PhysicalDrive{disk_index} SLEEP 失败（设备已移除）"
+                                )
+                    except Exception as e:
+                        logging.warning(
+                            f"[SafeRemovalPatch] REMOVECOMPLETE: PhysicalDrive{disk_index} SLEEP 异常: {e}"
+                        )
             # 清理已移除磁盘的句柄通知（避免句柄泄漏）
             if self._handle_notify_map:
                 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -1737,6 +1771,72 @@ class SafeRemovalPatcher:
             return False
 
         return False
+
+    def _on_devnodes_changed(self):
+        """处理 DBT_DEVNODES_CHANGED (0x0007)：
+        在 Win10 22H2 上，"安全删除硬件"弹出 USB 硬盘柜不发送 QUERYREMOVE，
+        设备节点变化(0x0007)是弹出前唯一的提前信号（实测比 REMOVECOMPLETE 早约 1 秒）。
+
+        为避免误休眠（0x0007 也因其他设备变化触发），采用"TUR 探测 + 精准 SLEEP"：
+        - 对每个已注册句柄的盘发送 TEST UNIT READY
+        - TUR 失败/异常 的盘 = 正在被移除（即将弹出）→ 只对这些盘发 SLEEP
+        - TUR 正常 的盘不受影响 → 不误休眠
+        """
+        try:
+            import time as _t
+            now = _t.time()
+            # 防抖：10 秒内不重复探测（0x0007 可能连续触发多次）
+            if getattr(self, '_last_devnodes_probe', 0) and now - self._last_devnodes_probe < 10:
+                return
+            self._last_devnodes_probe = now
+
+            if not self._handle_disk_map:
+                return
+
+            from src.hal.asm_commander import ASMCommander
+            candidates = []
+            for h, disk_index in list(self._handle_disk_map.items()):
+                try:
+                    with ASMCommander(disk_index, existing_handle=h) as cmd:
+                        responding = cmd.is_responding()
+                        if not responding:
+                            candidates.append(disk_index)
+                except Exception:
+                    candidates.append(disk_index)
+
+            if not candidates:
+                logging.debug(
+                    f"[SafeRemovalPatch] DEVNODES_CHANGED: 所有外置盘 TUR 正常，无需休眠"
+                )
+                return
+
+            logging.info(
+                f"[SafeRemovalPatch] DEVNODES_CHANGED: 检测到 {len(candidates)} 个盘不再响应"
+                f"（{candidates}），判定正在弹出，发送 SLEEP（提前停转）..."
+            )
+            for disk_index in candidates:
+                # 复用已注册的句柄（避免弹出窗口内重新打开失败 1117）
+                existing_h = None
+                for h, idx in self._handle_disk_map.items():
+                    if idx == disk_index:
+                        existing_h = h
+                        break
+                try:
+                    with ASMCommander(disk_index, existing_handle=existing_h) as cmd:
+                        if cmd.sleep_only():
+                            logging.info(
+                                f"[SafeRemovalPatch] DEVNODES_CHANGED: PhysicalDrive{disk_index} SLEEP 成功"
+                            )
+                        else:
+                            logging.warning(
+                                f"[SafeRemovalPatch] DEVNODES_CHANGED: PhysicalDrive{disk_index} SLEEP 失败"
+                            )
+                except Exception as e:
+                    logging.warning(
+                        f"[SafeRemovalPatch] DEVNODES_CHANGED: PhysicalDrive{disk_index} SLEEP 异常: {e}"
+                    )
+        except Exception as e:
+            logging.error(f"[SafeRemovalPatch] DEVNODES_CHANGED 处理异常: {e}")
 
     def _on_query_remove(self, lparam):
         reply = False  # do not veto; let Windows proceed
