@@ -77,5 +77,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='疾风知硬盘柜管理_v1.3.72',
+    name='疾风知硬盘柜管理_v1.3.74',
 )
