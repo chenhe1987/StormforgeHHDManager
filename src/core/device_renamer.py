@@ -91,40 +91,25 @@ class DeviceRenamer:
         """
         获取物理磁盘索引到 PnP 设备 ID 的映射
         返回: {disk_index (int): pnp_device_id (str)}
+
+        注意：改用 WMI(Win32_DiskDrive) 直接读取，不依赖 powershell 子进程。
+        powershell 子进程在部分环境会挂起（导致磁盘枚举阻塞、SMART 检测卡死），
+        WMI 与项目其他模块一致、更稳定。
         """
         device_map = {}
         try:
-            cmd = ["powershell", "-Command", "Get-CimInstance Win32_DiskDrive | Select-Object DeviceID, PNPDeviceID | ConvertTo-Json"]
-
-            creation_flags = 0
-            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
-                creation_flags = subprocess.CREATE_NO_WINDOW
-
-            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=creation_flags)
-
-            if result.returncode != 0:
-                logging.error(f"获取设备映射失败: {result.stderr}")
-                return {}
-
-            import json
-            try:
-                data = json.loads(result.stdout)
-                if isinstance(data, dict):
-                    data = [data] # 单个设备时转为列表
-
-                for drive in data:
-                    dev_id = drive.get("DeviceID", "")
-                    pnp_id = drive.get("PNPDeviceID", "")
-
-                    # 提取索引 "\\.\PHYSICALDRIVE1" -> 1
+            import wmi
+            c = wmi.WMI()
+            for drive in c.Win32_DiskDrive():
+                try:
+                    dev_id = drive.DeviceID or ""
+                    pnp_id = drive.PNPDeviceID or ""
                     match = re.search(r"PHYSICALDRIVE(\d+)", dev_id, re.IGNORECASE)
                     if match and pnp_id:
                         index = int(match.group(1))
                         device_map[index] = pnp_id
-
-            except json.JSONDecodeError:
-                logging.error("解析 PowerShell JSON 输出失败")
-
+                except Exception:
+                    continue
         except Exception as e:
             logging.error(f"获取设备映射异常: {e}")
 
