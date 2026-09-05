@@ -300,8 +300,11 @@ class MonitorService(threading.Thread):
                                 try:
                                     if disk.pnp_id and real_model and real_model != "Unknown":
                                         current_friendly = DeviceRenamer.get_friendly_name(disk.pnp_id)
-                                        if DeviceRenamer.should_rename(current_friendly, real_model):
-                                            logging.info(f"检测到设备名需更新: '{current_friendly}' -> '{real_model}'")
+                                        # 外置可换盘盘位(USB硬盘柜)强制同步真实型号，
+                                        # 修复换盘后设备管理器仍显示旧盘名的问题
+                                        force_sync = bool(getattr(disk, 'is_removable', False))
+                                        if DeviceRenamer.should_rename(current_friendly, real_model, force=force_sync):
+                                            logging.info(f"检测到设备名需更新: '{current_friendly}' -> '{real_model}' (force={force_sync})")
                                             DeviceRenamer.set_friendly_name(disk.pnp_id, real_model)
                                 except Exception as e:
                                     logging.warning(f"自动重命名尝试失败: {e}")

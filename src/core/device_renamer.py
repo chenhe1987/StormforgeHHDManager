@@ -95,13 +95,13 @@ class DeviceRenamer:
         device_map = {}
         try:
             cmd = ["powershell", "-Command", "Get-CimInstance Win32_DiskDrive | Select-Object DeviceID, PNPDeviceID | ConvertTo-Json"]
-            
+
             creation_flags = 0
             if hasattr(subprocess, 'CREATE_NO_WINDOW'):
                 creation_flags = subprocess.CREATE_NO_WINDOW
-                
+
             result = subprocess.run(cmd, capture_output=True, text=True, creationflags=creation_flags)
-            
+
             if result.returncode != 0:
                 logging.error(f"获取设备映射失败: {result.stderr}")
                 return {}
@@ -111,23 +111,23 @@ class DeviceRenamer:
                 data = json.loads(result.stdout)
                 if isinstance(data, dict):
                     data = [data] # 单个设备时转为列表
-                
+
                 for drive in data:
                     dev_id = drive.get("DeviceID", "")
                     pnp_id = drive.get("PNPDeviceID", "")
-                    
+
                     # 提取索引 "\\.\PHYSICALDRIVE1" -> 1
                     match = re.search(r"PHYSICALDRIVE(\d+)", dev_id, re.IGNORECASE)
                     if match and pnp_id:
                         index = int(match.group(1))
                         device_map[index] = pnp_id
-                        
+
             except json.JSONDecodeError:
                 logging.error("解析 PowerShell JSON 输出失败")
-                
+
         except Exception as e:
             logging.error(f"获取设备映射异常: {e}")
-            
+
         return device_map
 
     @staticmethod
@@ -140,12 +140,12 @@ class DeviceRenamer:
 
         devInfoData = SP_DEVINFO_DATA()
         devInfoData.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
-        
+
         if not SetupDiOpenDeviceInfoW(hDevInfo, pnp_id, None, 0, ctypes.byref(devInfoData)):
             # logging.error(f"SetupDiOpenDeviceInfoW failed for {pnp_id}: {ctypes.GetLastError()}")
             SetupDiDestroyDeviceInfoList(hDevInfo)
             return None, None
-            
+
         return hDevInfo, devInfoData
 
     @staticmethod
@@ -154,27 +154,27 @@ class DeviceRenamer:
         hDevInfo, devInfoData = DeviceRenamer._get_device_info(pnp_id)
         if not hDevInfo:
             return None
-            
+
         try:
             prop_type = wintypes.DWORD()
             buffer = (ctypes.c_byte * 1024)()
             required_size = wintypes.DWORD()
-            
-            if SetupDiGetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_FRIENDLYNAME, 
+
+            if SetupDiGetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_FRIENDLYNAME,
                                                ctypes.byref(prop_type), buffer, 1024, ctypes.byref(required_size)):
                 return ctypes.cast(buffer, ctypes.c_wchar_p).value
-            
+
             # Try DeviceDesc if FriendlyName fails
-            if SetupDiGetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_DEVICEDESC, 
+            if SetupDiGetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_DEVICEDESC,
                                                ctypes.byref(prop_type), buffer, 1024, ctypes.byref(required_size)):
                 val = ctypes.cast(buffer, ctypes.c_wchar_p).value
                 return val.split(";")[-1] if ";" in val else val
-                
+
         except Exception as e:
             logging.error(f"SetupAPI Get failed: {e}")
         finally:
             SetupDiDestroyDeviceInfoList(hDevInfo)
-            
+
         return None
 
     @staticmethod
@@ -196,7 +196,7 @@ class DeviceRenamer:
         try:
             # 1. Enable SeTakeOwnershipPrivilege
             DeviceRenamer._enable_privilege(win32security.SE_TAKE_OWNERSHIP_NAME)
-            
+
             # 2. Get Administrators SID
             admin_sid = win32security.LookupAccountName(None, "Administrators")[0]
 
@@ -212,9 +212,9 @@ class DeviceRenamer:
             sd.SetSecurityDescriptorOwner(admin_sid, False)
             win32api.RegSetKeySecurity(reg_key, win32security.OWNER_SECURITY_INFORMATION, sd)
             win32api.RegCloseKey(reg_key)
-            
+
             # 5. Now we own it, open with WRITE_DAC
-            reg_key = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE, key_path, 0, 
+            reg_key = win32api.RegOpenKeyEx(win32con.HKEY_LOCAL_MACHINE, key_path, 0,
                                           win32con.WRITE_DAC | win32con.READ_CONTROL)
 
             # 6. Get current DACL and add Full Control
@@ -222,17 +222,17 @@ class DeviceRenamer:
             dacl = sd.GetSecurityDescriptorDacl()
             if dacl is None:
                 dacl = win32security.ACL()
-                
+
             dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.KEY_ALL_ACCESS, admin_sid)
             sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            
+
             # 7. Apply new DACL
             win32api.RegSetKeySecurity(reg_key, win32security.DACL_SECURITY_INFORMATION, sd)
             win32api.RegCloseKey(reg_key)
-            
+
             logging.info(f"已授予管理员对 {pnp_id} 的注册表写权限")
             return True
-            
+
         except Exception as e:
             logging.error(f"修改注册表权限失败: {e}")
             return False
@@ -243,31 +243,31 @@ class DeviceRenamer:
         hDevInfo, devInfoData = DeviceRenamer._get_device_info(pnp_id)
         if not hDevInfo:
             return False
-            
+
         try:
             # Convert string to bytes (UTF-16LE for W API)
             name_bytes = new_name.encode('utf-16le') + b'\x00\x00'
             buffer = (ctypes.c_byte * len(name_bytes)).from_buffer_copy(name_bytes)
-            
-            success = SetupDiSetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_FRIENDLYNAME, 
+
+            success = SetupDiSetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_FRIENDLYNAME,
                                                buffer, len(name_bytes))
-            
+
             if not success:
                 err = ctypes.GetLastError()
                 logging.warning(f"SetupAPI 初次尝试失败 ({pnp_id}), Error: {err}")
-                
+
                 # 如果是权限错误 (5)，尝试修复权限
                 if err == 5:
                     logging.info("尝试修复注册表权限...")
                     if DeviceRenamer._grant_admin_access(pnp_id):
                         # Retry
-                        success = SetupDiSetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_FRIENDLYNAME, 
+                        success = SetupDiSetDeviceRegistryPropertyW(hDevInfo, ctypes.byref(devInfoData), SPDRP_FRIENDLYNAME,
                                                            buffer, len(name_bytes))
                         if success:
                             logging.info("权限修复后 SetupAPI 成功")
                         else:
                             logging.error(f"权限修复后 SetupAPI 仍失败, Error: {ctypes.GetLastError()}")
-            
+
             if success:
                 logging.info(f"SetupAPI: 已更新设备名: {pnp_id} -> {new_name}")
                 # Trigger re-enumeration to refresh Device Manager
@@ -277,7 +277,7 @@ class DeviceRenamer:
                 else:
                     logging.warning(f"设备节点重枚举失败: {ret}")
                 return True
-            
+
             return False
         except Exception as e:
             logging.error(f"SetupAPI Set Exception: {e}")
@@ -286,30 +286,39 @@ class DeviceRenamer:
             SetupDiDestroyDeviceInfoList(hDevInfo)
 
     @staticmethod
-    def should_rename(current_name, target_name):
+    def should_rename(current_name, target_name, force=False):
         """
         判断是否需要重命名
-        如果当前名字包含 'USB', 'SCSI', 'ATA Device', 'ASMT' 等通用词，且不包含目标型号的关键部分，则建议重命名
+        如果当前名字包含 'USB', 'SCSI', 'ATA Device', 'ASMT' 等通用词，且不包含目标型号的关键部分，则建议重命名。
+
+        force=True 用于 USB 硬盘柜等可换盘盘位：盘位的 PnP ID 固定不变，
+        但插入的硬盘可以更换（如台达固态换成 HC550）。此时 FriendlyName
+        必须始终跟随当前盘的真实型号，否则设备管理器会一直显示旧盘的名字
+        （实测：换盘后 3 个 HC550 显示成 2 个 HC550 + 1 个台达固态）。
         """
         if not current_name or not target_name:
             return False
-            
+
         if current_name == target_name:
             return False
-            
+
         # 清理目标名字中的非法字符（如果有）
         clean_target = target_name.strip()
-        
+
         # 如果当前名字已经是目标名字（忽略大小写），不需要改
         if clean_target.lower() in current_name.lower():
             return False
-            
+
+        # 外置可换盘盘位：名字必须跟随当前盘的真实型号
+        if force:
+            return True
+
         # 检查是否是通用名
         generic_keywords = ["USB Device", "SCSI Disk Device", "ATA Device", "ASMT", "USBSTOR", "External USB 3.0", "Sabrent", "JMicron"]
         is_generic = any(k.lower() in current_name.lower() for k in generic_keywords)
-        
+
         # 如果当前名字太短（可能是默认驱动名），也改
         if len(current_name) < 5:
             is_generic = True
-            
+
         return is_generic
