@@ -1481,6 +1481,7 @@ class Win32API:
 
 WM_DEVICECHANGE = 0x0219
 DBT_DEVICEQUERYREMOVE = 0x8001
+DBT_DEVICEQUERYREMOVEFAILED = 0x8002
 DBT_DEVICEREMOVEPENDING = 0x8003
 DBT_DEVICEREMOVECOMPLETE = 0x8004
 DBT_DEVTYP_VOLUME = 0x00000002
@@ -1832,6 +1833,7 @@ class SafeRemovalPatcher:
         event_names = {
             DBT_DEVICEARRIVAL: "DEVICEARRIVAL",
             DBT_DEVICEQUERYREMOVE: "DEVICEQUERYREMOVE",
+            DBT_DEVICEQUERYREMOVEFAILED: "DEVICEQUERYREMOVEFAILED",
             DBT_DEVICEREMOVEPENDING: "DEVICEREMOVEPENDING",
             DBT_DEVICEREMOVECOMPLETE: "DEVICEREMOVECOMPLETE",
             DBT_CONFIGCHANGED: "CONFIGCHANGED",
@@ -1868,6 +1870,19 @@ class SafeRemovalPatcher:
 
         if event_code == DBT_DEVICEQUERYREMOVE:
             return self._on_query_remove(lparam)
+
+        if event_code == DBT_DEVICEQUERYREMOVEFAILED:
+            # 移除被否决（卷仍被占用/卸载失败等）：
+            # 必须恢复监控并清空去重标记，否则监控永久停摆、
+            # 该盘后续弹出会被 _pending_volumes 去重跳过。
+            # （Win10 用户实测：QUERYREMOVE 阶段深睡盘导致卷移除失败 → 盘符残留）
+            logging.info(
+                "[SafeRemovalPatch] DEVICEQUERYREMOVEFAILED: 弹出被否决，恢复监控状态"
+            )
+            self._pending_volumes.clear()
+            if self.monitor_service:
+                self.monitor_service.resume_after_removal()
+            return False
 
         if event_code == DBT_DEVNODES_CHANGED:
             # Windows 10 22H2 上，系统托盘"安全删除硬件"弹出多盘位 USB 硬盘柜时，
@@ -2103,13 +2118,15 @@ class SafeRemovalPatcher:
             return reply
         self._pending_volumes[dedup_key] = True
 
-        logging.info("[SafeRemovalPatch] 正在同步发送 SLEEP...")
+        logging.info("[SafeRemovalPatch] 正在同步发送 STANDBY IMMEDIATE（可恢复停转）...")
 
-        # 在 QUERYREMOVE 同步窗口内完成 SLEEP，确保设备真正移除前命令已发出。
-        # 用 sleep_only（只发 SLEEP 0xE6，不 FLUSH CACHE）：Windows 弹出流程已 flush 卷，
-        # 且 SLEEP IOCTL 快速返回，避免阻塞导致弹出被否决。
-        # 优先复用句柄通知注册的 GENERIC_READ 句柄（有权限执行 IOCTL），
-        # 避免 QUERYREMOVE 阶段重新打开设备可能遇到的 1117 (I/O 设备错误)。
+        # 弹出场景铁律（十一轮关机实测 + Win10 用户反馈「弹出后盘符依然存在」）：
+        # QUERYREMOVE 时卷可能尚未卸载完成——若此刻发送深睡 SLEEP(0xE6)，
+        # Windows 后续卸载/移除卷的 I/O 会撞上不响应的深睡盘 → 移除被否决
+        # （DEVICEQUERYREMOVEFAILED）→ 磁盘设备虽被移除、卷却残留成幽灵盘符。
+        # 因此这里只用 STANDBY IMMEDIATE(0xE0)：磁头归位 + 停转，但**可恢复**——
+        # Windows 若仍需访问，盘自动起转完成移除；若不需要，则保持停转。
+        # 真正的深睡交给 REMOVECOMPLETE 之后的补发 SLEEP（此时卷已卸载，深睡安全）。
         existing_handle = None
         if devicetype == DBT_DEVTYP_HANDLE:
             for h, idx in self._handle_disk_map.items():
@@ -2119,25 +2136,23 @@ class SafeRemovalPatcher:
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, existing_handle=existing_handle) as cmd:
-                if cmd.sleep_only():
+                if cmd.standby_immediate():
                     logging.info(
-                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 成功，已停转"
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} STANDBY 成功，已停转（可恢复）"
                     )
-                    # 标记休眠，避免监控服务 SMART 检测访问已休眠盘触发 Event ID 129
-                    self._mark_disk_sleeping_by_index(disk_index)
                 else:
                     logging.warning(
-                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 失败"
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} STANDBY 失败"
                     )
         except Exception as e:
             logging.warning(
-                f"[SafeRemovalPatch] SLEEP 异常: {e}，仍允许系统继续移除"
+                f"[SafeRemovalPatch] STANDBY 异常: {e}，仍允许系统继续移除"
             )
 
-        # SLEEP 发送完成后，注销句柄通知并关闭设备句柄。
+        # 停转命令发送完成后，注销句柄通知并关闭设备句柄。
         # Windows 在 QUERYREMOVE 阶段会检查该句柄是否仍打开，
         # 若仍持有则判定设备被占用，弹出会被否决（事件日志 225）。
-        # 注意：必须在 SLEEP 之后释放——先释放会导致后续 I/O 报 1117 错误。
+        # 注意：必须在停转命令之后释放——先释放会导致后续 I/O 报 1117 错误。
         if devicetype == DBT_DEVTYP_HANDLE:
             self._release_handle_for_disk(disk_index)
 
