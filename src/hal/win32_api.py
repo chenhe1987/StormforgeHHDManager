@@ -2213,15 +2213,16 @@ class SafeRemovalPatcher:
             return reply
         self._pending_volumes[dedup_key] = True
 
-        logging.info("[SafeRemovalPatch] 正在同步发送 STANDBY IMMEDIATE（可恢复停转）...")
+        logging.info("[SafeRemovalPatch] 正在同步发送 SLEEP...")
 
-        # 弹出场景铁律（十一轮关机实测 + Win10 用户反馈「弹出后盘符依然存在」）：
-        # QUERYREMOVE 时卷可能尚未卸载完成——若此刻发送深睡 SLEEP(0xE6)，
-        # Windows 后续卸载/移除卷的 I/O 会撞上不响应的深睡盘 → 移除被否决
-        # （DEVICEQUERYREMOVEFAILED）→ 磁盘设备虽被移除、卷却残留成幽灵盘符。
-        # 因此这里只用 STANDBY IMMEDIATE(0xE0)：磁头归位 + 停转，但**可恢复**——
-        # Windows 若仍需访问，盘自动起转完成移除；若不需要，则保持停转。
-        # 真正的深睡交给 REMOVECOMPLETE 之后的补发 SLEEP（此时卷已卸载，深睡安全）。
+        # 弹出停转 = 深睡 SLEEP(0xE6)（用户验证过的方案）：
+        # 在 QUERYREMOVE 同步窗口内完成 SLEEP，确保设备真正移除前命令已发出。
+        # 用 sleep_only（只发 SLEEP 0xE6，不 FLUSH CACHE）：Windows 弹出流程已 flush 卷，
+        # 且 SLEEP IOCTL 快速返回，避免阻塞导致弹出被否决。
+        # 若移除被否决（QUERYREMOVEFAILED），handle_wm_devicechange 会恢复监控状态，
+        # 盘保持深睡（黑名单语义），用户可再次弹出。
+        # 优先复用句柄通知注册的句柄（有权限执行 IOCTL），
+        # 避免 QUERYREMOVE 阶段重新打开设备可能遇到的 1117 (I/O 设备错误)。
         existing_handle = None
         if devicetype == DBT_DEVTYP_HANDLE:
             for h, idx in self._handle_disk_map.items():
@@ -2231,23 +2232,25 @@ class SafeRemovalPatcher:
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, existing_handle=existing_handle) as cmd:
-                if cmd.standby_immediate():
+                if cmd.sleep_only():
                     logging.info(
-                        f"[SafeRemovalPatch] 磁盘 {disk_index} STANDBY 成功，已停转（可恢复）"
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 成功，已停转"
                     )
+                    # 标记休眠，避免监控服务 SMART 检测访问已休眠盘触发 Event ID 129
+                    self._mark_disk_sleeping_by_index(disk_index)
                 else:
                     logging.warning(
-                        f"[SafeRemovalPatch] 磁盘 {disk_index} STANDBY 失败"
+                        f"[SafeRemovalPatch] 磁盘 {disk_index} SLEEP 失败"
                     )
         except Exception as e:
             logging.warning(
-                f"[SafeRemovalPatch] STANDBY 异常: {e}，仍允许系统继续移除"
+                f"[SafeRemovalPatch] SLEEP 异常: {e}，仍允许系统继续移除"
             )
 
-        # 停转命令发送完成后，注销句柄通知并关闭设备句柄。
+        # SLEEP 发送完成后，注销句柄通知并关闭设备句柄。
         # Windows 在 QUERYREMOVE 阶段会检查该句柄是否仍打开，
         # 若仍持有则判定设备被占用，弹出会被否决（事件日志 225）。
-        # 注意：必须在停转命令之后释放——先释放会导致后续 I/O 报 1117 错误。
+        # 注意：必须在 SLEEP 之后释放——先释放会导致后续 I/O 报 1117 错误。
         if devicetype == DBT_DEVTYP_HANDLE:
             self._release_handle_for_disk(disk_index)
 
