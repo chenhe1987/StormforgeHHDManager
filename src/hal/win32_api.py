@@ -1724,9 +1724,16 @@ class SafeRemovalPatcher:
                         idx = getattr(d, 'index', None)
                         if idx is not None:
                             disk_indexes.add(idx)
-            # 兜底：把映射缓存里的磁盘序号也加入
+            # 兜底：把映射缓存里的磁盘序号也加入——但必须同样做外置判定！
+            # 卷映射包含内部盘（C:/D:/F:），若不加过滤，内部盘会被注册句柄通知，
+            # 并在 REMOVECOMPLETE 补发 SLEEP 时被误深睡（实测：内部 HGST 被深睡）。
             for idx in self._volume_disk_cache.values():
-                disk_indexes.add(idx)
+                try:
+                    pnp_fb = (Win32API.get_device_instance_path(idx) or "").upper()
+                    if "USB" in pnp_fb or "ASMT" in pnp_fb or "USBSTOR" in pnp_fb:
+                        disk_indexes.add(idx)
+                except Exception:
+                    pass
 
             for disk_index in sorted(disk_indexes):
                 try:
@@ -1897,14 +1904,31 @@ class SafeRemovalPatcher:
             # Win10 22H2 上"安全删除硬件"不发送 QUERYREMOVE，弹出时只收到
             # REMOVECOMPLETE。此时设备虽已开始移除，但多盘位硬盘柜的盘
             # (PhysicalDriveN) 在 USB 总线断连前仍有短暂可访问窗口——
-            # 立即尝试对所有已注册句柄的外置盘发送 SLEEP（快速失败）。
+            # 立即尝试对剩余外置盘补发 SLEEP（快速失败）。
+            #
+            # 铁律（§8.40，先卸载后深睡）：**跳过有挂载卷的盘**——
+            # 它们还在正常服役，深睡会让卷失去响应（实测：弹出空盘位后
+            # E: 的盘被补发 SLEEP 深睡，E: 一度不可访问；内部盘同样受害）。
+            mounted = set()
+            try:
+                for _letter, _idx in (Win32API.get_volume_disk_mapping() or {}).items():
+                    mounted.add(_idx)
+            except Exception:
+                pass
             if self._handle_disk_map:
                 logging.info(
                     f"[SafeRemovalPatch] REMOVECOMPLETE: 设备已移除，尝试向 "
-                    f"{len(self._handle_disk_map)} 个外置盘补发 SLEEP（Win10 兼容路径）..."
+                    f"{len(self._handle_disk_map)} 个外置盘补发 SLEEP（Win10 兼容路径，"
+                    f"跳过挂载卷的盘）..."
                 )
                 from src.hal.asm_commander import ASMCommander
                 for h, disk_index in list(self._handle_disk_map.items()):
+                    if disk_index in mounted:
+                        logging.info(
+                            f"[SafeRemovalPatch] REMOVECOMPLETE: PhysicalDrive{disk_index} "
+                            f"有挂载卷，跳过补发 SLEEP"
+                        )
+                        continue
                     try:
                         with ASMCommander(disk_index, existing_handle=h) as cmd:
                             if cmd.sleep_only():
