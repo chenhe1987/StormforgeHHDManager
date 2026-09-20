@@ -25,7 +25,7 @@ from src.core.device_manager import DeviceManager
 from src.core.config_manager import ConfigManager
 from src.core.shutdown_guard import ShutdownGuard
 from src.utils.paths import get_resource_path
-from src.utils.log_reporter import LogReporter
+from src.utils.log_reporter import LogReporter, load_report_server_config
 
 logging.info("Win32API 导入成功")
 
@@ -143,6 +143,8 @@ class LogDialog(QDialog):
         QMessageBox.information(self, "提示", "日志已复制到剪贴板")
 
 class ReportDialog(QDialog):
+    _upload_finished = Signal(dict)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("错误报告与分析")
@@ -159,6 +161,9 @@ class ReportDialog(QDialog):
         self.reporter = LogReporter()
         self.config_manager = parent.config_manager if parent else ConfigManager()
         self.report_config = self.config_manager.get_report_config()
+        self.app_version = getattr(parent, "version", None) or "1.3.74"
+        self._server_cfg = load_report_server_config()
+        self._upload_finished.connect(self._on_upload_finished)
         
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
@@ -178,22 +183,18 @@ class ReportDialog(QDialog):
         self.load_analysis()
         
         # 3. Settings
-        # 移除自动上传选项，因为没有后端服务器支持
-        # settings_layout = QHBoxLayout()
-        # self.auto_report_cb = QCheckBox("以后遇到严重错误自动发送报告 (需配置服务器)")
-        # self.auto_report_cb.setChecked(self.report_config["auto_report"])
-        # settings_layout.addWidget(self.auto_report_cb)
-        # layout.addLayout(settings_layout)
-        
+        # 自动上传未启用：一键上传已覆盖人工反馈场景，避免误传
+        # （报告服务器地址/密钥由程序目录 report_server.json 提供，如需自动上传可在此开启）
+
         # 4. Actions
         btn_layout = QHBoxLayout()
         
         self.export_btn = QPushButton("仅导出到本地...")
         self.export_btn.clicked.connect(self.do_export)
         
-        self.send_btn = QPushButton("通过邮件发送报告 (推荐)")
+        self.send_btn = QPushButton("一键上传服务器 (推荐)")
         self.send_btn.setStyleSheet("background-color: #76b900; color: black; font-weight: bold; border: none;")
-        self.send_btn.clicked.connect(self.do_email_report)
+        self.send_btn.clicked.connect(self.do_upload_report)
         
         self.close_btn = QPushButton("关闭")
         self.close_btn.clicked.connect(self.accept)
@@ -233,55 +234,89 @@ class ReportDialog(QDialog):
             else:
                 QMessageBox.critical(self, "导出失败", "无法创建日志包")
         
-    def do_email_report(self):
-        """生成日志并打开邮件客户端"""
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("正在生成...")
-        QApplication.processEvents()
-        
-        # 1. Pack logs to a temp location
-        zip_path = self.reporter.pack_logs()
-        if not zip_path:
-            QMessageBox.warning(self, "错误", "无法生成日志包")
-            self.send_btn.setEnabled(True)
-            self.send_btn.setText("通过邮件发送报告 (推荐)")
+    def do_upload_report(self):
+        """一键上传：打包日志 → POST 到云主机固定目录。"""
+        if not self._server_cfg:
+            QMessageBox.warning(
+                self, "未配置报告服务器",
+                "程序目录下缺少 report_server.json（云端地址与密钥）。\n"
+                "请改用「仅导出到本地」保存日志包。",
+            )
             return
-            
-        # 2. Open folder with file selected
-        try:
-            subprocess.Popen(f'explorer /select,"{zip_path}"')
-        except Exception as e:
-            logging.error(f"Failed to open explorer: {e}")
-            
-        # 3. Construct mailto link
-        recipient = "278715262@qq.com"
-        subject = f"疾风知硬盘柜-错误报告 ({datetime.now().strftime('%Y-%m-%d')})"
-        
-        # 4. Show custom guide dialog
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("发送错误报告")
-        msg_box.setText(
-            "请按以下步骤发送报告：\n\n"
-            "1. 包含日志的文件夹已自动打开 (选中了 .zip 文件)\n"
-            "2. 请手动发送邮件给开发者\n\n"
-            f"收件人: {recipient}\n"
-            f"主　题: {subject}\n"
-            "附　件: (请拖入刚才生成的 zip 文件)\n\n"
-            "点击“确定”关闭此窗口。"
+        desc, ok = QInputDialog.getMultiLineText(
+            self, "上传日志报告", "请简单描述遇到的问题（可留空）："
         )
-        msg_box.setIcon(QMessageBox.Information)
-        
-        # Add a "Copy Email" button
-        copy_btn = msg_box.addButton("复制邮箱地址", QMessageBox.ActionRole)
-        msg_box.addButton("确定", QMessageBox.AcceptRole)
-        
-        msg_box.exec()
-        
-        if msg_box.clickedButton() == copy_btn:
-            QApplication.clipboard().setText(recipient)
-            QMessageBox.information(self, "提示", "邮箱地址已复制")
-        
-        self.accept()
+        if not ok:
+            return
+        desc = (desc or "").strip()[:500]
+
+        self.send_btn.setEnabled(False)
+        self.send_btn.setText("正在上传...")
+        self.status_hint = desc
+        QApplication.processEvents()
+
+        threading.Thread(
+            target=self._upload_worker,
+            args=(desc, self.app_version),
+            daemon=True,
+        ).start()
+
+    def _upload_worker(self, description, version):
+        try:
+            ok, msg = self.reporter.send_report(
+                description=description, version=version
+            )
+            result = {"ok": ok, "msg": msg}
+        except Exception as e:
+            logging.error(f"上传日志异常: {e}")
+            result = {"ok": False, "msg": str(e)}
+        self._upload_finished.emit(result)
+
+    def _on_upload_finished(self, result):
+        self.send_btn.setEnabled(True)
+        self.send_btn.setText("一键上传服务器 (推荐)")
+
+        if result.get("ok"):
+            cfg = self._server_cfg or {}
+            browse = (cfg.get("browse_url") or "").strip()
+            dl = (cfg.get("download_url") or "").strip()
+            token = cfg.get("token") or ""
+            box = QMessageBox(self)
+            box.setWindowTitle("上传成功")
+            lines = [
+                "日志报告已上传到服务器固定目录。",
+                "",
+                "● 随时调取（浏览器打开，按版本/时间分类）：",
+            ]
+            if browse:
+                lines.append(f"  {browse}?key={token}")
+            lines.append("")
+            lines.append("● 本地调试直接下载：")
+            if dl:
+                lines.append(f"  {dl}?file=<文件名>&key={token}")
+            lines += [
+                "",
+                "报告超过 7 天自动标记为「过期」，低于最新版本标记为「旧版本」。",
+            ]
+            box.setText("\n".join(lines))
+            open_btn = box.addButton("打开日志页面", QMessageBox.ActionRole)
+            box.addButton("确定", QMessageBox.AcceptRole)
+            box.exec()
+            if browse and box.clickedButton() == open_btn:
+                webbrowser.open(f"{browse}?key={token}")
+            self.accept()
+        else:
+            box = QMessageBox(self)
+            box.setWindowTitle("上传失败")
+            box.setText(
+                f"上传失败：{result.get('msg')}\n\n"
+                "可以改用「仅导出到本地」保存日志包，稍后重试上传。"
+            )
+            save_btn = box.addButton("导出到本地", QMessageBox.ActionRole)
+            box.addButton("关闭", QMessageBox.AcceptRole)
+            box.exec()
+            if box.clickedButton() == save_btn:
+                self.do_export()
             
     def accept(self):
         # Save checkbox state if it existed

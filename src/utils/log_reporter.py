@@ -5,7 +5,44 @@ import requests
 import json
 import traceback
 from datetime import datetime
+from urllib.parse import quote
 from src.utils.paths import get_base_path
+
+# ============================================================
+# 日志报告云端方案（技术原则见 docs/TECH_NOTES_弹出休眠机制.md §8.39）
+# 客户端一键上传 → 云主机固定目录 → 网页/密钥调取，
+# 并按「版本 + 时间」判断报告有效性（过期/旧版本自动标记）。
+#
+# ⚠ 云端信息（服务器地址、访问密钥）**不写入源码**：
+# 由程序目录下的 report_server.json 提供（随发行包分发，不进公开仓库）。
+# 服务端实现与部署配置保存在本地 venv/私有资料/。
+# ============================================================
+SERVER_CONFIG_FILE = "report_server.json"
+
+
+def load_report_server_config():
+    """读取程序目录下的 report_server.json（云端地址与密钥，不随源码公开）。"""
+    try:
+        path = os.path.join(get_base_path(), SERVER_CONFIG_FILE)
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        upload_url = (cfg.get("upload_url") or "").strip()
+        token = (cfg.get("token") or "").strip()
+        if not upload_url or not token:
+            return None
+        browse_url = (cfg.get("browse_url") or "").strip()
+        if not browse_url:
+            browse_url = upload_url.rsplit("/", 1)[0] + "/"
+        return {
+            "upload_url": upload_url,
+            "browse_url": browse_url,
+            "download_url": (cfg.get("download_url") or "").strip(),
+            "token": token,
+        }
+    except Exception as e:
+        logging.warning(f"读取报告服务器配置失败: {e}")
+        return None
+
 
 class LogReporter:
     def __init__(self):
@@ -51,33 +88,51 @@ class LogReporter:
             logging.error(f"Failed to pack logs: {e}")
             return None
 
-    def send_report(self, url, description="", contact=""):
-        """Send the packed report to the specified URL"""
+    def send_report(self, description="", contact="", version="", url=None):
+        """把打包好的报告 zip 一键上传到云主机（POST 原始字节流）。
+
+        服务端按 version + 上传时间归档，并按版本/时间判断报告有效性
+        （超过 7 天标记过期、低于最新版本标记旧版本）。
+        """
         zip_path = self.pack_logs()
         if not zip_path:
             return False, "Failed to create log package"
 
+        cfg = load_report_server_config()
+        if not cfg:
+            return False, "报告服务器未配置（缺少 report_server.json）"
+
         try:
-            # This expects a multipart/form-data upload
-            # Field 'file': the zip file
-            # Field 'description': user description
-            # Field 'contact': user contact info
-            
+            url = url or cfg["upload_url"]
             with open(zip_path, 'rb') as f:
-                files = {'file': (os.path.basename(zip_path), f, 'application/zip')}
-                data = {
-                    'description': description, 
-                    'contact': contact,
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-                # Timeout set to 30s as upload might be slow
-                response = requests.post(url, files=files, data=data, timeout=30)
-                
+                payload = f.read()
+
+            headers = {
+                "X-Upload-Token": cfg["token"],
+                "X-Filename": quote(os.path.basename(zip_path)),
+                "X-Version": quote(version or ""),
+                "X-Description": quote(description or ""),
+                "X-Contact": quote(contact or ""),
+                "Content-Type": "application/zip",
+            }
+
+            # 超时放宽到 60s：日志包可能较大
+            response = requests.post(url, data=payload, headers=headers, timeout=60)
+
             if response.status_code in [200, 201]:
-                return True, "Report sent successfully"
+                try:
+                    body = response.json()
+                except Exception:
+                    body = {}
+                msg = body.get("message") or "上传成功"
+                return True, msg
             else:
-                return False, f"Server returned error: {response.status_code} - {response.text}"
+                detail = ""
+                try:
+                    detail = response.json().get("message") or response.text[:200]
+                except Exception:
+                    detail = response.text[:200]
+                return False, f"服务器返回 {response.status_code}: {detail}"
 
         except Exception as e:
             logging.error(f"Failed to send report: {e}")
@@ -87,7 +142,7 @@ class LogReporter:
             if zip_path and os.path.exists(zip_path):
                 try:
                     os.remove(zip_path)
-                except:
+                except Exception:
                     pass
 
     def analyze_logs(self):
