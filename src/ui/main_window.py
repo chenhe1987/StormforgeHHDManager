@@ -1310,6 +1310,28 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logging.warning(f"注册停转补丁失败: {e}")
 
+        # 兜底重试：设备到达风暴中 WMI 不可靠，句柄通知可能注册为 0 个外置盘
+        # （实测：硬盘柜上电瞬间注册 0 个 → 托盘弹出无停转）。
+        # 每 30 秒检查一次，为空则刷新缓存并重新注册，直到成功为止。
+        self._patcher_retry_timer = QTimer(self)
+        self._patcher_retry_timer.setInterval(30000)
+        self._patcher_retry_timer.timeout.connect(self._retry_patcher_registration)
+        self._patcher_retry_timer.start()
+
+    def _retry_patcher_registration(self):
+        try:
+            patcher = getattr(self, "spindown_patcher", None)
+            if not patcher:
+                return
+            if getattr(patcher, "_handle_notify_map", None):
+                return  # 已注册成功，无需重试
+            logging.info("[SafeRemovalPatch] 句柄通知为空，重试注册...")
+            patcher.refresh_cache()
+            hwnd = int(self.winId())
+            patcher.register(hwnd)
+        except Exception as e:
+            logging.warning(f"[SafeRemovalPatch] 重试注册失败: {e}")
+
     def nativeEvent(self, eventType, message):
         """Handle Windows native events to detect shutdown"""
         try:

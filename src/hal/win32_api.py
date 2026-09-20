@@ -29,7 +29,9 @@ CM_REMOVE_UI_NOT_OK = 0x00000002
 
 IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x4D014
 IOCTL_ATA_PASS_THROUGH = 0x4D02C
-IOCTL_STORAGE_QUERY_PROPERTY = 0x2D0504
+# 注意：旧值 0x2D0504 是错误的（驱动返回 ERROR_INVALID_FUNCTION），
+# 正确 = CTL_CODE(IOCTL_STORAGE_BASE=0x2D, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
+IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
 
 # Storage Query Property Structures
 class STORAGE_PROPERTY_QUERY(ctypes.Structure):
@@ -38,6 +40,26 @@ class STORAGE_PROPERTY_QUERY(ctypes.Structure):
         ("QueryType", ctypes.c_int),
         ("AdditionalParameters", ctypes.c_ubyte * 40) # Large enough for STORAGE_PROTOCOL_SPECIFIC_DATA
     ]
+
+class STORAGE_DEVICE_DESCRIPTOR(ctypes.Structure):
+    """STORAGE_DEVICE_DESCRIPTOR（StorageDeviceProperty 查询的返回）。"""
+    _fields_ = [
+        ("Version", ctypes.c_ulong),
+        ("Size", ctypes.c_ulong),
+        ("DeviceType", ctypes.c_byte),
+        ("DeviceTypeModifier", ctypes.c_byte),
+        ("RemovableMedia", ctypes.c_byte),
+        ("CommandQueueing", ctypes.c_byte),
+        ("VendorIdOffset", ctypes.c_ulong),
+        ("ProductIdOffset", ctypes.c_ulong),
+        ("ProductRevisionOffset", ctypes.c_ulong),
+        ("SerialNumberOffset", ctypes.c_ulong),
+        ("BusType", ctypes.c_byte),
+        ("RawPropertiesLength", ctypes.c_byte * 3),
+    ]
+
+# BusType（STORAGE_DEVICE_DESCRIPTOR.BusType）
+BusTypeUsb = 7
 
 class STORAGE_PROTOCOL_SPECIFIC_DATA(ctypes.Structure):
     _fields_ = [
@@ -286,6 +308,20 @@ class Win32API:
                     break
                 time.sleep(retry_interval)
             else:
+                # ERROR_ACCESS_DENIED(5)：ReFS/exFAT 等文件系统不支持 FSCTL_LOCK_VOLUME
+                # （实测 ReFS 卷锁定恒返回 5，而 DISMOUNT 可成功、Restart Manager 也
+                # 查不到占用者）。按 Windows 托盘弹出的做法：跳过锁定，直接卸载卷。
+                if last_error == 5:
+                    result, _, dismount_error = Win32API.device_io_control(
+                        handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0
+                    )
+                    if not result:
+                        return False, (
+                            f"卷不支持锁定且卸载失败 (error={dismount_error})"
+                        ), handle
+                    logging.info(f"卷 {volume_root} 不支持锁定（ReFS/exFAT），已直接卸载")
+                    return True, "卷不支持锁定（ReFS/exFAT），已直接卸载", handle
+
                 # ERROR_NOT_READY(21)/ERROR_IO_DEVICE(1117)/ERROR_DEV_NOT_EXIST(55)
                 # 说明设备未就绪（盘已停转或掉线），不是被程序占用：
                 # 此时查 Restart Manager 没意义而且很慢，直接跳过。
@@ -814,6 +850,38 @@ class Win32API:
         except Exception:
             return None
         return None
+
+    @staticmethod
+    def is_disk_usb_attached(disk_index):
+        """WMI-free 判定磁盘是否 USB 连接（BusType=USB，含 USBSTOR/UASP 桥接）。
+
+        注意：部分存储栈（含本机 ASMT/UASP）对 StorageDeviceProperty 查询
+        返回 BusType=0(Unknown)，此判定不可靠。保留供兼容环境使用，
+        句柄通知注册的兜底过滤不依赖本函数。
+        """
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        INVALID = ctypes.c_void_p(-1).value
+        h = kernel32.CreateFileW(
+            f"\\\\.\\PhysicalDrive{disk_index}",
+            0,  # 0 访问权限：只查适配器属性，无需读写权限
+            FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, 0, None
+        )
+        if not h or h == INVALID:
+            return False
+        try:
+            query = STORAGE_PROPERTY_QUERY()
+            query.PropertyId = 1  # StorageDeviceProperty（StorageAdapterProperty 在 Win8+ 已失效，实测 error=1）
+            query.QueryType = 0   # PropertyStandardQuery
+            desc = STORAGE_DEVICE_DESCRIPTOR()
+            result, bytes_returned, error = Win32API.device_io_control(
+                h, IOCTL_STORAGE_QUERY_PROPERTY,
+                ctypes.byref(query), ctypes.sizeof(query),
+                ctypes.byref(desc), ctypes.sizeof(desc)
+            )
+            return bool(result) and int(desc.BusType) == BusTypeUsb
+        finally:
+            kernel32.CloseHandle(h)
 
     @staticmethod
     def get_usbstor_parent_device_id(disk_index):
@@ -1727,6 +1795,9 @@ class SafeRemovalPatcher:
             # 兜底：把映射缓存里的磁盘序号也加入——但必须同样做外置判定！
             # 卷映射包含内部盘（C:/D:/F:），若不加过滤，内部盘会被注册句柄通知，
             # 并在 REMOVECOMPLETE 补发 SLEEP 时被误深睡（实测：内部 HGST 被深睡）。
+            # 判定用 WMI PNPDeviceID（含 USB/ASMT/USBSTOR 才算外置）；
+            # 设备到达风暴中 WMI 不可靠时可能注册 0 个——由 GUI 侧的
+            # 30 秒重试定时器兜底（句柄通知为空会自动重新注册）。
             for idx in self._volume_disk_cache.values():
                 try:
                     pnp_fb = (Win32API.get_device_instance_path(idx) or "").upper()

@@ -260,6 +260,12 @@ class DeviceManager:
             except Exception:
                 pass
 
+            # 请求移除前**先释放锁定的卷句柄**：持有 FSCTL_LOCK_VOLUME 锁句柄时，
+            # 卷管理器会否决设备移除（PNP_Veto STORAGE\VOLUME，实测 9.5 秒后
+            # 返回“磁盘正被占用”，而系统托盘弹出无锁句柄即可成功）。
+            # 卷已卸载（盘符已消失），释放句柄不影响移除；finally 中幂等兜底。
+            Win32API.release_prepared_volumes(prepared_volumes)
+
             pnp_ok, pnp_msg = Win32API.eject_device_by_instance_id(instance_id)
         finally:
             Win32API.release_prepared_volumes(prepared_volumes)
