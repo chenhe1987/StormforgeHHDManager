@@ -457,6 +457,60 @@ class ASMCommander:
         success, _ = self.send_scsi_command(cdb, None, data_direction=1, timeout=3)
         return success
 
+    def flush_cache(self, timeout=3):
+        """ATA FLUSH CACHE (0xE7)：把硬盘写缓存的内容真正写入盘片。
+
+        关机前必须做：缓存里未落盘的数据在断电时会被硬盘记为一次异常掉电。
+        """
+        if not self.handle:
+            return False
+        cdb = [0] * 16
+        cdb[0] = 0x85  # ATA PASS-THROUGH (16)
+        cdb[1] = (3 << 1)  # PROTOCOL=3 (Non-data)
+        cdb[14] = 0xE7  # Command - FLUSH CACHE
+        logging.info(f"Drive {self.drive_index}: Sending ATA FLUSH CACHE (关机落盘)...")
+        success, _ = self.send_scsi_command(
+            cdb, None, data_direction=SCSI_IOCTL_DATA_OUT, timeout=timeout
+        )
+        if not success:
+            logging.warning(f"Drive {self.drive_index}: ATA FLUSH CACHE 失败")
+        return success
+
+    def standby_immediate(self, timeout=5):
+        """ATA STANDBY IMMEDIATE (0xE0)：卸载磁头 + 停转马达，**可恢复**停转。
+
+        这是 Windows 自己对硬盘做停转时使用的命令（电源计划“在此时间后关闭硬盘”
+        以及存储设备 D3 断电），与 SLEEP(0xE6) 的关键区别：
+          - STANDBY IMMEDIATE：不需要复位，后续任何命令都会让盘自动重新起转；
+          - SLEEP：深睡，必须靠 COMRESET/重新上电才能退出。
+        关机/休眠场景只能用 STANDBY IMMEDIATE：若先 SLEEP，随后任何 I/O 都会挂起，
+        控制器超时后复位硬盘（盘又被转起来），断电瞬间盘仍在旋转 →
+        磁头紧急回收 → SMART C0(断电磁头缩回计数) +1。
+        """
+        if not self.handle:
+            return False
+
+        cdb = [0] * 16
+        cdb[0] = 0x85  # ATA PASS-THROUGH (16)
+        cdb[1] = (3 << 1)  # PROTOCOL=3 (Non-data)
+        cdb[14] = 0xE0  # Command - STANDBY IMMEDIATE
+        logging.info(f"Drive {self.drive_index}: Sending ATA STANDBY IMMEDIATE (可恢复停转)...")
+        success, _ = self.send_scsi_command(
+            cdb, None, data_direction=SCSI_IOCTL_DATA_OUT, timeout=timeout
+        )
+        if success:
+            return True
+
+        # 回退：SCSI START STOP UNIT (LoEj=0, Start=0 = 停转)
+        logging.info(f"Drive {self.drive_index}: ATA STANDBY 失败，回退 SCSI START STOP UNIT...")
+        stop_cdb = [0] * 6
+        stop_cdb[0] = 0x1B  # START STOP UNIT
+        stop_cdb[4] = 0x00  # Start=0 (Stop motor)
+        success, _ = self.send_scsi_command(
+            stop_cdb, None, data_direction=SCSI_IOCTL_DATA_OUT, timeout=timeout
+        )
+        return success
+
     def sleep(self):
         """
         Send ATA SLEEP (0xE6) command. 

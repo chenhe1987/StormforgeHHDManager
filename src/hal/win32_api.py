@@ -231,7 +231,33 @@ class Win32API:
         return bool(result), ctypes.get_last_error()
 
     @staticmethod
-    def prepare_volume_for_safe_removal(volume_name, lock_timeout_seconds=1.5, retry_interval=0.2):
+    def query_occupying_apps(volume_root, timeout_seconds=3.0):
+        """用 Restart Manager 查询占用卷的程序（带超时保护）。
+
+        设备未就绪时（例如硬盘已停转）RmGetList 可能阻塞几十秒，
+        不设上限会把整个弹出流程拖死，所以超时就直接放弃查询。
+        """
+        result = {"apps": []}
+
+        def _run():
+            try:
+                from src.utils.restart_manager import get_locking_processes
+                result["apps"] = get_locking_processes(volume_root)
+            except Exception as e:
+                logging.debug(f"获取占用程序失败: {e}")
+                result["apps"] = []
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            logging.warning(f"查询占用程序超时（>{timeout_seconds}s），跳过: {volume_root}")
+            return []
+        return result.get("apps") or []
+
+    @staticmethod
+    def prepare_volume_for_safe_removal(volume_name, lock_timeout_seconds=1.5,
+                                        retry_interval=0.2, query_occupiers=True):
         """
         对卷执行短超时的 lock + dismount。
         设备节点移除前由上层决定何时释放卷句柄，避免卷对象长期被当前进程持有。
@@ -260,18 +286,23 @@ class Win32API:
                     break
                 time.sleep(retry_interval)
             else:
-                # 尝试使用 Restart Manager 获取占用程序
-                occupying_apps = []
-                try:
-                    from src.utils.restart_manager import get_locking_processes
-                    occupying_apps = get_locking_processes(volume_root)
-                except Exception as rm_err:
-                    logging.debug(f"获取占用程序失败: {rm_err}")
-                    
-                msg = f"卷仍被占用，无法锁定 (error={last_error})"
-                if occupying_apps:
-                    msg += f"，可能被以下程序占用: {', '.join(occupying_apps)}"
-                    
+                # ERROR_NOT_READY(21)/ERROR_IO_DEVICE(1117)/ERROR_DEV_NOT_EXIST(55)
+                # 说明设备未就绪（盘已停转或掉线），不是被程序占用：
+                # 此时查 Restart Manager 没意义而且很慢，直接跳过。
+                unready = last_error in (21, 1117, 55)
+                occupying_apps = (
+                    [] if unready or not query_occupiers
+                    else Win32API.query_occupying_apps(volume_root)
+                )
+
+                if unready:
+                    msg = (f"卷未就绪，无法锁定 (error={last_error})："
+                           "硬盘可能已停转/未就绪，请稍后重试")
+                else:
+                    msg = f"卷仍被占用，无法锁定 (error={last_error})"
+                    if occupying_apps:
+                        msg += f"，可能被以下程序占用: {', '.join(occupying_apps)}"
+
                 return False, msg, handle
 
             result, _, dismount_error = Win32API.device_io_control(handle, FSCTL_DISMOUNT_VOLUME, None, 0, None, 0)
@@ -284,7 +315,8 @@ class Win32API:
             return False, f"卷预处理异常: {e}", handle
 
     @staticmethod
-    def prepare_volumes_for_safe_removal(volumes, lock_timeout_seconds=1.5):
+    def prepare_volumes_for_safe_removal(volumes, lock_timeout_seconds=1.5,
+                                         query_occupiers=True):
         prepared = []
         failures = []
         seen = set()
@@ -298,6 +330,7 @@ class Win32API:
             success, message, handle = Win32API.prepare_volume_for_safe_removal(
                 volume,
                 lock_timeout_seconds=lock_timeout_seconds,
+                query_occupiers=query_occupiers,
             )
             if success and handle:
                 prepared.append({
@@ -975,7 +1008,37 @@ class Win32API:
         return res, veto_type.value, veto_name.value, elapsed
 
     @staticmethod
-    def eject_device_by_instance_id(instance_id):
+    def eject_device_by_instance_id(instance_id, timeout_seconds=25.0):
+        """带超时保护的设备弹出。
+
+        CM_Request_Device_EjectW / CM_Query_And_Remove_SubTreeW 会同步等待所有
+        持有句柄的程序响应；遇到顽固占用或正在停转的盘时可能长时间不返回。
+        这里放到独立线程执行并限时，超时立刻返回错误，
+        避免后台线程和界面永久卡在“正在弹出...”。
+        """
+        result = {"value": (False, "弹出未执行")}
+
+        def _run():
+            try:
+                result["value"] = Win32API._eject_device_impl(instance_id)
+            except Exception as e:
+                logging.error(f"弹出线程执行异常: {e}")
+                result["value"] = (False, f"弹出异常: {e}")
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            logging.error(f"设备移除请求超过 {timeout_seconds:.0f} 秒未返回: {instance_id}")
+            return False, (
+                f"系统移除设备的请求超过 {timeout_seconds:.0f} 秒仍未响应。\n"
+                "常见原因：仍有程序占用该磁盘，或硬盘正在停转无法完成 I/O。\n"
+                "请关闭占用该磁盘的程序/窗口后重试。"
+            )
+        return result["value"]
+
+    @staticmethod
+    def _eject_device_impl(instance_id):
         """
         弹出设备，模拟“安全删除硬件”。
         对于基于 UASP/USB 桥接芯片的硬盘柜，需要找到最合适的父节点。
@@ -1162,6 +1225,74 @@ class Win32API:
         
         error_code = ctypes.get_last_error()
         return result, bytes_returned.value, error_code
+
+    # ---- 磁盘离线/在线（关机“黑名单”机制） ----
+    IOCTL_DISK_SET_DISK_ATTRIBUTES = 0x0007C0F4
+    DISK_ATTRIBUTE_OFFLINE = 0x0000000000000001
+
+    class SET_DISK_ATTRIBUTES(ctypes.Structure):
+        # 现代 ntdddisk.h 的结构是 40 字节（旧文档只有 16 字节，
+        # 用 16 字节缓冲会得到 ERROR_BAD_LENGTH=24 —— 第八轮实测踩坑）
+        _fields_ = [
+            ("Version", wintypes.DWORD),
+            ("Persist", ctypes.c_ubyte),
+            ("Reserved1", ctypes.c_ubyte * 3),
+            ("Attributes", ctypes.c_ulonglong),
+            ("AttributesMask", ctypes.c_ulonglong),
+            ("Reserved2", wintypes.DWORD * 4),
+        ]
+
+    @staticmethod
+    def set_disk_offline(disk_index, offline=True):
+        """把磁盘设为 Windows 离线/在线（IOCTL_DISK_SET_DISK_ATTRIBUTES）。
+
+        离线后卷管理器会卸载该盘上的所有卷，此后整个系统（包括关机流程的
+        卷 flush / 卸载 / 断电检查）都不再访问这块盘 —— 相当于把盘加入
+        Windows 的“黑名单”。这是配合 ATA SLEEP 深睡的关键：盘离线后，
+        不会再有任何 I/O 把它唤醒，深睡能一直保持到断电。
+
+        Persist=False：不持久化离线状态，设备重新枚举（下次开机）后自动在线。
+        另外服务/程序启动时仍会兜底执行 set_disk_offline(idx, offline=False)。
+        """
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        path = f"\\\\.\\PhysicalDrive{disk_index}"
+        handle = kernel32.CreateFileW(
+            path, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+            OPEN_EXISTING, 0, None
+        )
+        INVALID = ctypes.c_void_p(-1).value
+        if not handle or handle == INVALID:
+            err = ctypes.get_last_error()
+            logging.warning(f"set_disk_offline: 打开 {path} 失败 error={err}")
+            return False, err
+        try:
+            attrs = Win32API.SET_DISK_ATTRIBUTES()
+            attrs.Version = ctypes.sizeof(Win32API.SET_DISK_ATTRIBUTES)  # 40
+            attrs.Persist = 0  # 不持久化：下次开机自动在线（仍保留兜底恢复）
+            attrs.Attributes = Win32API.DISK_ATTRIBUTE_OFFLINE if offline else 0
+            attrs.AttributesMask = Win32API.DISK_ATTRIBUTE_OFFLINE
+            result, _, error_code = Win32API.device_io_control(
+                handle, Win32API.IOCTL_DISK_SET_DISK_ATTRIBUTES,
+                ctypes.byref(attrs), ctypes.sizeof(attrs), None, 0
+            )
+            if result:
+                logging.info(f"PhysicalDrive{disk_index} 已设为{'离线' if offline else '在线'}")
+            else:
+                logging.warning(
+                    f"PhysicalDrive{disk_index} {'离线' if offline else '在线'}失败 error={error_code}"
+                )
+            return bool(result), error_code
+        finally:
+            kernel32.CloseHandle(handle)
 
     @staticmethod
     def restart_device_via_pnputil(instance_id):
@@ -1454,6 +1585,10 @@ class SafeRemovalPatcher:
         self._notification_handles = []
         self._hwnd = None
         self._enabled = True  # controls FLUSH+SLEEP only
+        # 关机流程开关：关机期间必须完全静默。
+        # 关机时设备会被逐个移除并触发 DEVNODES_CHANGED，本补丁的 TUR 探测会把
+        # 刚刚 STANDBY 停转的盘重新唤醒，导致断电时盘仍在旋转（C0 计数 +1）。
+        self.shutdown_in_progress = False
         self._pending_volumes = {}
         self._volume_disk_cache = {}
         self.monitor_service = None  # set by main_window
@@ -1706,6 +1841,24 @@ class SafeRemovalPatcher:
             f"[SafeRemovalPatch] WM_DEVICECHANGE: {event_name} (wParam=0x{event_code:04X})"
         )
 
+        if self.shutdown_in_progress:
+            # 关机/休眠收尾阶段：
+            # - QUERYREMOVE **必须继续处理**：需要释放设备句柄。若在关机时跳过它，
+            #   Windows 会判定设备仍被本程序占用、无法移除 USB 设备，
+            #   关机会卡住数分钟（实测 6.5 分钟无法关机），最后强制断电时盘还在转。
+            #   此处只释放句柄，不再发送任何停转命令（盘已在 QES 阶段停转）。
+            # - 其余事件（DEVNODES_CHANGED 的 TUR 探测、REMOVECOMPLETE 的补发 SLEEP、
+            #   DEVICEARRIVAL 的重新注册）都会访问硬盘，全部忽略。
+            if event_code == DBT_DEVICEQUERYREMOVE:
+                logging.info(
+                    f"[SafeRemovalPatch] 关机流程中收到 {event_name}：释放句柄，不发送停转命令"
+                )
+                return self._on_query_remove(lparam)
+            logging.info(
+                f"[SafeRemovalPatch] 关机流程中，忽略设备事件 {event_name}（保持硬盘停转）"
+            )
+            return False
+
         if event_code == DBT_DEVICEARRIVAL:
             self.refresh_cache()
             # 设备插回后重新打开句柄并注册通知，保持句柄映射有效
@@ -1922,6 +2075,18 @@ class SafeRemovalPatcher:
         logging.info(
             f"[SafeRemovalPatch] 检测到外置硬盘即将被移除: {drive_desc} (PhysicalDrive{disk_index})"
         )
+
+        if self.shutdown_in_progress:
+            # 关机流程中：盘已在 QES 阶段用 FLUSH CACHE + STANDBY IMMEDIATE 停转。
+            # 这里**只释放句柄**（否则 Windows 无法移除 USB 设备，关机会卡住），
+            # 不发送 SLEEP/不做任何探测，避免把停转的盘重新唤醒。
+            if devicetype == DBT_DEVTYP_HANDLE:
+                self._release_handle_for_disk(disk_index)
+            logging.info(
+                f"[SafeRemovalPatch] 关机流程中：已释放句柄，允许系统移除设备 "
+                f"(PhysicalDrive{disk_index})"
+            )
+            return reply
 
         if self.monitor_service:
             self.monitor_service.pause_for_removal(disk_index)

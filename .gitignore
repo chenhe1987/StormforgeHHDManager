@@ -86,3 +86,13 @@ venv.bak/
 # Local config
 app_config.json
 *.log
+
+# 运行时产物（错误报告、日志备份、诊断输出、发布包）
+错误日志/*.zip
+错误日志/JiFengZhi_Report_*/
+logs_backup*/
+tools/*_out*.txt
+tools/*.jsonl
+tools/svc_manual.txt
+tools/offline_test*.py
+release/

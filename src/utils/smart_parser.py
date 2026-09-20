@@ -31,7 +31,7 @@ class SmartParser:
         0xBD: ("High Fly Writes", "磁头飞行高度监视"),
         0xBE: ("Airflow Temperature", "气流温度"),
         0xBF: ("G-Sense Error Rate", "冲击力检测错误率"),
-        0xC0: ("Power-off Retract Count", "断电磁头缩回计数"),
+        0xC0: ("Power-off Retract Count (Unsafe Shutdown Count)", "不安全关机数 (0xC0)"),
         0xC1: ("Load Cycle Count", "磁头加载/卸载循环计数"),
         0xC2: ("Temperature", "温度"),
         0xC3: ("Hardware ECC Recovered", "硬件 ECC 恢复"),

@@ -100,6 +100,18 @@ class ConfigManager:
         """获取硬盘休眠时间设置 (分钟)"""
         return self.config.get("sleep_timers", {}).get(serial, 0) # 默认 0 (从不)
 
+    def get_shutdown_counters(self):
+        """读取上次开机时记录的不安全关机计数基线。
+
+        结构: {serial: {"c0": int, "c1": int, "model": str, "at": "YYYY-mm-dd HH:MM:SS"}}
+        """
+        return self.config.get("shutdown_counters", {}) or {}
+
+    def set_shutdown_counters(self, counters):
+        """保存在本次开机时读到的不安全关机计数（用于下次开机对比增量）。"""
+        self.config["shutdown_counters"] = dict(counters or {})
+        self.save_config()
+
     def set_sleep_timer(self, serial, minutes):
         """保存硬盘休眠时间设置"""
         if "sleep_timers" not in self.config:
@@ -165,7 +177,7 @@ class ConfigManager:
                 cmd = (
                     f'schtasks /Create /F /TN "{task_name}" '
                     f'/TR "{exe_path}" /SC ONLOGON /RL HIGHEST '
-                    f'/DELAY 0005:00'
+                    f'/DELAY 0000:30'
                 )
                 result = subprocess.run(cmd, capture_output=True, text=True,
                                         startupinfo=startupinfo, shell=True,

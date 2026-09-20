@@ -33,14 +33,40 @@ class MonitorService(threading.Thread):
         persisted = []
         if self.config_manager:
             persisted = self.config_manager.get_sleeping_disks()
+            if persisted and self._started_soon_after_boot():
+                # 刚开机（开机后首次启动本程序）：硬盘柜随主机断电又重新上电，
+                # 里面的盘必然是转起来的，持久化的“休眠”标记此时一定是错的。
+                # 不清掉会导致：开机后所有外置盘都显示“休眠”、跳过 SMART 检测
+                # （拿不到健康数据和关机计数基线），用户还得手动唤醒。
+                logging.info(
+                    f"检测到本次为开机后首次启动，清空过期的休眠标记: {persisted}"
+                )
+                self.config_manager.set_sleeping_disks([])
+                persisted = []
         self.sleeping_disks = set(persisted) # {serial}
         self.ejected_disks = set() # {serial}
         self.cached_disks = []
+        self.last_ui_data = []  # 最近一次推送给 UI 的完整列表（部分盘扫描时用于合并）
         self.last_inventory_scan_time = 0
         self.device_inventory_interval = 300
         self.scan_lock = threading.Lock()
         self._idle_tracker = {}  # {disk_index: {last_r, last_w, idle_since_ts, timeout_mins}}
         self._idle_last_check = 0
+
+    @staticmethod
+    def _started_soon_after_boot(tolerance_seconds=600):
+        """判断本进程是否在系统开机后不久启动（开机自启场景）。
+
+        容差必须是 600 秒：计划任务的登录自启动带 5 分钟延迟
+        （旧任务 /DELAY 0005:00），180 秒的窗口会永远错过，
+        导致开机后过期的休眠标记不被清空、外置盘一直显示"休眠"。
+        """
+        try:
+            import ctypes
+            uptime_ms = ctypes.windll.kernel32.GetTickCount64()
+            return uptime_ms < tolerance_seconds * 1000
+        except Exception:
+            return False
 
     def run(self):
         logging.info("监控服务已启动...")
@@ -52,8 +78,12 @@ class MonitorService(threading.Thread):
 
         while self.running:
             if self.shutdown_mode:
-                logging.info("监控服务进入关机静默模式，停止后台检测")
-                break
+                # 关机/休眠期间暂停一切检测（不访问硬盘），但**不退出线程**：
+                # 关机被用户或其他程序取消、或系统从休眠恢复后，必须能继续工作。
+                # 旧实现直接 break，导致取消关机 / 休眠唤醒后监控永久停摆
+                # （表现为唤醒后列表状态再也不刷新）。
+                time.sleep(1)
+                continue
 
             current_time = time.time()
             
@@ -397,7 +427,23 @@ class MonitorService(threading.Thread):
                                 self.callback_notify("硬盘 SMART 预警", msg)
                     else:
                         logging.warning(f"无法读取硬盘 {disk.index} 的数据")
-                        if serial in self.sleeping_disks:
+                        # 区分“盘在休眠/未起转”与“真的读取失败”：
+                        # USB-SATA 桥对休眠盘返回 sense 3A/00 (MEDIUM NOT PRESENT)，
+                        # 这属于正常休眠状态而不是故障。用轻量 TUR 探测确认，
+                        # 避免把休眠盘误报成「Read Failed」让用户以为硬盘坏了。
+                        asleep = serial in self.sleeping_disks
+                        if not asleep:
+                            try:
+                                with ASMCommander(disk.index, model_hint=disk.model,
+                                                  serial_hint=serial) as probe:
+                                    asleep = not probe.is_responding()
+                            except Exception as probe_err:
+                                logging.debug(f"TUR 探测失败 (disk {disk.index}): {probe_err}")
+
+                        if asleep:
+                            logging.info(
+                                f"硬盘 {disk.index} SMART 无响应且 TUR 无响应 → 判定为休眠/停转状态"
+                            )
                             disk_info["status"] = "Sleeping"
                         else:
                             disk_info["status"] = "Read Failed"
@@ -410,34 +456,136 @@ class MonitorService(threading.Thread):
         # Notify UI to update
         logging.info(f"DEBUG: 准备更新 UI，数据条数: {len(ui_data)}")
         if self.callback_update_ui:
-            self.callback_update_ui(ui_data)
-            logging.info("DEBUG: UI 更新回调已执行")
+            if target_disks is not None:
+                # 调度检测只扫描了部分磁盘：把结果合并进上一次的全量列表再推送，
+                # 避免侧边栏被覆盖成只剩这几块盘。
+                # （休眠盘永远“到期”，若不合并，定时检测会把列表洗成只剩休眠盘）
+                merged = self._merge_ui_data(self.last_ui_data, ui_data)
+                self.last_ui_data = merged
+                self.callback_update_ui(merged)
+                logging.info(f"DEBUG: UI 更新回调已执行 (合并后 {len(merged)} 条)")
+            else:
+                self.last_ui_data = ui_data
+                self.callback_update_ui(ui_data)
+                logging.info("DEBUG: UI 更新回调已执行")
         else:
             logging.warning("DEBUG: 未设置 UI 更新回调")
 
-    def mark_disk_sleeping(self, serial):
-        if serial:
-            logging.info(f"将硬盘标记为休眠: {serial}")
-            self.ejected_disks.discard(serial)
-            self.sleeping_disks.add(serial)
-            if self.config_manager:
-                self.config_manager.add_sleeping_disk(serial)
+    def _merge_ui_data(self, base, updates):
+        """把部分磁盘的检测结果合并进完整列表。
 
-    def mark_disk_ejected(self, serial):
-        if serial:
-            logging.info(f"将硬盘标记为已弹出: {serial}")
-            self.sleeping_disks.discard(serial)
+        规则：
+        - base 中与 updates 同 serial（其次同 index）的条目被更新条目替换；
+        - base 中已弹出（ejected_disks）的条目被丢弃；
+        - base 中 serial 与 index 都无法在设备缓存里匹配的条目，才视为已移除的盘丢弃；
+        - updates 中出现但 base 中没有的新磁盘追加到末尾。
+
+        注意：UI 记录里的 serial 可能是硬盘真实序列号（SATA IDENTIFY 得到），
+        而设备缓存里是桥接芯片序列号（如 B000BBBBAAAA）。因此绝不能只按 serial 判定
+        盘是否还在——必须 index 或 serial 命中其一即保留，否则会把正在使用的盘误删。
+        """
+        by_serial = {u.get("serial"): u for u in updates if u.get("serial")}
+        by_index = {u.get("index"): u for u in updates if u.get("index") is not None}
+
+        cached_serials = {
+            getattr(d, "serial_number", None)
+            for d in self.cached_disks
+            if getattr(d, "serial_number", None)
+        }
+        cached_indexes = {
+            getattr(d, "index", None)
+            for d in self.cached_disks
+            if getattr(d, "index", None) is not None
+        }
+
+        merged = []
+        for d in base:
+            serial = d.get("serial")
+            index = d.get("index")
+            if serial and serial in self.ejected_disks:
+                continue
+            if cached_serials or cached_indexes:
+                serial_known = bool(serial) and serial in cached_serials
+                index_known = index is not None and index in cached_indexes
+                if not serial_known and not index_known:
+                    logging.info(
+                        f"DEBUG: 合并时移除已不在设备列表中的记录: "
+                        f"{d.get('model')} (index={index}, serial={serial})"
+                    )
+                    continue
+            replacement = None
+            if serial:
+                replacement = by_serial.get(serial)
+            if replacement is None and index is not None:
+                replacement = by_index.get(index)
+            merged.append(replacement if replacement is not None else d)
+
+        known_serials = {d.get("serial") for d in base if d.get("serial")}
+        known_indexes = {d.get("index") for d in base if d.get("index") is not None}
+        for u in updates:
+            serial = u.get("serial")
+            if serial and serial in known_serials:
+                continue
+            if u.get("index") is not None and u.get("index") in known_indexes:
+                continue
+            merged.append(u)
+
+        return merged
+
+    def _serials_for(self, serial, disk_index=None):
+        """收集一个盘位对应的所有序列号。
+
+        UI 记录里的 serial 可能是硬盘真实序列号（SATA IDENTIFY 得到），
+        而设备缓存里是桥接芯片序列号（如 B000BBBBAAAA）。屏蔽/弹出时必须两者都覆盖，
+        否则后台监控仍会访问正在弹出的盘，导致锁卷失败、弹出被否决。
+        """
+        targets = {s for s in [serial] if s}
+        if disk_index is not None:
+            for d in self.cached_disks:
+                if getattr(d, "index", None) == disk_index:
+                    s = getattr(d, "serial_number", None)
+                    if s:
+                        targets.add(s)
+        return targets
+
+    def mark_disk_sleeping(self, serial, disk_index=None):
+        for s in self._serials_for(serial, disk_index):
+            logging.info(f"将硬盘标记为休眠: {s}")
+            self.ejected_disks.discard(s)
+            self.sleeping_disks.add(s)
             if self.config_manager:
-                self.config_manager.remove_sleeping_disk(serial)
+                self.config_manager.add_sleeping_disk(s)
+
+    def mark_disk_ejected(self, serial, disk_index=None):
+        targets = self._serials_for(serial, disk_index)
+        logging.info(f"将硬盘标记为已弹出: {serial} (index={disk_index})")
+
+        # 休眠屏蔽要按两种序列号一起清除（桥接序列号可能挂在休眠名单里）
+        for s in targets:
+            self.sleeping_disks.discard(s)
+            if self.config_manager:
+                self.config_manager.remove_sleeping_disk(s)
+
+        if serial:
             self.ejected_disks.add(serial)
+            self.disk_health_status.pop(serial, None)
+            self.disk_last_check_times.pop(serial, None)
+
+        # 立刻把该盘位从设备缓存中剔除：避免旧缓存把盘位里的新盘识别成旧盘。
+        # 注意不要把桥接序列号加入 ejected_disks——同一个盘位换入新盘后，
+        # 新盘应能在下次枚举时正常出现，而不是要等用户手动刷新。
+        if disk_index is not None:
+            self.cached_disks = [
+                disk for disk in self.cached_disks
+                if getattr(disk, "index", None) != disk_index
+            ]
+        elif serial:
             self.cached_disks = [
                 disk for disk in self.cached_disks
                 if getattr(disk, "serial_number", None) != serial
             ]
-            self.disk_health_status.pop(serial, None)
-            self.disk_last_check_times.pop(serial, None)
-            # 允许后续正常扫描剩余设备，但不要再把已弹出的设备重新加回来，直到用户手动刷新。
-            self.last_inventory_scan_time = 0
+        # 允许后续正常扫描剩余设备，但不要再把已弹出的设备重新加回来，直到用户手动刷新。
+        self.last_inventory_scan_time = 0
 
     def clear_all_sleeping(self):
         """pnputil 重启设备后所有盘一起醒来"""
@@ -448,18 +596,20 @@ class MonitorService(threading.Thread):
             if self.config_manager:
                 self.config_manager.set_sleeping_disks([])
 
-    def mark_disk_awake(self, serial):
+    def mark_disk_awake(self, serial, disk_index=None):
+        targets = self._serials_for(serial, disk_index)
         changed = False
-        if serial in self.sleeping_disks:
-            logging.info(f"将硬盘标记为唤醒: {serial}")
-            self.sleeping_disks.remove(serial)
-            if self.config_manager:
-                self.config_manager.remove_sleeping_disk(serial)
-            changed = True
-        if serial in self.ejected_disks:
-            logging.info(f"将硬盘从已弹出名单移除: {serial}")
-            self.ejected_disks.remove(serial)
-            changed = True
+        for s in targets:
+            if s in self.sleeping_disks:
+                logging.info(f"将硬盘标记为唤醒: {s}")
+                self.sleeping_disks.remove(s)
+                if self.config_manager:
+                    self.config_manager.remove_sleeping_disk(s)
+                changed = True
+            if s in self.ejected_disks:
+                logging.info(f"将硬盘从已弹出名单移除: {s}")
+                self.ejected_disks.remove(s)
+                changed = True
         if changed:
             self.last_inventory_scan_time = 0
             self.reset_idle_timer(serial)

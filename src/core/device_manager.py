@@ -192,23 +192,13 @@ class DeviceManager:
         except Exception:
             pass
 
-        # 3. 弹出前先发送 FLUSH CACHE + SLEEP，确保磁头归位并停转
-        #    对于 2074+1153E 组合，这一步弥补了 Windows 不发送停转命令的缺陷
-        spin_down_ok = False
-        try:
-            from src.hal.asm_commander import ASMCommander
-            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
-                if cmd.sleep():
-                    spin_down_ok = True
-                    logging.info(f"磁盘 {disk_index} 弹出前停转成功")
-                else:
-                    logging.warning(f"磁盘 {disk_index} 弹出前停转命令失败，继续弹出流程")
-        except Exception as e:
-            logging.warning(f"磁盘 {disk_index} 弹出前停转异常: {e}")
-
-        # 4. 策略 A (优先): Shell Eject
+        # 3. 策略 A (优先): Shell Eject
         #    与 Windows 原生安全删除硬件使用相同路径
         #    对 2074 Hub + 多 ASM1153E 桥接的组合最为可靠
+        #    注意：**不要**先发 SLEEP。ATA SLEEP(0xE6) 是深睡，必须复位才能唤醒，
+        #    先停转会让后续的卷锁定/设备移除因 I/O 无法完成而长时间挂起，
+        #    盘还会被控制器复位重新转起来。停转交给设备移除的 QUERYREMOVE 阶段完成。
+        spin_down_ok = False  # 停转由设备移除时的 QUERYREMOVE 阶段完成（见 SafeRemovalPatch）
         shell_msg = ""
         if volumes:
             primary_volume = volumes[0]
@@ -216,19 +206,16 @@ class DeviceManager:
             shell_ok, shell_msg = Win32API.eject_volume_by_drive_letter(
                 primary_volume,
                 expected_volumes=volumes,
-                timeout_seconds=15.0,
+                timeout_seconds=10.0,
             )
             if shell_ok:
                 total_elapsed = time.perf_counter() - started_at
-                msg = "设备已安全弹出"
-                if spin_down_ok:
-                    msg += "，硬盘已停转"
                 logging.info(f"磁盘 {disk_index} 策略 A (Shell Eject) 成功，总耗时 {total_elapsed:.2f} 秒")
                 logging.info("=" * 72)
-                return True, msg
+                return True, "设备已安全弹出"
 
-        # 5. 策略 B (备选): PnP 设备节点移除
-        #    适用于独立 USB-SATA 桥接芯片，对于 2074 hub 下的子设备可能被否决
+        # 4. 锁定并卸载卷 —— 必须在硬盘仍在转动、能响应 I/O 时完成。
+        #    卷锁不住说明有程序占用，直接给出可操作的原因，不继续移除设备。
         prepared_volumes = []
         volume_failures = []
 
@@ -243,10 +230,29 @@ class DeviceManager:
                 )
             if volume_failures:
                 logging.warning(
-                    "部分卷预处理失败: " +
+                    "卷预处理失败: " +
                     "; ".join(f"{item['volume']}={item['message']}" for item in volume_failures)
                 )
+            if not prepared_volumes:
+                volume_details = "; ".join(
+                    f"{item['volume']} {item['message']}" for item in volume_failures
+                )
+                combined = (
+                    f"磁盘正被占用，无法安全弹出。({volume_details})。"
+                    "请关闭占用该磁盘的程序或窗口后重试。"
+                )
+                occupying_apps = []
+                for vol in volumes:
+                    vol_root = f"{vol}\\" if not vol.endswith("\\") else vol
+                    occupying_apps.extend(Win32API.query_occupying_apps(vol_root))
+                if occupying_apps:
+                    combined += f"\n可能正在占用该磁盘的程序: {', '.join(sorted(set(occupying_apps)))}"
+                logging.error(f"磁盘 {disk_index} 卷锁定失败，放弃弹出: {combined}")
+                logging.info("=" * 72)
+                return False, combined
 
+        # 5. 策略 B (备选): PnP 设备节点移除（带超时保护）
+        #    适用于独立 USB-SATA 桥接芯片，对于 2074 hub 下的子设备可能被否决
         try:
             logging.info(f"策略 B: 按 PnP 设备节点移除策略请求移除设备: {instance_id}")
             try:
@@ -260,12 +266,9 @@ class DeviceManager:
 
         if pnp_ok:
             total_elapsed = time.perf_counter() - started_at
-            msg = "设备已安全移除"
-            if spin_down_ok:
-                msg += "，硬盘已停转"
             logging.info(f"磁盘 {disk_index} 策略 B (PnP 移除) 成功，总耗时 {total_elapsed:.2f} 秒")
             logging.info("=" * 72)
-            return True, msg
+            return True, "设备已安全移除"
 
         # 6. 所有策略都失败，生成详细错误信息
         total_elapsed = time.perf_counter() - started_at
@@ -275,37 +278,114 @@ class DeviceManager:
             messages.append(f"Shell Eject: {shell_msg}")
         messages.append(f"PnP 移除: {pnp_msg}")
 
-        if spin_down_ok:
-            messages.append(
-                "虽然 Windows 未能完成设备节点移除，但硬盘已成功停转，"
-                "您可以稍后通过系统托盘安全删除硬件完成最终弹出。"
-            )
-
         combined = "\n".join(messages)
-
-        if volume_failures:
-            volume_details = "; ".join(f"{item['volume']} 仍被占用" for item in volume_failures)
-            combined = f"磁盘正被占用，无法安全弹出。({volume_details})。请关闭占用该磁盘的程序或窗口后重试。"
-
-        if volumes:
-            occupying_apps = []
-            try:
-                from src.utils.restart_manager import get_locking_processes
-                for vol in volumes:
-                    vol_root = f"{vol}\\" if not vol.endswith("\\") else vol
-                    apps = get_locking_processes(vol_root)
-                    if apps:
-                        occupying_apps.extend(apps)
-            except Exception as rm_err:
-                logging.debug(f"获取占用程序失败: {rm_err}")
-
-            if occupying_apps:
-                unique_apps = list(set(occupying_apps))
-                combined += f"\n可能正在占用该磁盘的程序: {', '.join(unique_apps)}"
+        combined += "\n\n提示：请关闭可能访问该磁盘的程序（资源管理器窗口、播放器、下载工具）后重试。"
 
         logging.error(f"磁盘 {disk_index} 弹出最终失败，总耗时 {total_elapsed:.2f} 秒: {combined}")
         logging.info("=" * 72)
         return False, combined
+
+    @staticmethod
+    def deep_sleep_disk(disk_index, model=None, serial=None):
+        """深度休眠：FLUSH CACHE → ATA SLEEP(0xE6)。
+
+        与“立即休眠硬盘”按钮完全相同的机制：SLEEP 后盘进入最低功耗，
+        不响应任何程序（桥接芯片会对后续访问立即回 3A/00 无介质，不会唤醒盘），
+        直到重新上电。这正是关机场景要的“黑名单”：不需要卸载卷、不需要锁卷，
+        被程序占用也不影响休眠。
+        """
+        started_at = time.perf_counter()
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
+                flush_ok = cmd.flush_cache(timeout=3)
+                sleep_ok = cmd.sleep()
+            elapsed = time.perf_counter() - started_at
+            if sleep_ok:
+                return True, f"已深睡(FLUSH={'OK' if flush_ok else 'FAIL'})", elapsed
+            return False, "ATA SLEEP 失败", elapsed
+        except Exception as e:
+            elapsed = time.perf_counter() - started_at
+            logging.warning(f"磁盘 {disk_index} 深睡异常: {e}")
+            return False, f"异常: {e}", elapsed
+
+    @staticmethod
+    def flush_volumes_for_disk(disk_index, timeout_seconds=2.0):
+        """关机前把该盘所有卷的文件系统缓存刷到盘上（FlushFileBuffers）。
+
+        只做 flush，不 lock/dismount：关机流程中锁卷会干扰 Windows 自己的卸载流程。
+        """
+        deadline = time.perf_counter() + timeout_seconds
+        flushed = []
+        try:
+            volumes = DeviceManager.get_volumes_for_disk(disk_index)
+        except Exception as e:
+            logging.debug(f"磁盘 {disk_index} 卷枚举失败: {e}")
+            return flushed
+
+        for vol in volumes or []:
+            if time.perf_counter() >= deadline:
+                logging.warning(f"磁盘 {disk_index} 卷 flush 超时，跳过剩余卷")
+                break
+            try:
+                handle = Win32API.open_volume(vol)
+                if not handle:
+                    continue
+                try:
+                    ok, err = Win32API.flush_volume_buffers(handle)
+                    if ok:
+                        flushed.append(vol)
+                    else:
+                        logging.debug(f"卷 {vol} flush 失败 error={err}")
+                finally:
+                    Win32API.close_handle(handle)
+            except Exception as e:
+                logging.debug(f"卷 {vol} flush 异常: {e}")
+        return flushed
+
+    @staticmethod
+    def prepare_disk_for_shutdown(disk_index, model=None, serial=None, verify=False):
+        """关机/系统休眠前的停转：FLUSH CACHE → STANDBY IMMEDIATE。
+
+        与“立即休眠硬盘”按钮不同，这里**绝不使用 ATA SLEEP**，因为关机流程后面
+        还会有服务停止/文件系统 flush/断电等动作，SLEEP 深睡会让这些 I/O 挂起，
+        导致控制器复位硬盘（盘重新旋转）→ 断电时磁头紧急回收 → C0 计数 +1。
+        STANDBY IMMEDIATE 是可恢复停转（磁头已卸载、马达已停），
+        且正是 Windows 自己对硬盘停转时使用的命令。
+
+        verify=True 时，STANDBY 之后等 1 秒再用 TEST UNIT READY 探测一次，
+        用于判断停转命令是否真的被 USB-SATA 桥传递给了硬盘
+        （历史笔记里曾怀疑 ASMT 桥会过滤 STANDBY IMMEDIATE，需要实测证据）。
+        探测结果只写日志，用于事后判断策略是否真的生效。
+        """
+        started_at = time.perf_counter()
+        try:
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
+                flush_ok = cmd.flush_cache(timeout=3)
+                standby_ok = cmd.standby_immediate(timeout=5)
+
+                if standby_ok and verify:
+                    time.sleep(1.0)
+                    still_ready = cmd.is_responding()
+                    elapsed = time.perf_counter() - started_at
+                    if still_ready:
+                        msg = (f"STANDBY 已被桥接受，但 1 秒后 TUR 仍有响应 → "
+                               f"盘可能仍在旋转（桥可能未传递停转命令）")
+                        logging.warning(f"磁盘 {disk_index} 停转校验: {msg}")
+                        return True, msg + f"(FLUSH={'OK' if flush_ok else 'FAIL'})", elapsed
+                    msg = "已确认停转(FLUSH=%s, TUR 无响应)" % ("OK" if flush_ok else "FAIL")
+                    logging.info(f"磁盘 {disk_index} 停转校验: {msg}")
+                    return True, msg, elapsed
+
+            elapsed = time.perf_counter() - started_at
+            if standby_ok:
+                return True, f"已停转(FLUSH={'OK' if flush_ok else 'FAIL'})", elapsed
+            return False, "STANDBY IMMEDIATE 失败", elapsed
+        except Exception as e:
+            elapsed = time.perf_counter() - started_at
+            logging.warning(f"磁盘 {disk_index} 关机停转异常: {e}")
+            return False, f"异常: {e}", elapsed
 
 if __name__ == "__main__":
     # Test disk enumeration

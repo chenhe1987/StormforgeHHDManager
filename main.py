@@ -74,6 +74,17 @@ def main():
     root_logger.addHandler(operation_handler)
     root_logger.addHandler(console_handler)
 
+    # 关机停转服务模式（LocalSystem 后台服务，无 GUI，等待 SERVICE_CONTROL_PRESHUTDOWN）
+    if "--shutdown-service" in sys.argv:
+        try:
+            logging.info("--- 以关机停转服务模式启动 ---")
+            from src.core.shutdown_service import svc_main
+            svc_main(debug=("--debug" in sys.argv))
+        except Exception:
+            logging.error(f"服务模式异常:\n{traceback.format_exc()}")
+            sys.exit(1)
+        return
+
     try:
         logging.info("--- 程序启动尝试 ---")
         logging.info(f"管理员权限: {is_admin()}, 运行目录: {base_dir}, 主日志: {log_file}, 操作日志: {operation_log_file}")

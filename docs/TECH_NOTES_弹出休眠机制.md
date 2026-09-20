@@ -180,43 +180,246 @@ DBT_DEVICEQUERYREMOVE 的返回值语义与普通消息相反：
 
 ---
 
-## 8. 关机/系统休眠保护
+## 8. 关机/系统休眠保护（2026-09-19 重写：对齐 Windows 内置盘做法）
 
-### 8.1 触发方式
+> 旧实现（下方“历史实现”段落）用 ATA SLEEP + 阻塞 20 秒，是**错误**的，已删除。
+> 新实现在 `src/core/shutdown_guard.py`。
 
-- WM_QUERYENDSESSION（关机）→ eject_all_removable_disks()
-- WM_POWERBROADCAST / PBT_APMSUSPEND（系统休眠）→ eject_all_removable_disks(is_system_sleep=True)
+### 8.1 旧策略为什么错
 
-驱动级功能：无条件执行，不读 config_manager.get_shutdown_eject()（UI 已固定开启并禁用）。
+旧流程：WM_QUERYENDSESSION → 并发发 `DeviceManager.spin_down_disk`（FLUSH CACHE + **ATA SLEEP 0xE6**）
+→ 阻塞等待最多 20 秒 → 标记休眠。
 
-### 8.2 休眠列表来源（关键！）
+1. **SLEEP 是深睡**，必须 COMRESET/重新上电才能退出。QES 之后系统还要停止服务、
+   flush 文件系统、卸载卷、断电；其中任何一次 I/O 落到已 SLEEP 的盘上都会挂起十几秒，
+   控制器超时后复位硬盘 → 盘被重新转起来 → 断电瞬间盘仍在旋转 →
+   磁头紧急回收 → **SMART C0（断电磁头缩回计数 / 不安全关机数）+1**。
+2. **20 秒阻塞**超过 Windows 给应用的关机等待预算，可能被强杀在命令中途。
+3. **自家补丁又把盘唤醒**：SafeRemovalPatch 在关机期间收到 DEVNODES_CHANGED 会对所有
+   外置盘做 TUR 探测（探测即起转），甚至补发 SLEEP，把刚停转的盘再折腾一遍。
 
-    # 关机阶段严格只使用缓存，避免再次在线扫描唤醒硬盘。
-    # 优先使用 monitor_service.cached_disks（物理盘缓存，始终保持最新），
-    # 避免依赖 UI disk_data（仅在 SMART 检测时刷新，silent 模式下可能过期）。
-    cached = getattr(self.monitor_service, 'cached_disks', []) or []
+### 8.2 Windows 是怎么做的（内置硬盘）
 
-    eject_list = []
-    for d in cached:
-        idx = getattr(d, 'index', None)
-        serial = getattr(d, 'serial_number', None)
-        model = getattr(d, 'model', None) or getattr(d, 'model_hint', None)
-        is_removable = getattr(d, 'is_removable', False)
-        if idx is not None and is_removable and serial not in already_asleep:
-            eject_list.append((idx, model, serial))
+电源计划“在此时间后关闭硬盘”以及存储设备 D3 断电，用的是 **ATA STANDBY IMMEDIATE (0xE0)**：
+卸载磁头 + 停转马达，但**可恢复**（下一条命令自动起转，不需复位）；硬盘收到该命令时会先落盘。
+Windows **从不对内置盘发 SLEEP**，断电时盘已停转、磁头已卸载 → 不会紧急回收 → C0 不增长。
 
-不要改回 self.disk_data：silent 模式下 disk_data 只在 SMART 检测时更新，
-长时间运行后会过期 → 关机时漏掉部分外置盘（实测漏掉磁盘 3）。
+### 8.3 新策略（ShutdownGuard）
 
-- cached_disks 是 DiskInfo 对象列表（src/core/device_manager.py）
-- already_asleep = monitor_service.sleeping_disks | ejected_disks（跳过已休眠/已弹出盘）
+触发点（`main_window.nativeEvent`）：
 
-### 8.3 流程
+| 消息 | 动作 |
+|---|---|
+| WM_QUERYENDSESSION | `prepare_disks_for_shutdown("关机", 预算 4s)` |
+| WM_ENDSESSION wParam=1 | `prepare_disks_for_shutdown("关机收尾", 预算 2.5s)` —— 断电前最后一次 |
+| WM_ENDSESSION wParam=0 | 关机被取消 → `thaw_background_access()` 恢复后台 |
+| PBT_APMSUSPEND | `prepare_disks_for_shutdown("系统休眠")` |
+| PBT_APMRESUMESUSPEND / AUTOMATIC | `thaw_background_access()` |
 
-1. Phase 1：并发（线程）发送 SLEEP，join 最多 5 秒
-2. Phase 2：等待 20 秒（SPIN_DOWN_WAIT_SEC）让硬盘停转
-3. 标记成功盘 mark_disk_sleeping(serial)
-4. ShutdownBlockReasonCreate 显示"正在为您执行硬盘关机休眠保护"
+每块外置盘（`is_removable` 或 PnP 含 USB/UASP；内置 SATA/NVMe 不碰，作为对照组）：
+
+1. `DeviceManager.flush_volumes_for_disk()` —— FlushFileBuffers 刷卷（不锁卷，避免干扰关机流程）
+2. `DeviceManager.prepare_disk_for_shutdown()` —— **ATA FLUSH CACHE(0xE7) → ATA STANDBY IMMEDIATE(0xE0)**
+   （`ASMCommander.flush_cache()` / `standby_immediate()`，回退 SCSI START STOP UNIT）
+
+并发执行、总耗时不超过预算；命令返回即代表磁头已卸载（**不需要**等马达物理停转）。
+
+关机前必须冻结后台（`freeze_background_access()`）：
+
+- `monitor_service.shutdown_mode = True`（监控主循环改为 1 秒轮询暂停，**不再 break 退出线程**）
+- `SafeRemovalPatcher.shutdown_in_progress = True`（`handle_wm_devicechange` 直接返回，
+  不再 TUR 探测 / 补发 SLEEP）
+
+**绝不在关机路径使用 ATA SLEEP。**
+
+### 8.35 实测结论（2026-09-19，tools/smart_counter_probe.py）
+
+用真实硬件跑过对照实验（disk 5，WUH721816ALE6L4）：
+
+| 操作 | C0 (0xC0) | C1 (0xC1) |
+|---|---|---|
+| 读取基线 | 1388 | 1388 |
+| FLUSH CACHE + **STANDBY IMMEDIATE** | 1388 | 1388 |
+| 15 秒后再读取（把盘重新起转） | 1388 | 1388 |
+
+结论：
+
+1. **ASMT 105x/1153E 桥会正常传递 STANDBY IMMEDIATE** ——
+   `SafeRemovalPatcher` 老注释里"桥会过滤 STANDBY，只能用 SLEEP"的说法是**错的**，
+   不要据此回退到 SLEEP。（当年误判很可能是因为当时自家监控每 10 秒一次
+   SMART/TUR 探测不停地吵醒硬盘，看起来像"没停转"。）
+2. **命令式停转、正常起转都不计入 C0/C1** → 这两个计数器只统计
+   "断电时磁头仍在盘上"造成的紧急回收。策略目标因此非常明确：
+   **断电瞬间盘必须是停的**。
+3. **TUR (TEST UNIT READY) 不能用来判断盘是否已停转**：桥会代答 TUR，
+   实测停转 1 秒后 TUR 仍返回成功。旧版据此打印的"桥可能未传递停转命令"是误报，已删除。
+
+### 8.36 最终架构（2026-09-20，七轮实测 + 社区调研后确定）
+
+七轮实测的演化（每一步都被真实关机验证过）：
+
+| 版本 | 做法 | 结果 |
+|---|---|---|
+| v1 | QES 里同步停转 + 每盘 1s TUR 验证（耗时 4.7s） | 外置 +3、内置 +1；用户听到"停了又转" |
+| v2/v3 | QES 立刻返回，停转交给守护循环（等卷卸载） | **完全没停转**：进程在 QES 后 38ms 就被结束 |
+| v4 | 同上（卷映射改 Win32，0ms） | 循环启动了，但进程仍只活了 38ms |
+| v5 | QES 内同步停转，无探测 | 停了又转；+2；卸载卷失败（应用还活着，error=5） |
+| v6 | QES 同步"锁卷→卸载卷→停转"，保持锁句柄 | 锁失败（error=5：应用还占着卷）→ 停在转的盘被 flush 唤醒 → +2 |
+| v7 | 关机停转服务 PRESHUTDOWN：锁卷→卸载→STANDBY | 锁卷 error=5 依旧（PRESHUTDOWN 时仍有占用），卸载做不到 |
+| v8/v9 | 服务里 Windows 离线(黑名单)+STANDBY | 16 字节结构 → error=24 离线失败；离线前置失败后整条流程作废，盘没停 |
+| v10 | **纯深睡（ATA SLEEP 0xE6）+移入黑名单，不锁卷不卸载**（用户方案："无法卸载≠无法休眠"） | **生效**：盘深睡保持到断电，三块盘 0xC0 全部 Δ+0；但内核关机 flush 卷撞深睡盘 → UASPStor 复位卡 58 秒 |
+| v11 | 离线(40字节结构修复)→等卷卸载→深睡 | 回归 v9 的问题：卸载被当成深睡前提（用户否决） |
+| **v12（当前，定稿）** | **刷卷缓存 → 尽力离线(纯加速,不等不阻塞) → 无条件深睡(重试3次) → 移入黑名单** | **第 11 轮实测通过：4 块外置盘 3.1s 完成离线+深睡+黑名单，关机不再卡顿；开机核对三块盘 0xC0 增量与内置对照盘完全一致（+1=+1），判据达标，用户确认成功** |
+
+**关键实测与调研结论：**
+
+1. WM_QUERYENDSESSION 之后约 38ms 进程就被结束（日志实证）。
+2. QES 阶段应用还活着，外置盘的卷被资源管理器等占用（FSCTL_LOCK_VOLUME
+   实测 error=5），**在 GUI 进程里永远无法完成"先卸载卷再停转"**。
+3. Windows 关机流程（[gfody/OnShutdown](https://github.com/gfody/OnShutdown)）：
+   `WM_QUERYENDSESSION → 应用退出 → 服务 PRESHUTDOWN（可推迟关机约 125s）
+   → 其他服务停止 → 文件系统 flush → 设备断电`。
+   **PRESHUTDOWN 是唯一"应用已退出、卷可卸载、断电之前"的钩子**，
+   其余方案（GPO 脚本 / WMI 事件 / 任务计划事件）都会被提前终止。
+4. 社区标准顺序（[Debian 用户列表](https://lists.debian.org/debian-user/2026/05/msg00005.html)）：
+   `sync → umount → 停转 → 断电`；[微软问答](https://learn.microsoft.com/en-us/answers/questions/2622701/external-hard-drive-safe-shutdown)
+   确认 Windows 从不会替 USB 桥接硬盘做关机停转（磁头撞击声=紧急回收）。
+
+**v7 架构：**
+
+- **GUI**：启动时确保服务已安装（sc create，start=auto，LocalSystem）并运行；
+  QES 阶段只冻结自身后台（不再停转）；每 60 秒把物理盘清单+休眠名单写入
+  `shutdown_disks.json`（服务在 SYSTEM 会话里 WMI 枚举不可靠，实测返回 0 设备）。
+- **服务**（同 exe 的 `--shutdown-service` 模式，`src/core/shutdown_service.py`）：
+  接收 SERVICE_CONTROL_PRESHUTDOWN → 锁卷（应用已退出，应成功）→ 卸载卷 →
+  FLUSH CACHE → STANDBY IMMEDIATE → 报告 STOPPED。
+  之后文件系统 flush 会跳过已卸载的卷 → 盘不会被再转起来 → 断电时盘是停的。
+- 本环境 pywin32 注意：win32service 不导出 StartServiceCtrlDispatcher，
+  必须用 `win32serviceutil.ServiceFramework` + `servicemanager.PrepareToHostSingle(cls)`
+  + `servicemanager.StartServiceCtrlDispatcher()`（无参）；
+  PRESHUTDOWN 通过重写 `GetAcceptedControls()`（+0x100）和 `SvcOther(15)` 接收；
+  `servicemanager.Initialize()` 是设事件源用的，不是注册服务类。
+- 服务停转同样**每块盘只停一次**；已休眠的盘跳过（0 成本）。
+
+### 8.38 技术原则（定稿）—— 关机深度休眠策略
+
+> 本条为**固定技术原则**，第 11 轮实测通过后定稿。后续任何改动不得违反：
+> 未经用户确认，不得重新引入"卸载/锁卷/离线成功才休眠"的前置依赖。
+
+**一、深睡就是黑名单（用户方案，v9/v10 定稿）**
+
+1. 关机时给每块外置盘发送**深度休眠**：ATA FLUSH CACHE(0xE7) + **ATA SLEEP(0xE6)**。
+   盘进入最低功耗，**不响应任何程序**；ASMT 桥接芯片对后续访问立刻回
+   sense 3A/00（MEDIUM NOT PRESENT），不会真把盘唤醒。
+2. **无条件执行**——不管卷能不能卸载、盘是否被程序占用，都先深睡：
+   "外置硬盘被程序占用无法卸载，但**无法被卸载不代表无法被休眠**"。
+   深睡成功后把盘移入本程序黑名单（sleeping_disks），本程序与设备补丁
+   从此不再访问它。
+3. 用户要再次访问硬盘，必须在程序里点击「唤醒并解除黑名单」把盘从
+   黑名单移除（GUI 上会明确提醒）。
+4. 深睡保持到断电；重新上电后盘自动苏醒。开机时服务兜底把所有外置盘
+   恢复上线（Persist=False，离线状态不会持久化）。
+
+**二、离线只是可选加速（消除关机卡顿），绝不成为深睡前提**
+
+- 第 10 轮实测：深睡后卷仍挂载，内核关机阶段的卷 flush 会向深睡盘发命令
+  超时 → UASPStor 复位设备，关机卡 58 秒。
+- 因此 PRESHUTDOWN 里先**尽力**把盘设为 Windows 离线（
+  IOCTL_DISK_SET_DISK_ATTRIBUTES，40 字节结构；盘还在转时卷同步卸载）。
+- 离线失败/卷被占用：直接跳过，**不等待、不阻塞**，照常深睡
+  （该分支等价于第 10 轮已确认生效的纯深睡方案）。
+- 若离线成功却导致深睡失败（ATA 透传受离线影响）：恢复在线再重试深睡，
+  **深睡优先于离线**。
+
+**三、执行阶段与载体**
+
+- 唯一可靠的钩子是服务的 `SERVICE_CONTROL_PRESHUTDOWN`
+  （QES 后约 38ms 应用进程就被结束；GPO/WMI/任务计划触发器更早失效）。
+- 服务 `JiFengZhiShutdownSvc`：LocalSystem、自动启动，与 GUI 同 exe
+  （`--shutdown-service` 模式）；GUI 每 60 秒把物理盘清单+休眠名单写入
+  `shutdown_disks.json` 供服务读取（SYSTEM 会话 WMI 枚举不可靠）。
+- 内部直连盘（SATA/NVMe）**绝不干预**，由 Windows 自己管理，作为对照组。
+
+**四、验证判据**
+
+- SMART **0xC0 不安全关机数**（不是磁头归位/加载数，概念不得混淆）：
+  每次开机对比"上次关机前基线"，**外置盘增量 ≤ 且等于内置对照盘增量即达标**
+  （内置盘由 Windows 管理，代表"正常关机"的基准）。
+- 深睡/STANDBY 命令本身会让 0xC0 延迟 1-2 分钟 +1（命令式磁头卸载入账），
+  这是任何命令式停转的固有成本，与内置对照盘持平即为正常。
+- 实测历程：第 10 轮纯深睡 Δ+0；第 11 轮（v12）三块盘全部 Δ+1 且
+  与内置对照盘完全一致（+1=+1）→ **判据达标**，关机卡顿消失，用户确认成功。
+
+### 8.37 计数成本实测（2026-09-19）
+
+
+结论：
+
+1. 任何"等某个时机再执行"的设计（守护循环 / 等卷卸载 / 定时器 / 后台线程）
+   **都不可能执行** —— 进程活不到那一刻。用户"完全听不到硬盘停转"就是这么来的。
+2. 停转必须在 **QES 处理函数内同步完成**。命令很快（每盘 FLUSH CACHE +
+   STANDBY IMMEDIATE，共约 1-2 秒），且由 USB-SATA 桥接芯片转交硬盘，
+   本进程随后消失不影响停转。
+3. **停转路径里不能再做任何探测/验证**：v1 多出来的成本正是 TUR 验证造成的
+   （桥会代答 TUR，实测停转 1 秒后 TUR 仍返回成功），
+   探测会把刚停转的盘重新唤醒，随后又要再停一次。
+4. 严格保证**每块盘只停一次**；已休眠（sleeping_disks）的盘直接跳过，0 成本。
+
+### 8.37 计数成本实测（2026-09-19）
+
+
+对同一块盘连续做两次"读取基线 → FLUSH CACHE + STANDBY IMMEDIATE → 多次采样"：
+
+| 采样点 | C0 | C1 |
+|---|---|---|
+| before | 1388 | 1388 |
+| park（发出命令） | 1388 | 1388 |
+| +5s / +20s / +60s | 1388 | 1388 |
+| **+120s** | **1389** | **1389** |
+| +180s | 1389 | 1389 |
+
+第二次实验同样：1389 → 1390（+1 出现在 60~120 秒之间）。
+
+**结论（决定性）**：这些 WD/HGST 盘的 0xC0/0xC1 把**每一次磁头卸载**都计入，
+包括命令式 STANDBY IMMEDIATE（延迟 1-2 分钟入账），断电时的紧急回收同样 +1。
+即"停转次数 = 成本"，与是否断电无关。
+
+所以 v3 的设计原则是**把停转次数压到最低**：
+
+1. 关机时已经停着的盘（sleeping_disks 名单）→ 完全跳过，**0 成本**；
+2. 还在转的盘 → **只停一次**，且要停在最接近断电的时刻
+   （卷卸载完成之后，因为那时文件系统不可能再写）；
+3. 绝不在 QES/ENDSESSION 提前停转 —— 那会被后续 flush 重新转起来，
+   Windows 设备断电时还会再停一次，实测变成 **+3**；
+4. 兜底：卷 45 秒仍未卸载 → 停一次（避免盘一直转到断电）。
+
+代价对比（同一台机器、同一次关机）：
+
+| 策略 | 外置盘 C0 增量 | 内置对照盘 |
+|---|---|---|
+| 旧策略（SLEEP + 阻塞 20s） | 未执行（盘卡在休眠名单里被跳过） | +0 |
+| v1（QES 同步停转 + TUR 验证） | **+3** | +1 |
+| v3（卷卸载后只停一次） | 待实测 | 待实测 |
+
+### 8.4 不安全关机计数核对（重启验证）
+
+- 每块盘第一次读到 SMART 时，把 **C0(0xC0) / C1(0xC1)** 与上次保存的基线对比：
+  增量 0 = 上次关机是安全关机；随后持续刷新基线（关机时不读盘，避免唤醒）。
+- 基线持久化在 `app_config.json` 的 `shutdown_counters`；
+  报告写到 `%LOCALAPPDATA%\StormForgeDiskManager\shutdown_verification.json`。
+- 内置直连盘是**对照组**：若内置盘增量为 0 而外置盘 >0，说明问题只在外置盘关机处理。
+
+### 8.5 开机清空过期休眠标记
+
+开机后首次启动（`GetTickCount64 < 180s`）时清空持久化的 sleeping_disks：
+硬盘柜随主机断电重新上电，盘必然是转的，旧标记一定是错的。
+（否则会出现“开机后全部显示休眠、拿不到 SMART 基线、用户要手动唤醒”）
+
+### 8.6 历史实现（已废弃，仅作参考）
+
+- WM_QUERYENDSESSION → `eject_all_removable_disks()` → 并发 SLEEP + 20 秒等待
+- 磁盘列表来源：`monitor_service.cached_disks`（不要用 `self.disk_data`，silent 模式下会过期漏盘）
+- 跳过 `sleeping_disks | ejected_disks` 中的盘
 
 ---
 
