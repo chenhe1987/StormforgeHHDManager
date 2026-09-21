@@ -457,12 +457,13 @@ class MainWindow(QMainWindow):
     # （表现为按钮一直停在“正在弹出.../正在深度休眠...”）。跨线程回主线程必须用信号。
     _eject_done_signal = Signal(dict)
     _spindown_done_signal = Signal(dict)
+    _eject_progress_signal = Signal(str)
 
     def __init__(self, silent_mode=False):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.74"
+        self.version = "1.3.78"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1100, 750)
         self.setStyleSheet(NVIDIA_STYLE)
@@ -497,6 +498,9 @@ class MainWindow(QMainWindow):
         self._wake_done_signal.connect(self._on_wake_complete)
         self._eject_done_signal.connect(self._on_eject_complete)
         self._spindown_done_signal.connect(self._on_spin_down_complete)
+        self._eject_progress_signal.connect(self._on_eject_progress)
+        self._eject_active = None
+        self._hardware_refresh_active = False
         
         # UI Setup
         central_widget = QWidget()
@@ -552,7 +556,8 @@ class MainWindow(QMainWindow):
         self.settings_layout.setSpacing(8)
 
         # 1. Refresh Button (Green)
-        self.refresh_btn = QPushButton("刷新设备列表")
+        self.refresh_btn = QPushButton("刷新设备列表（有风险）")
+        self.refresh_btn.setToolTip("不建议使用：可能重置其他 USB 硬盘柜。请先关闭目标硬盘柜上的读写任务，再重启该硬盘柜。")
         self.refresh_btn.setObjectName("RefreshButton")
         self.refresh_btn.setFixedHeight(38)
         self.refresh_btn.setStyleSheet("""
@@ -568,6 +573,9 @@ class MainWindow(QMainWindow):
         """)
         self.refresh_btn.clicked.connect(self.on_refresh_clicked)
         self.settings_layout.addWidget(self.refresh_btn)
+        refresh_warning = QLabel("不建议刷新：请先关闭读写任务，\n再重启对应硬盘柜。")
+        refresh_warning.setWordWrap(True)
+        self.settings_layout.addWidget(refresh_warning)
 
         # 2. Check Update Button (Purple accent)
         self.check_update_btn = QPushButton("检查软件更新")
@@ -621,14 +629,13 @@ class MainWindow(QMainWindow):
         self.settings_layout.addWidget(self.shutdown_eject_checkbox)
 
         # 6. Safe Removal Spin-Down Patch Checkbox — 驱动级功能：固定启用
-        self.spindown_patch_checkbox = QCheckBox("系统弹出时附加硬盘停转（驱动级，固定开启）")
+        self.spindown_patch_checkbox = QCheckBox("GUI 停转并安全弹出")
         self.spindown_patch_checkbox.setStyleSheet("color: #888888; font-size: 12px; padding: 5px;")
         self.spindown_patch_checkbox.setChecked(True)
         self.spindown_patch_checkbox.setEnabled(False)
         self.spindown_patch_checkbox.setToolTip(
-            "当您通过 Windows 系统托盘安全删除硬件时，\n"
-            "程序会自动发送 SLEEP 停转命令，确保磁头归位、盘片停转。\n"
-            "该功能为驱动级常驻，无需手动开启。"
+            "请在本程序界面选择硬盘并点击“停转并安全弹出”。\n"
+            "Windows 系统托盘弹出不再由本程序接管。"
         )
         self.settings_layout.addWidget(self.spindown_patch_checkbox)
         
@@ -761,7 +768,7 @@ class MainWindow(QMainWindow):
 
         self.actions_layout.addSpacing(10)
 
-        self.eject_button = QPushButton("安全弹出设备")
+        self.eject_button = QPushButton("停转并安全弹出")
         self.eject_button.setObjectName("EjectButton")
         self.eject_button.setFixedWidth(180)
         self.eject_button.clicked.connect(self.on_eject_clicked)
@@ -857,7 +864,10 @@ class MainWindow(QMainWindow):
         # （配合深睡消除关机卡顿），这里在监控启动前把盘恢复上线，保证盘符已回来。
         try:
             from src.core.shutdown_service import bring_all_external_disks_online
-            bring_all_external_disks_online()
+            if not self.config_manager.config.get("eject_quarantine"):
+                bring_all_external_disks_online()
+            else:
+                logging.warning("存在未完成弹出隔离记录，跳过自动恢复在线")
         except Exception as e:
             logging.warning(f"开机恢复外置盘失败: {e}")
 
@@ -869,13 +879,7 @@ class MainWindow(QMainWindow):
         )
         self.monitor_service.start()
 
-        # Safe Removal Spin-Down Patcher — always register to intercept removal events
-        # and pause monitor service to release device refs. _enabled only controls FLUSH+SLEEP.
-        self.spindown_patcher = SafeRemovalPatcher()
-        self.spindown_patcher.monitor_service = self.monitor_service
-        # 驱动级功能：系统弹出停转始终启用，不受 UI 设置影响。
-        self.spindown_patcher.enabled = True
-        QTimer.singleShot(1000, self._register_spindown_patcher)
+        # Windows 原生托盘弹出不由本程序接管；停转与弹出统一从 GUI 发起。
 
         # 关机/休眠停转策略（对齐 Windows 内置盘做法：FLUSH CACHE + STANDBY IMMEDIATE，
         # 不使用 ATA SLEEP，不长时间阻塞关机），同时负责不安全关机计数核对。
@@ -1090,23 +1094,27 @@ class MainWindow(QMainWindow):
     @Slot()
     def on_refresh_clicked(self):
         """处理刷新按钮点击：重新扫描硬件并更新列表"""
+        if self._eject_active is not None or self.monitor_service.eject_quarantine:
+            QMessageBox.warning(self, "不能扫描", "弹出事务或隔离状态尚未解除，不能深度扫描硬盘。")
+            return
         # 增加提醒弹窗
-        reply = QMessageBox.question(
+        reply = QMessageBox.warning(
             self, 
-            "深度硬件扫描确认",
-            "深度扫描将执行以下操作：\n"
-            "1. 强制系统重新枚举所有硬件总线\n"
-            "2. 尝试重置并唤醒处于异常状态的存储控制器\n"
-            "3. 深度恢复已安全删除但未拔出的硬盘\n\n"
-            "注意：此过程可能需要 1-3 分钟，期间界面可能会有短暂无响应，属于正常现象。\n"
-            "是否继续？",
+            "刷新设备列表有风险，不建议使用",
+            "此操作会执行全局硬件恢复，可能重启其他 USB 硬盘柜、父设备或存储控制器，"
+            "造成磁盘掉线、读写中断，甚至文件或目录损坏。\n\n"
+            "建议取消此操作：先关闭目标硬盘柜上的文件、下载、备份等读写任务，"
+            "确认写入完成后，再重启对应硬盘柜。\n\n"
+            "如仍要继续，请先关闭所有可能受影响硬盘上的读写任务。\n"
+            "是否仍然执行有风险的刷新？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         
-        if reply == QMessageBox.No:
+        if reply != QMessageBox.Yes:
             return
 
+        self._hardware_refresh_active = True
         self.refresh_btn.setText("正在扫描硬件...")
         self.refresh_btn.setEnabled(False)
         QApplication.processEvents()
@@ -1165,7 +1173,8 @@ class MainWindow(QMainWindow):
             if lock_acquired:
                 self.monitor_service.scan_lock.release()
                 
-            self.refresh_btn.setText("刷新设备列表")
+            self._hardware_refresh_active = False
+            self.refresh_btn.setText("刷新设备列表（有风险）")
             self.refresh_btn.setEnabled(True)
             
             root_logger.removeHandler(log_handler)
@@ -1314,7 +1323,7 @@ class MainWindow(QMainWindow):
         # （实测：硬盘柜上电瞬间注册 0 个 → 托盘弹出无停转）。
         # 每 30 秒检查一次，为空则刷新缓存并重新注册，直到成功为止。
         self._patcher_retry_timer = QTimer(self)
-        self._patcher_retry_timer.setInterval(30000)
+        self._patcher_retry_timer.setInterval(5000)
         self._patcher_retry_timer.timeout.connect(self._retry_patcher_registration)
         self._patcher_retry_timer.start()
 
@@ -1323,9 +1332,6 @@ class MainWindow(QMainWindow):
             patcher = getattr(self, "spindown_patcher", None)
             if not patcher:
                 return
-            if getattr(patcher, "_handle_notify_map", None):
-                return  # 已注册成功，无需重试
-            logging.info("[SafeRemovalPatch] 句柄通知为空，重试注册...")
             patcher.refresh_cache()
             hwnd = int(self.winId())
             patcher.register(hwnd)
@@ -1387,12 +1393,9 @@ class MainWindow(QMainWindow):
                     return True, 0
 
                 elif msg.message == WM_DEVICECHANGE:
-                    # 已处理。注意 DBT_DEVICEQUERYREMOVE 的返回值语义与普通消息相反：
-                    #   返回 TRUE (result=1) = 允许移除设备
-                    #   返回 FALSE/0 (result=0) = 否决移除（Windows 显示"设备正在使用中"）
-                    # 程序从不否决弹出，因此统一返回 (True, 1)。
-                    self.spindown_patcher.handle_wm_devicechange(msg.wParam, msg.lParam)
-                    return True, 1
+                    # TRUE allows removal; BCAST_QUERY_DENY defers the request
+                    # until the shared offline/SLEEP/eject transaction can run.
+                    return super().nativeEvent(eventType, message)
         except Exception as e:
             logging.error(f"nativeEvent error: {e}")
 
@@ -1586,6 +1589,8 @@ class MainWindow(QMainWindow):
         self.interval_slider.show()
  
     def on_spin_down_clicked(self):
+        if self._eject_active is not None or self.monitor_service.eject_quarantine:
+            return
         if not hasattr(self, 'current_disk_index'):
             return
 
@@ -1624,9 +1629,10 @@ class MainWindow(QMainWindow):
     def _spin_down_and_verify_thread(self, disk_index, model, serial):
         result = {}
         try:
-            success, message = DeviceManager.spin_down_disk(
-                disk_index, model=model, serial=serial
-            )
+            with self.monitor_service.scan_lock:
+                if self.monitor_service.removal_pending.is_set():
+                    raise RuntimeError("正在执行安全弹出，取消休眠操作")
+                success, message = DeviceManager.spin_down_disk(disk_index, model=model, serial=serial)
             result = {"success": success, "message": message, "serial": serial}
         except Exception as e:
             result = {"success": False, "message": str(e), "serial": serial}
@@ -1656,78 +1662,88 @@ class MainWindow(QMainWindow):
             self.status_label.setText("深度休眠失败")
 
     def on_eject_clicked(self):
-        if not hasattr(self, 'current_disk_index'):
+        if self._eject_active is not None or not hasattr(self, 'current_disk_index'):
             return
+        disk = next((d for d in self.monitor_service.cached_disks
+                     if d.index == self.current_disk_index), None)
+        if disk is None:
+            QMessageBox.warning(self, "设备信息已过期", "请等待设备列表自动更新。若设备仍未恢复，请先关闭读写任务，再重启对应硬盘柜后重试。")
+            return
+        identity = {"index": disk.index, "model": disk.model,
+                    "serial": disk.serial_number, "pnp_id": disk.pnp_id,
+                    "ui_serial": self.current_disk_serial, "source": "gui"}
+        if QMessageBox.question(self, "停转并安全弹出",
+                f"确定要停转并安全弹出磁盘 {disk.index} 吗？\n全部关联卷将被锁定、卸载并离线。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self._start_eject(identity)
 
-        reply = QMessageBox.question(
-            self, '确认弹出',
-            f"确定要安全弹出磁盘 {self.current_disk_index} 吗？\n所有关联的分区都将被卸载。",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
+    def _on_native_eject(self, identity):
+        identity = dict(identity, source="windows_tray")
+        index = identity["index"]
+        if self._eject_active is not None or self._hardware_refresh_active:
+            self.show_notification("暂不能弹出", "另一项磁盘操作尚未完成，请稍后重试。")
+            return
+        started = time.monotonic()
+        def wait_for_native_cancel():
+            if self.spindown_patcher.native_ready(index):
+                self._start_eject(identity)
+            elif time.monotonic() - started < 10:
+                QTimer.singleShot(100, wait_for_native_cancel)
+            else:
+                self.show_notification("未启动停转", "Windows 未确认原弹出请求已结束，请使用程序内的弹出按钮。")
+        wait_for_native_cancel()
 
-        if reply == QMessageBox.Yes:
-            logging.info(f"用户触发弹出磁盘 {self.current_disk_index}")
+    def _start_eject(self, identity):
+        if self._eject_active is not None or self._hardware_refresh_active:
+            self.show_notification("暂不能弹出", "另一项磁盘操作尚未完成。")
+            return
+        self._eject_active = identity
+        self.monitor_service.removal_pending.set()
+        self.eject_button.setEnabled(False)
+        self.spin_down_button.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.eject_button.setText("正在停转并弹出...")
+        self.status_label.setText(f"磁盘 {identity['index']}：等待后台访问结束，随后锁卷、离线并停转...")
+        threading.Thread(target=self._eject_disk_thread, args=(identity,), daemon=True).start()
 
-            # 1. 首先在监控服务中屏蔽该硬盘，避免后台 SMART 检测干扰弹出
-            if hasattr(self, 'monitor_service') and self.current_disk_serial:
-                self.monitor_service.mark_disk_sleeping(
-                    self.current_disk_serial, self.current_disk_index
-                )
+    def _eject_disk_thread(self, identity):
+        from src.core.eject_service import execute_eject
+        result = execute_eject(self.monitor_service, identity, self._eject_progress_signal.emit)
+        self._eject_done_signal.emit(dict(identity, **result))
 
-            # 2. 禁用按钮，显示等待状态
-            self.eject_button.setEnabled(False)
-            self.eject_button.setText("正在弹出...")
-            self.status_label.setText(f"正在尝试安全弹出磁盘 {self.current_disk_index}，请稍候...")
-            QApplication.processEvents()
-
-            # 3. 启动后台线程执行弹出逻辑，避免 UI 卡死
-            threading.Thread(
-                target=self._eject_disk_thread,
-                args=(self.current_disk_index, self.current_disk_model, self.current_disk_serial),
-                daemon=True,
-            ).start()
-
-    def _eject_disk_thread(self, disk_index, model, serial):
-        result = {}
-        try:
-            success, message = DeviceManager.safe_eject_disk(
-                disk_index, model=model, serial=serial
-            )
-            result = {"success": success, "message": message, "serial": serial, "index": disk_index}
-        except Exception as e:
-            logging.error(f"弹出线程执行异常: {e}")
-            result = {"success": False, "message": str(e), "serial": serial, "index": disk_index}
-        self._eject_done_signal.emit(result)
+    def _on_eject_progress(self, event):
+        labels = {"volume_locked": "卷已锁定", "disk_offline": "磁盘已离线",
+                  "sleep_dispatch": "正在发送 SLEEP 停转命令",
+                  "pnp_request": "等待 Windows 完成安全弹出（请勿重复操作）"}
+        if event in labels:
+            self.status_label.setText(labels[event])
 
     def _on_eject_complete(self, result):
-        """弹出操作完成的回调（主线程）"""
-        success = result.get("success", False)
-        message = result.get("message", "")
-        serial = result.get("serial")
-        disk_index = result.get("index")
-
-        # 恢复按钮文本
-        self.eject_button.setText("安全弹出设备")
-
-        if success:
-            if hasattr(self, 'monitor_service') and (serial or disk_index is not None):
-                self.monitor_service.mark_disk_ejected(serial, disk_index)
-            QMessageBox.information(
-                self,
-                "弹出成功",
-                f"设备已安全弹出。\n\n{message}\n\n您现在可以安全地拔掉硬盘或关闭电源了。"
-            )
-            # 立即从当前 UI 中移除已弹出的磁盘，避免主线程执行完整刷新导致界面卡顿。
-            self._remove_ejected_disk_from_ui(serial, disk_index)
-            self.status_label.setText("设备已弹出")
-            QTimer.singleShot(1500, lambda: self.status_label.setText("就绪"))
+        index = result["index"]
+        self.monitor_service.removal_pending.clear()
+        self._eject_active = None
+        self.eject_button.setText("停转并安全弹出")
+        self.refresh_btn.setEnabled(True)
+        if result.get("ejected"):
+            message = "Windows 已完成安全弹出，SLEEP 命令已接受。"
+            self._remove_ejected_disk_from_ui(result.get("ui_serial") or result.get("serial"), index)
+            self.status_label.setText(message)
+            if result.get("source") == "windows_tray":
+                self.show_notification("停转并弹出完成", message)
+            else:
+                QMessageBox.information(self, "安全弹出完成", message)
         else:
-            # 弹出失败：解除屏蔽，恢复监控并允许重试
-            if hasattr(self, 'monitor_service') and (serial or disk_index is not None):
-                self.monitor_service.mark_disk_awake(serial, disk_index)
-            self.eject_button.setEnabled(True)
-            QMessageBox.warning(self, "弹出失败", f"无法安全弹出设备：\n{message}\n\n请确保没有程序正在使用该磁盘中的文件。")
-            self.status_label.setText("弹出失败")
+            isolated = result.get("sleep_attempted") or result.get("state") == "recovery_required"
+            message = result.get("error") or "Windows 未完成设备移除。"
+            if isolated:
+                message += "\n磁盘保持隔离，停转/弹出状态未完全确认。请勿重复读盘或直接拔盘。"
+            self.status_label.setText(message)
+            self.eject_button.setEnabled(not isolated)
+            self.spin_down_button.setEnabled(not isolated)
+            if result.get("source") == "windows_tray":
+                self.show_notification("弹出未完成", message)
+            else:
+                QMessageBox.warning(self, "弹出未完成", message)
 
     def _remove_ejected_disk_from_ui(self, serial, disk_index):
         """先本地更新列表，避免成功弹出后同步刷新阻塞 UI。"""
@@ -1818,7 +1834,10 @@ class MainWindow(QMainWindow):
         """
         import pythoncom
         pythoncom.CoInitialize()
+        self.monitor_service.scan_lock.acquire()
         try:
+            if self.monitor_service.removal_pending.is_set():
+                raise RuntimeError("正在执行安全弹出，取消唤醒")
             from src.hal.asm_commander import ASMCommander
 
             data = None
@@ -1853,6 +1872,7 @@ class MainWindow(QMainWindow):
             logging.error(f"SMART 唤醒异常: {e}")
             self._wake_done_signal.emit({"success": False, "serial": serial})
         finally:
+            self.monitor_service.scan_lock.release()
             pythoncom.CoUninitialize()
 
     def _on_wake_complete(self, result):

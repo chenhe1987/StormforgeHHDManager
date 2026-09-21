@@ -160,136 +160,26 @@ class DeviceManager:
             return False, f"操作异常: {e}"
 
     @staticmethod
-    def safe_eject_disk(disk_index, model=None, serial=None):
-        started_at = time.perf_counter()
-        logging.info("=" * 72)
-        logging.info(
-            f"开始安全弹出磁盘: index={disk_index}, model={model or 'Unknown'}, serial={serial or 'Unknown'}"
-        )
-
-        # 1. 获取该物理盘对应的设备实例 ID
-        instance_id = Win32API.get_device_instance_path(disk_index)
-        if not instance_id:
-            logging.error(f"无法获取磁盘 {disk_index} 的设备实例 ID")
-            logging.info("=" * 72)
-            return False, "无法识别设备节点，请尝试重新扫描设备。"
-
-        logging.info(f"磁盘 {disk_index} 的实例 ID: {instance_id}")
-
-        # 2. 记录卷信息
-        volumes = DeviceManager.get_volumes_for_disk(disk_index)
-        if volumes:
-            logging.info(f"磁盘 {disk_index} 当前关联卷: {', '.join(volumes)}")
-        else:
-            logging.info(f"磁盘 {disk_index} 上未发现活动卷")
-
-        # 释放 WMI COM 对象
-        import gc
-        gc.collect()
+    def safe_eject_disk(disk_index, model=None, serial=None, monitor_service=None):
+        """Compatibility entry point; requires the monitor's I/O gate."""
+        if monitor_service is None:
+            return False, "Use the GUI controlled eject transaction (monitor gate required)."
+        disk = next((d for d in monitor_service.cached_disks if d.index == disk_index), None)
+        if disk is None:
+            return False, "Disk identity expired; refresh before ejecting."
+        from src.core.eject_service import execute_eject
+        from src.hal.win32_api import SafeRemovalPatcher
+        identity = dict(index=disk.index, model=disk.model, serial=disk.serial_number,
+                        pnp_id=disk.pnp_id, ui_serial=serial)
+        monitor_service.removal_pending.set()
+        patcher = SafeRemovalPatcher()
         try:
-            import pythoncom
-            pythoncom.CoFreeUnusedLibraries()
-        except Exception:
-            pass
-
-        # 3. 策略 A (优先): Shell Eject
-        #    与 Windows 原生安全删除硬件使用相同路径
-        #    对 2074 Hub + 多 ASM1153E 桥接的组合最为可靠
-        #    注意：**不要**先发 SLEEP。ATA SLEEP(0xE6) 是深睡，必须复位才能唤醒，
-        #    先停转会让后续的卷锁定/设备移除因 I/O 无法完成而长时间挂起，
-        #    盘还会被控制器复位重新转起来。停转交给设备移除的 QUERYREMOVE 阶段完成。
-        spin_down_ok = False  # 停转由设备移除时的 QUERYREMOVE 阶段完成（见 SafeRemovalPatch）
-        shell_msg = ""
-        if volumes:
-            primary_volume = volumes[0]
-            logging.info(f"策略 A: 尝试 Shell Eject 弹出卷 {primary_volume}")
-            shell_ok, shell_msg = Win32API.eject_volume_by_drive_letter(
-                primary_volume,
-                expected_volumes=volumes,
-                timeout_seconds=10.0,
-            )
-            if shell_ok:
-                total_elapsed = time.perf_counter() - started_at
-                logging.info(f"磁盘 {disk_index} 策略 A (Shell Eject) 成功，总耗时 {total_elapsed:.2f} 秒")
-                logging.info("=" * 72)
-                return True, "设备已安全弹出"
-
-        # 4. 锁定并卸载卷 —— 必须在硬盘仍在转动、能响应 I/O 时完成。
-        #    卷锁不住说明有程序占用，直接给出可操作的原因，不继续移除设备。
-        prepared_volumes = []
-        volume_failures = []
-
-        if volumes:
-            prepared_volumes, volume_failures = Win32API.prepare_volumes_for_safe_removal(
-                volumes,
-                lock_timeout_seconds=3.0,
-            )
-            if prepared_volumes:
-                logging.info(
-                    "卷预处理成功: " + ", ".join(item["volume"] for item in prepared_volumes)
-                )
-            if volume_failures:
-                logging.warning(
-                    "卷预处理失败: " +
-                    "; ".join(f"{item['volume']}={item['message']}" for item in volume_failures)
-                )
-            if not prepared_volumes:
-                volume_details = "; ".join(
-                    f"{item['volume']} {item['message']}" for item in volume_failures
-                )
-                combined = (
-                    f"磁盘正被占用，无法安全弹出。({volume_details})。"
-                    "请关闭占用该磁盘的程序或窗口后重试。"
-                )
-                occupying_apps = []
-                for vol in volumes:
-                    vol_root = f"{vol}\\" if not vol.endswith("\\") else vol
-                    occupying_apps.extend(Win32API.query_occupying_apps(vol_root))
-                if occupying_apps:
-                    combined += f"\n可能正在占用该磁盘的程序: {', '.join(sorted(set(occupying_apps)))}"
-                logging.error(f"磁盘 {disk_index} 卷锁定失败，放弃弹出: {combined}")
-                logging.info("=" * 72)
-                return False, combined
-
-        # 5. 策略 B (备选): PnP 设备节点移除（带超时保护）
-        #    适用于独立 USB-SATA 桥接芯片，对于 2074 hub 下的子设备可能被否决
-        try:
-            logging.info(f"策略 B: 按 PnP 设备节点移除策略请求移除设备: {instance_id}")
-            try:
-                pythoncom.CoFreeUnusedLibraries()
-            except Exception:
-                pass
-
-            # 请求移除前**先释放锁定的卷句柄**：持有 FSCTL_LOCK_VOLUME 锁句柄时，
-            # 卷管理器会否决设备移除（PNP_Veto STORAGE\VOLUME，实测 9.5 秒后
-            # 返回“磁盘正被占用”，而系统托盘弹出无锁句柄即可成功）。
-            # 卷已卸载（盘符已消失），释放句柄不影响移除；finally 中幂等兜底。
-            Win32API.release_prepared_volumes(prepared_volumes)
-
-            pnp_ok, pnp_msg = Win32API.eject_device_by_instance_id(instance_id)
+            patcher.begin_managed(disk_index)
+            result = execute_eject(monitor_service, identity)
+            return result["ejected"], result["error"] or result["state"]
         finally:
-            Win32API.release_prepared_volumes(prepared_volumes)
-
-        if pnp_ok:
-            total_elapsed = time.perf_counter() - started_at
-            logging.info(f"磁盘 {disk_index} 策略 B (PnP 移除) 成功，总耗时 {total_elapsed:.2f} 秒")
-            logging.info("=" * 72)
-            return True, "设备已安全移除"
-
-        # 6. 所有策略都失败，生成详细错误信息
-        total_elapsed = time.perf_counter() - started_at
-
-        messages = []
-        if shell_msg:
-            messages.append(f"Shell Eject: {shell_msg}")
-        messages.append(f"PnP 移除: {pnp_msg}")
-
-        combined = "\n".join(messages)
-        combined += "\n\n提示：请关闭可能访问该磁盘的程序（资源管理器窗口、播放器、下载工具）后重试。"
-
-        logging.error(f"磁盘 {disk_index} 弹出最终失败，总耗时 {total_elapsed:.2f} 秒: {combined}")
-        logging.info("=" * 72)
-        return False, combined
+            patcher.finish_managed(disk_index)
+            monitor_service.removal_pending.clear()
 
     @staticmethod
     def deep_sleep_disk(disk_index, model=None, serial=None):

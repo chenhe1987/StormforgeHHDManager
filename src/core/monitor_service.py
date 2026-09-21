@@ -49,7 +49,9 @@ class MonitorService(threading.Thread):
         self.last_ui_data = []  # 最近一次推送给 UI 的完整列表（部分盘扫描时用于合并）
         self.last_inventory_scan_time = 0
         self.device_inventory_interval = 300
-        self.scan_lock = threading.Lock()
+        self.scan_lock = threading.RLock()
+        self.removal_pending = threading.Event()
+        self.eject_quarantine = set(self.config_manager.config.get("eject_quarantine", []))
         self._idle_tracker = {}  # {disk_index: {last_r, last_w, idle_since_ts, timeout_mins}}
         self._idle_last_check = 0
 
@@ -155,6 +157,12 @@ class MonitorService(threading.Thread):
         self.check_all_smart(target_disks=disks)
 
     def _get_cached_or_scan_disks(self, force=False):
+        with self.scan_lock:
+            return self._get_cached_or_scan_disks_locked(force)
+
+    def _get_cached_or_scan_disks_locked(self, force=False):
+        if self.removal_pending.is_set():
+            return self._filter_excluded_disks(self.cached_disks)
         now = time.time()
 
         if self.shutdown_mode:
@@ -171,6 +179,8 @@ class MonitorService(threading.Thread):
         return self._filter_excluded_disks(self.cached_disks)
 
     def check_all_smart(self, force=False, target_disks=None):
+        if self.removal_pending.is_set():
+            return
         if not self.scan_lock.acquire(blocking=False):
             if force:
                 # If forced (manual refresh), we wait for the lock
@@ -207,6 +217,10 @@ class MonitorService(threading.Thread):
         current_time = time.time()
         
         for disk in disks:
+            if self.removal_pending.is_set():
+                break
+            if self.is_eject_blocked(disk):
+                continue
             if self.shutdown_mode:
                 logging.info("检测过程中收到关机静默请求，提前结束本轮 SMART 检测")
                 break
@@ -642,6 +656,13 @@ class MonitorService(threading.Thread):
         self.last_inventory_scan_time = 0
 
     def _check_idle_timers(self):
+        if self.removal_pending.is_set():
+            return
+        with self.scan_lock:
+            if not self.removal_pending.is_set():
+                self._check_idle_timers_locked()
+
+    def _check_idle_timers_locked(self):
         """简单倒计时——超时后触发休眠（等同于点击立即休眠按钮）"""
         try:
             disks = self._get_cached_or_scan_disks(force=False)
@@ -651,7 +672,9 @@ class MonitorService(threading.Thread):
                 idx = disk.index
                 serial = disk.serial_number
 
-                if serial in self.sleeping_disks or serial in self.ejected_disks:
+                if self.removal_pending.is_set():
+                    return
+                if self.is_eject_blocked(disk) or serial in self.sleeping_disks or serial in self.ejected_disks:
                     self._idle_tracker.pop(idx, None)
                     continue
 
@@ -679,11 +702,11 @@ class MonitorService(threading.Thread):
                         f"Idle timer fired: Disk {idx}, timeout={tracker['timeout']}min, "
                         f"elapsed={elapsed:.0f}s"
                     )
-                    self.mark_disk_sleeping(serial)
                     try:
                         from src.hal.asm_commander import ASMCommander
                         with ASMCommander(idx) as cmd:
                             if cmd.sleep():
+                                self.mark_disk_sleeping(serial, idx)
                                 logging.info(f"Auto-sleep OK: Disk {idx}")
                             else:
                                 logging.warning(f"Auto-sleep FAIL: Disk {idx}")
@@ -703,13 +726,18 @@ class MonitorService(threading.Thread):
             if tracker.get("serial") == serial:
                 del self._idle_tracker[idx]
 
+    def is_eject_blocked(self, disk):
+        return (getattr(disk, "pnp_id", "") or "").upper() in self.eject_quarantine
+
+    def quarantine_eject(self, pnp_id):
+        if pnp_id:
+            self.eject_quarantine.add(pnp_id.upper())
+            self.config_manager.config["eject_quarantine"] = sorted(self.eject_quarantine)
+            self.config_manager.save_config()
+
     def _filter_excluded_disks(self, disks):
-        if not self.ejected_disks:
-            return list(disks)
-        return [
-            disk for disk in disks
-            if getattr(disk, "serial_number", None) not in self.ejected_disks
-        ]
+        return [disk for disk in disks if not self.is_eject_blocked(disk)
+                and getattr(disk, "serial_number", None) not in self.ejected_disks]
 
     def stop(self):
         logging.info("监控服务收到停止请求")
