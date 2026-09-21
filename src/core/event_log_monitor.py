@@ -50,7 +50,7 @@ class EventLogMonitor:
         return errors
 
 if __name__ == "__main__":
-    # Test monitor
+    # Diagnostic monitor
     monitor = EventLogMonitor()
     print("Checking for disk errors in System Log (last 24h)...")
     monitor.last_check_time = time.time() - 86400

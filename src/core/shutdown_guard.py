@@ -1,52 +1,9 @@
-"""关机/系统休眠停转策略 —— 对齐 Windows 对内置硬盘的处理方式。
+"""关机/系统休眠停转策略。
 
-## 旧策略为什么是错的
-
-旧实现在 WM_QUERYENDSESSION 里对每块外置盘发送 `DeviceManager.spin_down_disk`
-（FLUSH CACHE + **ATA SLEEP 0xE6**），然后**阻塞关机约 20 秒**等待盘物理停转。
-三个致命问题：
-
-1. **SLEEP 是深睡**：必须靠 COMRESET/重新上电才能退出（见 asm_commander.sleep 注释）。
-   而 WM_QUERYENDSESSION 之后系统还要做：停止服务 → 文件系统 flush → 卸载卷 → 设备断电。
-   其中任何一次 I/O 落到已 SLEEP 的盘上都会挂起十几秒，控制器超时后复位硬盘 →
-   盘被重新转起来 → 断电瞬间盘仍在旋转 → 磁头紧急回收 →
-   硬盘记一次 **C0（断电磁头缩回计数，即“不安全关机数”）**。
-2. **20 秒阻塞**：超过 Windows 给应用的关机等待预算，系统可能在命令发出中途强杀进程，
-   结果是“部分盘停转、部分盘还在转”，状态更糟。
-3. **自家补丁又把盘唤醒**：SafeRemovalPatch 在关机期间收到 DEVNODES_CHANGED 会对所有
-   外置盘做 TUR 探测（探测本身就会让盘起转），甚至补发 SLEEP，把刚停转的盘再折腾一遍。
-
-## Windows 是怎么做的（内置硬盘）
-
-电源计划的“在此时间后关闭硬盘”，以及存储设备进入 D3 断电时，用的是
-**ATA STANDBY IMMEDIATE (0xE0)**：
-
-- 卸载磁头 + 停转马达，但**可恢复** —— 后续任何命令都会让盘自动起转，不需要复位；
-- 硬盘收到该命令时会把写缓存落盘；
-- Windows 从不对内置盘发 SLEEP。
-
-断电时盘已停转、磁头已卸载，因此不会发生紧急回收，C0 不增长。
-
-## 新策略
-
-1. **冻结所有后台访问**：监控线程进入 shutdown_mode，设备事件补丁置 shutdown_in_progress，
-   关机期间不再有任何 TUR 探测 / SLEEP 补发；
-2. 每块外置盘执行：**刷卷缓存 (FlushFileBuffers) → ATA FLUSH CACHE(0xE7) → ATA STANDBY IMMEDIATE(0xE0)**；
-3. 多盘并发，总耗时设上限（默认 4 秒）。命令返回即代表磁头已卸载，不需要等马达物理停转；
-4. 在 **WM_QUERYENDSESSION**（关机开始）与 **WM_ENDSESSION**（会话结束，断电前最后一次）
-   各执行一次，幂等；系统休眠 PBT_APMSUSPEND 同样处理；
-5. 全程不长时间阻塞，让 Windows 正常走完关机流程。
-
-## 效果验证
-
-每次开机记录各盘 SMART C0/C1（持久化在 app_config.json 的 shutdown_counters），
-并与上次开机记录对比增量：
-
-- 增量 0    → 上次关机被硬盘认定为安全关机（新策略生效）
-- 增量 > 0  → 上次关机仍被判定为异常掉电（策略无效或断电时序不对）
-
-内置直连盘由 Windows 自己管理，可作为对照组：若内置盘增量为 0 而外置盘增量 > 0，
-说明问题只出在外置盘的关机处理上。
+Windows 发送关机或系统休眠通知后，程序冻结后台探测，只对已加入白名单的
+USB/UASP 硬盘执行与“立即休眠”按钮相同的流程：刷可访问的卷缓存、发送
+FLUSH CACHE 和 ATA SLEEP，然后把成功的硬盘加入本次运行的休眠集合。界面在
+关机前持续显示数据保存提示；内置盘和未加入白名单的硬盘完全跳过。
 """
 
 import json
@@ -58,6 +15,7 @@ import time
 from datetime import datetime
 
 from src.core.device_manager import DeviceManager
+from src.core.disk_whitelist import disk_id
 
 # 关停相关的 SMART 属性
 ATTR_UNSAFE_SHUTDOWN = "0xC0"   # 不安全关机数（厂商文档称 Power-off Retract Count）
@@ -156,8 +114,10 @@ class ShutdownGuard:
         return "USB" in pnp_id or "UASP" in pnp_id
 
     def collect_external_disks(self, cached_disks):
-        """从物理盘缓存里挑出需要处理的外置盘。"""
+        """从物理盘缓存里挑出白名单内需要处理的外置盘。"""
         already_stopped = set()
+        allowed = (self.config_manager.get_managed_disk_whitelist()
+                   if self.config_manager is not None else set())
         if self.monitor_service is not None:
             already_stopped = (
                 set(getattr(self.monitor_service, "sleeping_disks", set()) or set())
@@ -167,7 +127,7 @@ class ShutdownGuard:
         targets = []
         for d in cached_disks or []:
             idx = getattr(d, "index", None)
-            if idx is None or not self._is_external(d):
+            if idx is None or not self._is_external(d) or disk_id(d) not in allowed:
                 continue
             serial = getattr(d, "serial_number", None)
             # 已确认停转/已弹出的盘不再发命令：向 SLEEP 深睡盘发命令只会挂起并触发复位
@@ -275,18 +235,12 @@ class ShutdownGuard:
         return by_disk
 
     def start_shutdown_parking(self, cached_disks, event_type="关机"):
-        """关机/系统休眠停转（定稿策略的服务不可用降级版）：刷卷缓存 → FLUSH CACHE → **ATA SLEEP 深睡** + 移入黑名单。
+        """Use the proven deep-sleep path when Windows begins shutdown/suspend.
 
-        设计依据（用户方案 + 十一轮实测，固定技术原则见
-        docs/TECH_NOTES_弹出休眠机制.md §8.38「技术原则（定稿）」）：
-        - 深睡本身就是黑名单：ATA SLEEP(0xE6) 后盘进入最低功耗，**不响应任何程序**；
-          桥接芯片会对后续访问立刻回 3A/00（无介质），不会真把盘唤醒。
-        - 因此**不需要卸载卷、不需要锁卷、不需要 Windows 离线**——卷被程序占用
-          也完全不影响深睡（“无法卸载 ≠ 无法休眠”）。
-        - 深睡后把盘移入本程序黑名单（sleeping_disks），本程序与补丁不再访问它；
-          用户需在程序里「唤醒并解除黑名单」才能再次访问。
-        - 正常情况下由关机停转服务（shutdown_service.py，PRESHUTDOWN 阶段，
-          带离线加速）执行；本函数只在该服务不可用时兜底。
+        The operation is intentionally the same as the UI's immediate sleep:
+        flush available volume buffers, send FLUSH CACHE + ATA SLEEP, then add
+        the disk to the in-process sleeping set.  Only allow-listed external
+        disks returned by collect_external_disks() are eligible.
         """
         self._shutdown_runs += 1
         run_no = self._shutdown_runs
@@ -294,27 +248,23 @@ class ShutdownGuard:
 
         targets = self.collect_external_disks(cached_disks)
         if not targets:
-            logging.info(f"[ShutdownGuard] {event_type}#{run_no}: 没有需要停转的外置盘")
+            logging.info(f"[ShutdownGuard] {event_type}#{run_no}: 没有需要休眠的白名单硬盘")
             return 0
 
-        by_disk = self._resolve_volumes_fast()
-
-        resolved = []
-        for disk_index, model, serial in targets:
-            resolved.append({
+        by_disk = {}
+        resolved = [
+            {
                 "index": disk_index,
                 "model": model,
                 "serial": serial,
                 "volumes": by_disk.get(disk_index, []),
-            })
-
+            }
+            for disk_index, model, serial in targets
+        ]
         logging.info(
-            f"[ShutdownGuard] {event_type}#{run_no}: 深睡 {len(resolved)} 块外置盘"
-            f"（刷卷缓存→FLUSH CACHE→ATA SLEEP 深睡→移入黑名单，无需卸载卷）: "
-            + ", ".join(f"{t['index']}({t['model']})" for t in resolved)
+            f"[ShutdownGuard] {event_type}#{run_no}: 按立即休眠逻辑处理 "
+            f"{len(resolved)} 块白名单硬盘（直接 ATA SLEEP）"
         )
-
-        # 必须在 QES 返回前完成（进程随时可能被结束），同步执行、不启动守护线程。
         return self._park_round(resolved, event_type, run_no)
 
     def _park_one(self, target, event_type, run_no, reason):
@@ -325,33 +275,10 @@ class ShutdownGuard:
         started = time.time()
         msg = ""
         try:
-            from src.hal.win32_api import Win32API
-
-            # 1) 刷文件系统缓存（不锁卷、不卸载卷：被占用也能刷，数据安全）
-            volume_note = ""
-            if volumes:
-                flushed = []
-                for vol in volumes:
-                    try:
-                        handle = Win32API.open_volume(vol)
-                        if not handle:
-                            continue
-                        try:
-                            ok_f, _ = Win32API.flush_volume_buffers(handle)
-                            if ok_f:
-                                flushed.append(vol)
-                        finally:
-                            Win32API.close_handle(handle)
-                    except Exception:
-                        pass
-                if flushed:
-                    volume_note = "，已刷卷 " + ",".join(flushed)
-
-            # 2) 深睡（与“立即休眠硬盘”按钮同机制）：FLUSH CACHE + ATA SLEEP
-            ok, park_msg, _ = DeviceManager.deep_sleep_disk(
-                disk_index, model=model, serial=serial
-            )
-            msg = park_msg + volume_note
+            from src.hal.asm_commander import ASMCommander
+            with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
+                ok = cmd.sleep_only()
+            msg = "ATA SLEEP 命令已接受" if ok else "ATA SLEEP 命令失败"
 
             # 3) 移入本程序黑名单：监控与补丁从此不再访问它
             if ok and self.monitor_service is not None and serial:

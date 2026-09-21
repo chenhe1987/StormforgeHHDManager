@@ -21,6 +21,30 @@ else:
 
 import logging
 import traceback
+if '--qt-check' in sys.argv:
+    # Exercise the actual frozen DLLs without starting monitoring or services.
+    import json
+    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+    output = os.path.join(os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                          else base_path, 'qt_check.json')
+    try:
+        from PySide6.QtWidgets import QApplication, QWidget
+        from PySide6.QtCore import qVersion
+        from PySide6 import QtNetwork
+        from src.ui.main_window import MainWindow
+        app = QApplication([])
+        widget = QWidget()
+        widget.resize(300, 100)
+        widget.show()
+        app.processEvents()
+        widget.close()
+        result = {'ok': True, 'qt': qVersion(), 'frozen': bool(getattr(sys, 'frozen', False))}
+    except Exception:
+        result = {'ok': False, 'traceback': traceback.format_exc()}
+    with open(output, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    sys.exit(0 if result['ok'] else 1)
+
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtCore import QSharedMemory
 from src.ui.main_window import MainWindow
@@ -74,7 +98,7 @@ def main():
     root_logger.addHandler(operation_handler)
     root_logger.addHandler(console_handler)
 
-    # 关机停转服务模式（LocalSystem 后台服务，无 GUI，等待 SERVICE_CONTROL_PRESHUTDOWN）
+    # LocalSystem 关机服务入口；主 GUI 只负责注册服务并冻结后台访问。
     if "--shutdown-service" in sys.argv:
         try:
             logging.info("--- 以关机停转服务模式启动 ---")

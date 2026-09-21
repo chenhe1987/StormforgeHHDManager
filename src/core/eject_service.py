@@ -5,11 +5,18 @@ import os
 
 from src.core.eject_protocol import Outcome, run
 from src.hal.eject_backend import inventory, WindowsBackend
+from src.core.disk_whitelist import disk_id, is_external_disk
 
 
 def execute_eject(monitor, identity, progress=None):
     index, pnp = identity["index"], identity["pnp_id"]
     result = Outcome()
+    if not is_external_disk(identity):
+        result.error = "仅允许管理 USB/UASP 外置硬盘，拒绝弹出。"
+        return asdict(result)
+    if disk_id(identity) not in monitor.config_manager.get_managed_disk_whitelist():
+        result.error = "磁盘不在管理白名单中，拒绝弹出。"
+        return asdict(result)
     if not monitor.scan_lock.acquire(timeout=30):
         result.error = "后台磁盘访问尚未结束，本次未发送停转命令。"
         return asdict(result)

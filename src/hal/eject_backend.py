@@ -239,7 +239,7 @@ class WindowsBackend:
 
     def eject(self):
         if self.owned:
-            raise RuntimeError("Refusing PnP request with open test handles")
+            raise RuntimeError("Refusing PnP request while operation handles remain open")
         self.record("pnp_request", {"target": self.target["instance_id"]})
         veto = C.c_int()
         name = C.create_unicode_buffer(1024)

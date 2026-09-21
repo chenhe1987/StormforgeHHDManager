@@ -1,6 +1,15 @@
 import os
 import sys
 
+# Keep unrelated application DLLs (e.g. Poppler's incompatible ICU) out of
+# PyInstaller's dependency search. Qt hooks add their own package directories.
+system_root = os.environ.get('SystemRoot', r'C:\Windows')
+os.environ['PATH'] = os.pathsep.join([
+    sys.base_prefix, os.path.join(sys.base_prefix, 'DLLs'),
+    os.path.join(sys.prefix, 'Scripts'),
+    os.path.join(system_root, 'System32'), system_root,
+])
+
 # 获取当前脚本所在目录的绝对路径
 current_dir = os.path.abspath(os.getcwd())
 
@@ -61,7 +70,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='疾风知硬盘柜管理',
+    name='Stormforge_DiskManager_v1.3.84',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -83,5 +92,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='疾风知硬盘柜管理_v1.3.78',
+    name='Stormforge_DiskManager_v1.3.84',
 )

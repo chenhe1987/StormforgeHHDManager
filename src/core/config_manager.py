@@ -41,6 +41,7 @@ class ConfigManager:
         default_config = {
             "intervals": {}, # {serial: seconds}
             "sleep_timers": {}, # {serial: minutes}
+            "managed_disk_whitelist": [],
             "autostart": False,
             "shutdown_eject": True,
             "safe_remove_spindown": True
@@ -117,6 +118,18 @@ class ConfigManager:
         if "sleep_timers" not in self.config:
             self.config["sleep_timers"] = {}
         self.config["sleep_timers"][serial] = int(minutes)
+        self.save_config()
+
+    def get_managed_disk_whitelist(self):
+        return set(self.config.get("managed_disk_whitelist", []) or [])
+
+    def set_disk_managed(self, disk_id, managed):
+        ids = self.get_managed_disk_whitelist()
+        if managed:
+            ids.add(disk_id)
+        else:
+            ids.discard(disk_id)
+        self.config["managed_disk_whitelist"] = sorted(ids)
         self.save_config()
 
     def get_report_config(self):

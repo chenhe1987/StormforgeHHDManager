@@ -8,6 +8,7 @@ from src.utils.smart_parser import SmartParser
 from src.core.event_log_monitor import EventLogMonitor
 from src.core.history_manager import HistoryManager
 from src.core.config_manager import ConfigManager
+from src.core.disk_whitelist import disk_id
 
 class MonitorService(threading.Thread):
     def __init__(self, callback_notify=None, callback_update_ui=None):
@@ -52,6 +53,7 @@ class MonitorService(threading.Thread):
         self.scan_lock = threading.RLock()
         self.removal_pending = threading.Event()
         self.eject_quarantine = set(self.config_manager.config.get("eject_quarantine", []))
+
         self._idle_tracker = {}  # {disk_index: {last_r, last_w, idle_since_ts, timeout_mins}}
         self._idle_last_check = 0
 
@@ -170,7 +172,8 @@ class MonitorService(threading.Thread):
             return self._filter_excluded_disks(self.cached_disks)
 
         if force or not self.cached_disks or now - self.last_inventory_scan_time >= self.device_inventory_interval:
-            self.cached_disks = DeviceManager.get_physical_disks()
+            self.cached_disks = DeviceManager.get_physical_disks(
+                allowlist=self.config_manager.get_managed_disk_whitelist())
             self.last_inventory_scan_time = now
             logging.info(f"更新物理磁盘缓存: {len(self.cached_disks)} 个设备")
         else:
@@ -215,11 +218,28 @@ class MonitorService(threading.Thread):
         # Prepare data for UI update
         ui_data = []
         current_time = time.time()
+        whitelist = self.config_manager.get_managed_disk_whitelist()
+        if target_disks is None:
+            for disk in disks:
+                managed_id = disk_id(disk)
+                if managed_id and managed_id in whitelist:
+                    continue
+                ui_data.append({
+                    "index": disk.index, "model": disk.model,
+                    "serial": disk.serial_number, "pnp_id": disk.pnp_id or "",
+                    "managed_id": managed_id, "is_removable": disk.is_removable,
+                    "interface": disk.interface_type or "Unknown",
+                    "status": "未加入白名单（不管理）", "temp": "N/A",
+                    "reallocated": "N/A", "pending": "N/A", "attributes": []
+                })
         
         for disk in disks:
             if self.removal_pending.is_set():
                 break
             if self.is_eject_blocked(disk):
+                continue
+            managed_id = disk_id(disk)
+            if not managed_id or managed_id not in whitelist:
                 continue
             if self.shutdown_mode:
                 logging.info("检测过程中收到关机静默请求，提前结束本轮 SMART 检测")
@@ -240,6 +260,7 @@ class MonitorService(threading.Thread):
                     "model": disk.model,
                     "serial": serial,
                     "interface": disk.interface_type,
+                    "pnp_id": disk.pnp_id or "", "managed_id": managed_id,
                     "temp": "N/A",
                     "status": "Sleeping",
                     "reallocated": "N/A",
@@ -286,6 +307,7 @@ class MonitorService(threading.Thread):
                 "index": disk.index,
                 "model": disk.model,
                 "serial": disk.serial_number,
+                "pnp_id": disk.pnp_id or "", "managed_id": managed_id,
                 "interface": interface_type,
                 "is_removable": disk.is_removable,
                 "temp": "N/A",
@@ -674,7 +696,9 @@ class MonitorService(threading.Thread):
 
                 if self.removal_pending.is_set():
                     return
-                if self.is_eject_blocked(disk) or serial in self.sleeping_disks or serial in self.ejected_disks:
+                if (self.is_eject_blocked(disk) or
+                        disk_id(disk) not in self.config_manager.get_managed_disk_whitelist() or
+                        serial in self.sleeping_disks or serial in self.ejected_disks):
                     self._idle_tracker.pop(idx, None)
                     continue
 
@@ -703,6 +727,11 @@ class MonitorService(threading.Thread):
                         f"elapsed={elapsed:.0f}s"
                     )
                     try:
+                        from src.core.device_manager import DeviceManager
+                        if not DeviceManager.is_managed_disk(idx):
+                            logging.info("自动休眠前白名单复核失败，跳过磁盘 %s", idx)
+                            self._idle_tracker.pop(idx, None)
+                            continue
                         from src.hal.asm_commander import ASMCommander
                         with ASMCommander(idx) as cmd:
                             if cmd.sleep():
@@ -728,6 +757,12 @@ class MonitorService(threading.Thread):
 
     def is_eject_blocked(self, disk):
         return (getattr(disk, "pnp_id", "") or "").upper() in self.eject_quarantine
+
+    def reset_unmanaged_idle_timers(self):
+        allowed = self.config_manager.get_managed_disk_whitelist()
+        for disk in self.cached_disks:
+            if disk_id(disk) not in allowed:
+                self._idle_tracker.pop(getattr(disk, 'index', None), None)
 
     def quarantine_eject(self, pnp_id):
         if pnp_id:

@@ -1,4 +1,4 @@
-"""Experimental, fail-closed SLEEP/eject transaction; no OS dependencies.
+"""Fail-closed SLEEP/eject transaction with no OS dependencies.
 
 The backend must freeze application I/O before run(), validate a dedicated USB
 target, enumerate ALL its volumes, and provide owned, checked handles.
@@ -17,7 +17,7 @@ class Outcome:
     error: str = ""
 
 
-def run(backend):
+def run(backend, eject=True):
     result = Outcome()
     disk = None
     volumes = []
@@ -51,9 +51,10 @@ def run(backend):
         result.state = "sleep_accepted_offline"
         backend.close(disk)
         disk = None
-        backend.eject()
-        result.ejected = True
-        result.state = "ejected_sleep_accepted"
+        if eject:
+            backend.eject()
+            result.ejected = True
+            result.state = "ejected_sleep_accepted"
     except Exception as exc:
         result.error = str(exc)
         if result.sleep_attempted:

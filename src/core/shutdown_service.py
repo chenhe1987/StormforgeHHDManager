@@ -1,34 +1,7 @@
-"""关机停转服务 —— 在 Windows 关机流程的正确阶段停转硬盘。
+"""Pre-shutdown: flush, best-effort temporary offline, then ATA SLEEP.
 
-## 为什么需要服务（六轮实测 + 调研结论）
-
-GUI 进程的宿命：实测 WM_QUERYENDSESSION 之后约 38 毫秒进程就被结束；
-QES/ENDSESSION 期间应用还活着、外置盘的卷仍被资源管理器等占用
-（实测 FSCTL_LOCK_VOLUME 返回 error=5，卸载卷失败），
-于是"先卸载卷再停转"永远做不到——卷 flush 总会把停转的盘重新转起来，
-断电时盘在转 → 不安全关机数再 +1。
-
-调研结论（https://github.com/gfody/OnShutdown 等）：
-Windows 关机流程里唯一可靠且足够晚的钩子是**服务**的
-`SERVICE_CONTROL_PRESHUTDOWN`(0x0F) 通知——它发生在：
-  1. 所有**应用程序已经退出**（卷句柄全部释放）之后；
-  2. 其他服务停止、文件系统 flush、设备断电**之前**；
-且服务可以把关机推迟最多约 125 秒（WaitToKillServiceTimeout），
-有充足时间完成：刷卷缓存 → 尽力离线（纯加速）→ **无条件深度休眠** → 黑名单。
-其余方案（GPO 关机脚本 / WMI 事件 / 任务计划事件触发）都会被提前终止。
-
-> 策略已定稿（第 11 轮实测通过），固定技术原则见
-> `docs/TECH_NOTES_弹出休眠机制.md` §8.38「技术原则（定稿）」：
-> 深睡(ATA SLEEP 0xE6)本身就是黑名单，必须无条件执行；
-> 离线/卸载只是可选加速，绝不成为深睡的前提。
-
-服务安装为"自动启动"（LocalSystem），平时休眠等待，关机时工作；
-GUI 负责在每次启动时确保服务已安装且正在运行。
-
-本环境的 pywin32 实现注意：win32service 不导出 StartServiceCtrlDispatcher，
-必须走 `win32serviceutil.ServiceFramework` + `servicemanager.Initialize /
-StartServiceCtrlDispatcher`，PRESHUTDOWN 通过重写 GetAcceptedControls +
-SvcOther(15) 接收。
+Offline reduces later filesystem requests; failure does not prevent SLEEP.
+Command acceptance is not proof of sustained physical spin-down.
 """
 
 import logging
@@ -78,170 +51,138 @@ def _refresh_disk_cache():
         return []
 
 
-def _park_all_disks(cached=None):
-    """关机停转（v12）：刷卷缓存 → 尽力离线(纯加速) → **无条件深睡** → 移入黑名单。
-
-    用户方案定稿（v9/v10）：
-    - “关机时给硬盘深度休眠的命令，然后给 Windows 黑名单，让它整个关机流程
-      都不管外置硬盘”；
-    - “外置硬盘被程序占用无法卸载，但无法被卸载不代表无法被休眠：
-      休眠按钮按下后硬盘进入黑名单，所有程序都无法访问它”。
-
-    因此铁律：**深睡必须无条件执行**——不管卷能不能卸载、盘是否被占用，
-    都先深睡；深睡本身就是黑名单（盘不再响应任何程序，桥接芯片对后续
-    访问立刻回 3A/00，不会真把盘唤醒）。
-
-    第 11 轮教训：离线/等卷卸载绝不能成为深睡的前置条件（那是第 9 轮
-    失败的原因）。离线只是**可选加速**：
-    - 第 10 轮实测：深睡后卷仍挂载，内核关机阶段 flush 卷时命令发向
-      深睡盘超时 → UASPStor 复位设备，关机卡 58 秒；先离线（盘还转时
-      卷同步卸载）就没卷可 flush → 关机不卡。
-    - 离线失败/卷被占用：**直接跳过，不等待、不阻塞**，照常深睡。
-      （这一分支等价于第 10 轮已确认生效的纯深睡方案。）
-
-    v12 每块外置盘流程：
-    1. 刷文件系统缓存（尽力而为，数据安全）；
-    2. 尽力尝试 Windows 离线（Persist=False，下次开机自动在线）——
-       纯加速，不等卷卸载完成；
-    3. 无条件深睡（瞬时失败重试，最多 3 次）；若离线成功却深睡失败，
-       恢复在线再重试一次（离线后 ATA 透传可能失败；深睡优先于离线）；
-    4. 深睡成功 → 移入本程序黑名单。
-    """
+def _validate_target_handle(handle, disk):
+    """Check the actual opened disk, before sending any modifying commands."""
+    import ctypes as C
     from src.hal.win32_api import Win32API
-    from src.core.device_manager import DeviceManager
+    handle = C.c_void_p(handle)
+    if Win32API.get_device_number(handle) != disk["index"]:
+        raise RuntimeError("磁盘编号已变化，拒绝操作")
+    query = (C.c_ubyte * 12)()
+    descriptor = (C.c_ubyte * 4096)()
+    ok, count, error = Win32API.device_io_control(
+        handle, 0x2D1400, C.byref(query), C.sizeof(query),
+        C.byref(descriptor), C.sizeof(descriptor))
+    raw = bytes(descriptor[:count])
+    if not ok or len(raw) < 36:
+        raise RuntimeError(f"无法核对磁盘身份: {error}")
+    offset = int.from_bytes(raw[24:28], "little")
+    if not 36 <= offset < len(raw):
+        raise RuntimeError("磁盘序列号描述符无效")
+    serial = raw[offset:].split(b"\0", 1)[0].decode("ascii", "replace")
+    normalize = lambda value: "".join(str(value).split()).upper()
+    if normalize(serial) != normalize(disk["serial_number"]) or raw[28] != 7:
+        raise RuntimeError("实际句柄序列号或 USB 总线与白名单目标不匹配")
 
-    snap = _load_shared_disk_snapshot()
-    sleeping = set((snap or {}).get("sleeping") or [])
-    disks = cached or _refresh_disk_cache()
-    if not disks:
-        disks = _refresh_disk_cache()
 
-    # 卷映射（Win32，无 WMI）：用于刷卷缓存
-    by_disk = {}
-    try:
-        for letter, idx in (Win32API.get_volume_disk_mapping() or {}).items():
-            by_disk.setdefault(idx, []).append(f"{letter}:")
-    except Exception as e:
-        logging.warning(f"[Svc] 卷映射失败: {e}")
+def _set_offline_handle(handle, offline):
+    """Use the already validated handle; never reopen a possibly reassigned index."""
+    import ctypes as C
+    from src.hal.win32_api import Win32API
+    attrs = Win32API.SET_DISK_ATTRIBUTES()
+    attrs.Version = C.sizeof(attrs)
+    attrs.Persist = 0
+    attrs.AttributesMask = Win32API.DISK_ATTRIBUTE_OFFLINE
+    attrs.Attributes = attrs.AttributesMask if offline else 0
+    ok, _, error = Win32API.device_io_control(
+        C.c_void_p(handle), Win32API.IOCTL_DISK_SET_DISK_ATTRIBUTES,
+        C.byref(attrs), C.sizeof(attrs), None, 0)
+    return bool(ok), error
 
-    started = time.time()
+
+def _park_all_disks(cached=None):
+    from src.core.disk_whitelist import disk_id, is_external_disk
+    from src.hal.asm_commander import ASMCommander
+    from src.hal.win32_api import Win32API
+    from src.utils.paths import get_base_path
+    import os
+    snap = _load_shared_disk_snapshot() or {}
+    allowed = set(snap.get("managed_disk_whitelist") or [])
+    sleeping = set(snap.get("sleeping") or [])
+    targets = []
+    seen = set()
+    for disk in snap.get("disks", []):
+        idx = disk.get("index")
+        if (not isinstance(idx, int) or idx < 0 or idx in seen or
+                not disk_id(disk) or disk_id(disk) not in allowed or
+                not is_external_disk(disk)):
+            continue
+        seen.add(idx)
+        if disk.get("serial_number") not in sleeping:
+            targets.append(disk)
+    if not targets:
+        return 0
+    # Only metadata mapping, once, before any disk is put to sleep.
+    mapping = Win32API.get_volume_disk_mapping() or {}
+    protected_letters = {os.path.splitdrive(get_base_path())[0].rstrip(":").upper(),
+                         os.environ.get("SystemDrive", "C:").rstrip(":").upper()}
+    protected = {idx for letter, idx in mapping.items()
+                 if str(letter).rstrip(":").upper() in protected_letters}
     ok_count = 0
-    for d in disks:
-        idx = getattr(d, "index", None)
-        if idx is None:
+    for disk in targets:
+        idx = disk["index"]
+        if idx in protected:
+            logging.warning("[Svc] 磁盘 %s 承载系统或程序目录，跳过停转", idx)
             continue
-        serial = getattr(d, "serial_number", None)
-        model = getattr(d, "model", None) or f"Disk{idx}"
-        pnp = (getattr(d, "pnp_id", "") or "").upper()
-        is_external = bool(getattr(d, "is_removable", False)) or \
-            "USB" in pnp or "UASP" in pnp
-        if not is_external or (serial and serial in sleeping):
-            logging.info(f"[Svc] 跳过磁盘 {idx} ({model})：已休眠或非外置")
-            continue
-
-        t0 = time.time()
+        started = time.monotonic()
         try:
-            volumes = by_disk.get(idx, [])
-
-            # 1) 刷文件系统缓存（不锁卷、不卸载卷：被占用也能刷，数据安全）
-            flushed = []
-            for vol in volumes:
-                try:
-                    handle = Win32API.open_volume(vol)
-                    if not handle:
+            with ASMCommander(idx, model_hint=disk.get("model"),
+                              serial_hint=disk.get("serial_number")) as cmd:
+                if not cmd.handle:
+                    raise RuntimeError("无法打开目标磁盘")
+                _validate_target_handle(cmd.handle, disk)
+                for letter, number in mapping.items():
+                    if number != idx:
                         continue
+                    volume = str(letter).rstrip(":") + ":"
                     try:
-                        ok_f, _ = Win32API.flush_volume_buffers(handle)
-                        if ok_f:
-                            flushed.append(vol)
-                    finally:
-                        Win32API.close_handle(handle)
-                except Exception:
-                    pass
-
-            # 2) 尽力离线（纯加速，绝不决定/阻塞深睡）：盘还转时卷同步卸载，
-            #    消除第 10 轮实测的内核关机 flush 卡 58 秒。失败就直接跳过。
-            offline_ok = False
-            try:
-                offline_ok, off_err = Win32API.set_disk_offline(idx, offline=True)
-            except Exception:
-                offline_ok = False
-
-            # 3) 无条件深睡（与“立即休眠硬盘”按钮同机制）——
-            #    铁律：不管卷卸没卸掉、盘是否被占用，都必须执行。
-            #    瞬时失败重试，最多 3 次；离线成功却深睡失败时恢复在线再重试。
-            ok = False
-            msg = "未执行"
-            for attempt in range(3):
-                if attempt:
-                    time.sleep(1.0)
-                ok, msg, _ = DeviceManager.deep_sleep_disk(idx, model=model, serial=serial)
-                if ok:
-                    break
-                if attempt == 0 and offline_ok:
-                    # 离线后 ATA 透传可能失败：恢复在线再试，深睡优先于离线
-                    try:
-                        Win32API.set_disk_offline(idx, offline=False)
-                    except Exception:
-                        pass
-                    offline_ok = False
-
-            # 4) 移入本程序黑名单
-            if ok and serial:
-                sleeping.add(serial)
-
-            if ok:
-                ok_count += 1
-                note = f"{'已离线' if offline_ok else '离线未生效，直接深睡'}"
-                if flushed:
-                    note += "，已刷卷 " + ",".join(flushed)
-                logging.info(
-                    f"[Svc] 磁盘 {idx} ({model}) 已深睡并移入黑名单（{note}）"
-                    f" ({time.time() - t0:.1f}s)"
-                )
-            else:
-                logging.warning(f"[Svc] 磁盘 {idx} 深睡失败: {msg} ({time.time() - t0:.1f}s)")
-        except Exception as e:
-            logging.warning(f"[Svc] 磁盘 {idx} 深睡异常: {e}")
-
-    logging.info(f"[Svc] 关机停转完成: {ok_count} 块已深睡，耗时 {time.time() - started:.1f}s")
+                        handle = Win32API.open_volume(volume)
+                        if handle:
+                            try:
+                                flushed, error = Win32API.flush_volume_buffers(handle)
+                                logging.info("[Svc] 磁盘 %s 卷刷新=%s error=%s", idx, flushed, error)
+                            finally:
+                                Win32API.close_handle(handle)
+                    except Exception as exc:
+                        logging.warning("[Svc] 磁盘 %s 卷刷新失败: %s", idx, exc)
+                try:
+                    flush_ok = cmd.flush_cache(timeout=3)
+                except Exception as exc:
+                    flush_ok = False
+                    logging.warning("[Svc] 磁盘 %s ATA FLUSH 失败: %s", idx, exc)
+                logging.info("[Svc] 磁盘 %s 缓存准备结束 FLUSH=%s 耗时=%.3fs",
+                             idx, flush_ok, time.monotonic() - started)
+                offline_start = time.monotonic()
+                try:
+                    offline, error = _set_offline_handle(cmd.handle, True)
+                except Exception as exc:
+                    offline, error = False, str(exc)
+                logging.info("[Svc] 磁盘 %s 临时离线=%s error=%s 耗时=%.3fs",
+                             idx, offline, error, time.monotonic() - offline_start)
+                # Offline failure must not veto SLEEP. No STANDBY fallback.
+                ok = cmd.sleep_only()
+                if not ok and offline:
+                    # Historical bridge fallback; at most one retry and no reset.
+                    restored, error = _set_offline_handle(cmd.handle, False)
+                    offline = not restored
+                    if restored:
+                        logging.warning("[Svc] 磁盘 %s 离线透传失败，恢复在线后重试一次 SLEEP", idx)
+                        ok = cmd.sleep_only()
+                ok_count += int(bool(ok))
+                logging.info("[Svc] 磁盘 %s SLEEP已接受=%s 保持离线=%s 总耗时=%.3fs",
+                             idx, ok, offline, time.monotonic() - started)
+                if ok and not offline:
+                    logging.warning("[Svc] 磁盘 %s 已尝试停转但未隔离卷，仍可能发生系统超时或复位", idx)
+                # No probes/flush/online operations after successful SLEEP.
+        except Exception:
+            logging.exception("[Svc] 磁盘 %s 关机处理异常", idx)
+    logging.info("[Svc] 关机停转命令完成: %s/%s 块已接受", ok_count, len(targets))
     return ok_count
 
 
 def bring_all_external_disks_online(cached=None):
-    """开机恢复：把上次关机时离线的外置盘重新上线（卷自动重新挂载）。
-
-    离线状态会被 Windows 持久化，若不开机恢复，用户下次开机会发现盘符消失。
-    服务启动时和 GUI 启动时各执行一次（幂等）。
-    """
-    from src.hal.win32_api import Win32API
-
-    disks = cached
-    if not disks:
-        snap = _load_shared_disk_snapshot()
-        if snap:
-            from types import SimpleNamespace
-            disks = [SimpleNamespace(**d) for d in snap.get("disks", [])]
-
-    n = 0
-    for d in disks or []:
-        idx = getattr(d, "index", None)
-        if idx is None:
-            continue
-        pnp = (getattr(d, "pnp_id", "") or "").upper()
-        is_external = bool(getattr(d, "is_removable", False)) or \
-            "USB" in pnp or "UASP" in pnp
-        if not is_external:
-            continue
-        try:
-            ok, _ = Win32API.set_disk_offline(idx, offline=False)
-            if ok:
-                n += 1
-        except Exception as e:
-            logging.warning(f"[Svc] 磁盘 {idx} 恢复上线异常: {e}")
-    if n:
-        logging.info(f"[Svc] 开机恢复: {n} 块外置盘已重新上线")
-    return n
+    """Persist=False restores on re-enumeration; never online disks by stale indices."""
+    return 0
 
 
 def _make_service_class():
@@ -252,11 +193,8 @@ def _make_service_class():
     class ShutdownParkService(win32serviceutil.ServiceFramework):
         _svc_name_ = SERVICE_NAME
         _svc_display_name_ = SERVICE_DISPLAY_NAME
-        _svc_description_ = (
-            "在 Windows 关机流程的 pre-shutdown 阶段，对外置硬盘发送 "
-            "FLUSH CACHE + ATA SLEEP 深睡（深睡后盘不响应任何程序，"
-            "等同于进入黑名单），保证断电时硬盘已停转；无需卸载卷。"
-        )
+        _svc_description_ = "仅对 GUI 白名单中的 USB 硬盘逐盘执行安全停转；失败时不强制停转。"
+
 
         def __init__(self, args):
             super().__init__(args)
@@ -265,9 +203,10 @@ def _make_service_class():
             self._cache = None
 
         def GetAcceptedControls(self):
-            # 关键：接受 SERVICE_CONTROL_PRESHUTDOWN（0x0F）
+            # Reserve time for cache flush/offline before final storage shutdown.
             accepted = super().GetAcceptedControls()
             accepted |= getattr(win32service, "SERVICE_ACCEPT_PRESHUTDOWN", 0x100)
+            accepted |= win32service.SERVICE_ACCEPT_SHUTDOWN
             return accepted
 
         def SvcStop(self):
@@ -277,48 +216,28 @@ def _make_service_class():
             win32event.SetEvent(self.hWaitStop)
 
         def SvcShutdown(self):
-            # 关机（若系统未发 PRESHUTDOWN 也会走到这里）
             logging.info("[Svc] 收到 SERVICE_CONTROL_SHUTDOWN，准备执行关机停转")
             self._park_requested = True
-            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING, waitHint=60000)
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING, waitHint=10000)
             win32event.SetEvent(self.hWaitStop)
 
         def SvcOther(self, control):
-            preshutdown = getattr(win32service, "SERVICE_CONTROL_PRESHUTDOWN", 15)
-            if control == preshutdown:
-                # 应用已全部退出、其他服务尚未停止、文件系统 flush 之前 —— 最正确的时机
-                logging.info("[Svc] 收到 SERVICE_CONTROL_PRESHUTDOWN，准备执行关机停转")
+            if control == getattr(win32service, "SERVICE_CONTROL_PRESHUTDOWN", 15):
+                logging.info("[Svc] 收到 SERVICE_CONTROL_PRESHUTDOWN，执行临时离线与停转")
                 self._park_requested = True
-                self.ReportServiceStatus(
-                    win32service.SERVICE_STOP_PENDING, waitHint=60000
-                )
+                self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING, waitHint=30000)
                 win32event.SetEvent(self.hWaitStop)
 
         def SvcDoRun(self):
-            logging.info("[Svc] 服务已启动，等待关机通知（SERVICE_CONTROL_PRESHUTDOWN）...")
-            self._cache = _refresh_disk_cache()
-
-            # 开机恢复：把上次关机时离线的外置盘重新上线（卷自动重新挂载）。
-            # 离线用 Persist=False 理论上下次开机自动在线，这里兜底执行一次（幂等）。
-            try:
-                bring_all_external_disks_online(self._cache)
-            except Exception as e:
-                logging.warning(f"[Svc] 开机恢复执行异常: {e}")
-
-            last_refresh = time.time()
-
+            logging.info("[Svc] 服务已启动，等待 SERVICE_CONTROL_PRESHUTDOWN（缓存刷新→临时离线→SLEEP）")
             while True:
-                rc = win32event.WaitForSingleObject(self.hWaitStop, 60000)
-                if rc == win32event.WAIT_TIMEOUT:
-                    # 周期刷新磁盘缓存（关机时 WMI 可能已停，届时直接用缓存）
-                    if time.time() - last_refresh >= 300:
-                        self._cache = _refresh_disk_cache() or self._cache
-                        last_refresh = time.time()
-                    continue
+                win32event.WaitForSingleObject(self.hWaitStop, win32event.INFINITE)
 
                 if self._park_requested:
                     try:
-                        _park_all_disks(self._cache)
+                        started = time.monotonic()
+                        _park_all_disks()
+                        logging.info("[Svc] 最终关机 SLEEP 总耗时 %.3fs", time.monotonic() - started)
                     except Exception as e:
                         logging.error(f"[Svc] 关机停转异常: {e}")
                     self._park_requested = False
@@ -390,6 +309,25 @@ def _sc(cmd_args, timeout=30):
         return -1, "", str(e)
 
 
+def remove_shutdown_service():
+    """Remove the obsolete pre-shutdown service before using the GUI sleep path."""
+    try:
+        _, out, _ = _sc(["query", SERVICE_NAME])
+        installed = "SERVICE_NAME" in (out or "") and "1060" not in (out or "")
+        if not installed:
+            return True
+        _sc(["stop", SERVICE_NAME], timeout=30)
+        code, delete_out, delete_err = _sc(["delete", SERVICE_NAME], timeout=20)
+        logging.info(
+            "[Svc] 已移除旧关机服务: code=%s %s %s",
+            code, (delete_out or "").strip(), (delete_err or "").strip()
+        )
+        return code == 0
+    except Exception:
+        logging.exception("[Svc] 移除旧关机服务失败")
+        return False
+
+
 def ensure_service_installed_and_running(exe_path):
     """确保服务已安装（指向当前 exe）且正在运行。
 
@@ -418,6 +356,23 @@ def ensure_service_installed_and_running(exe_path):
         logging.info(
             f"[Svc] 服务创建结果 {code}: {(out or '').strip()} {(err or '').strip()}"
         )
+
+    # This is an upper bound, not a fixed wait. SCM continues when we stop.
+    try:
+        import win32service
+        scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+        try:
+            service = win32service.OpenService(scm, SERVICE_NAME, win32service.SERVICE_CHANGE_CONFIG)
+            try:
+                win32service.ChangeServiceConfig2(
+                    service, win32service.SERVICE_CONFIG_PRESHUTDOWN_INFO, 30000)
+            finally:
+                win32service.CloseServiceHandle(service)
+        finally:
+            win32service.CloseServiceHandle(scm)
+    except Exception:
+        logging.exception("[Svc] 无法设置 30 秒预关机处理上限")
+        return False
 
     _, query_out, _ = _sc(["query", SERVICE_NAME])
     if "RUNNING" not in (query_out or ""):

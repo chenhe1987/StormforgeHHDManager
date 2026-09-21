@@ -20,7 +20,22 @@ class DiskInfo:
 
 class DeviceManager:
     @staticmethod
-    def get_physical_disks():
+    def is_managed_disk(disk_index):
+        """Fail closed: privileged ATA actions require explicit whitelist membership."""
+        try:
+            from src.core.config_manager import ConfigManager
+            from src.core.disk_whitelist import disk_id, is_external_disk
+            allowed = ConfigManager().get_managed_disk_whitelist()
+            if not allowed:
+                return False
+            return any(d.index == disk_index and is_external_disk(d) and disk_id(d) in allowed
+                       for d in DeviceManager.get_physical_disks(allowlist=allowed))
+        except Exception as exc:
+            logging.warning("白名单核对失败，拒绝操作磁盘 %s: %s", disk_index, exc)
+            return False
+
+    @staticmethod
+    def get_physical_disks(allowlist=None):
         disks = []
         try:
             c = wmi.WMI()
@@ -51,10 +66,19 @@ class DeviceManager:
                             if any(k in model_upper for k in ["EXTERNAL", "DOCK", "ENCLOSURE", "ASMT"]):
                                 is_removable = True
 
-                    # 尝试自动重命名设备 (FriendlyName)
+                    from src.core.disk_whitelist import disk_id
+                    from src.core.config_manager import ConfigManager
+                    allowed = (set(allowlist) if allowlist is not None
+                               else ConfigManager().get_managed_disk_whitelist())
+                    provisional = DiskInfo(
+                        drive.DeviceID, drive.Model, drive.SerialNumber, index,
+                        drive.InterfaceType, is_removable, pnp_id)
+
+                    # 非白名单磁盘只做只读枚举，禁止修改设备名称。
+                    # 已登记白名单磁盘才执行历史兼容重命名行为。
                     try:
                         pnp_id_full = device_map.get(index)
-                        if pnp_id_full:
+                        if pnp_id_full and disk_id(provisional) in allowed:
                             current_name = DeviceRenamer.get_friendly_name(pnp_id_full)
                             model_clean = drive.Model.strip()
                             if DeviceRenamer.should_rename(current_name, model_clean):
@@ -72,7 +96,7 @@ class DeviceManager:
                         index=index,
                         interface_type=drive.InterfaceType,
                         is_removable=is_removable,
-                        pnp_id=pnp_id_full
+                        pnp_id=pnp_id
                     )
                     disks.append(disk_info)
                     logging.debug(f"发现磁盘: {disk_info}")
@@ -128,6 +152,8 @@ class DeviceManager:
     def spin_down_disk(disk_index, model=None, serial=None):
         """发送 FLUSH CACHE + SLEEP 停转命令（不发送 TUR 验证，避免唤醒已休眠的盘）"""
         logging.info(f"正在尝试让磁盘 {disk_index} 进入休眠...")
+        if not DeviceManager.is_managed_disk(disk_index):
+            return False, "磁盘不在管理白名单中，已拒绝休眠命令"
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
@@ -145,6 +171,8 @@ class DeviceManager:
     def set_standby_timer(disk_index, minutes, model=None, serial=None):
         """设置硬盘的自动休眠时间"""
         try:
+            if not DeviceManager.is_managed_disk(disk_index):
+                return False, "磁盘不在管理白名单中，已拒绝修改"
             minutes = int(minutes)
             logging.info(f"正在尝试设置磁盘 {disk_index} 的休眠时间为 {minutes} 分钟...")
             from src.hal.asm_commander import ASMCommander
@@ -191,6 +219,8 @@ class DeviceManager:
         被程序占用也不影响休眠。
         """
         started_at = time.perf_counter()
+        if not DeviceManager.is_managed_disk(disk_index):
+            return False, "磁盘不在管理白名单中，已拒绝休眠命令", 0.0
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
@@ -211,6 +241,9 @@ class DeviceManager:
 
         只做 flush，不 lock/dismount：关机流程中锁卷会干扰 Windows 自己的卸载流程。
         """
+        if not DeviceManager.is_managed_disk(disk_index):
+            logging.info("跳过非白名单磁盘 %s 的卷缓存刷新", disk_index)
+            return []
         deadline = time.perf_counter() + timeout_seconds
         flushed = []
         try:
@@ -255,6 +288,8 @@ class DeviceManager:
         探测结果只写日志，用于事后判断策略是否真的生效。
         """
         started_at = time.perf_counter()
+        if not DeviceManager.is_managed_disk(disk_index):
+            return False, "磁盘不在管理白名单中，已拒绝关机停转命令", 0.0
         try:
             from src.hal.asm_commander import ASMCommander
             with ASMCommander(disk_index, model_hint=model, serial_hint=serial) as cmd:
@@ -284,7 +319,7 @@ class DeviceManager:
             return False, f"异常: {e}", elapsed
 
 if __name__ == "__main__":
-    # Test disk enumeration
+    # Diagnostic disk enumeration
     manager = DeviceManager()
     disks = manager.get_physical_disks()
     for disk in disks:

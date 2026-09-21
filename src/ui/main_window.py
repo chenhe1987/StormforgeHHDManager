@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QHBoxLayout, QW
                              QTableWidget, QTableWidgetItem, QHeaderView, QListWidget, 
                              QListWidgetItem, QFrame, QScrollArea, QPushButton, QSlider,
                              QDialog, QTextEdit, QFileDialog, QCheckBox, QInputDialog)
+from PySide6.QtWidgets import QTabWidget, QGridLayout
 from PySide6.QtGui import QIcon, QAction, QColor, QFont, QPalette, QPixmap
 from PySide6.QtCore import Qt, Slot, Signal, QSize, QThread, QTimer
 import logging
@@ -327,9 +328,11 @@ NVIDIA_STYLE = """
 QMainWindow {
     background-color: #0c0c0c;
     font-family: "OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 14px;
 }
 QWidget {
     font-family: "OPPO Sans", "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: #ffffff;
 }
 QWidget#CentralWidget {
     background-color: #0c0c0c;
@@ -337,20 +340,18 @@ QWidget#CentralWidget {
 QListWidget {
     background-color: #1a1a1a;
     border: none;
-    border-right: 1px solid #2d2d2d;
     outline: none;
-    padding: 10px;
+    padding: 0px;
 }
 QListWidget::item {
     background-color: #262626;
-    color: #ffffff;
-    border-radius: 4px;
-    margin-bottom: 8px;
-    padding: 15px;
+    border: 1px solid #2d2d2d;
+    border-radius: 6px;
+    margin: 3px 8px;
 }
 QListWidget::item:selected {
     background-color: #333333;
-    border-left: 4px solid #9147ff; /* Purple accent for selection */
+    border: 1px solid #9147ff;
 }
 QListWidget::item:hover {
     background-color: #2d2d2d;
@@ -359,64 +360,108 @@ QLabel {
     color: #ffffff;
 }
 QLabel#TitleLabel {
-    font-size: 24px;
+    font-size: 25px;
     font-weight: bold;
-    color: #9147ff; /* Changed to Purple */
-    margin-bottom: 10px;
+    color: #9147ff;
 }
 QLabel#StatusLabel {
     font-size: 14px;
     color: #aaaaaa;
-    margin-bottom: 20px;
 }
-QFrame#DetailCard {
+QFrame#Card, QFrame#DetailCard {
     background-color: #1a1a1a;
+    border: 1px solid #2d2d2d;
     border-radius: 8px;
-    padding: 20px;
 }
 QTableWidget {
     background-color: #1a1a1a;
     color: #ffffff;
     gridline-color: #2d2d2d;
-    border: none;
+    border: 1px solid #2d2d2d;
+    border-radius: 6px;
     selection-background-color: #333333;
 }
 QHeaderView::section {
     background-color: #262626;
-    color: #9147ff; /* Changed to Purple */
+    color: #9147ff;
     padding: 8px;
     border: none;
+    border-right: 1px solid #2d2d2d;
     font-weight: bold;
 }
-QScrollBar:vertical {
+QTabWidget::pane {
+    border: none;
+    background: transparent;
+    top: -1px;
+}
+QTabBar::tab {
+    background: transparent;
+    color: #aaaaaa;
+    padding: 10px 22px;
+    margin-right: 6px;
+    border-bottom: 2px solid transparent;
+    font-weight: bold;
+}
+QTabBar::tab:selected {
+    color: #ffffff;
+    border-bottom: 2px solid #9147ff;
+}
+QTabBar::tab:hover { color: #c19bff; }
+QPushButton {
+    min-height: 36px;
+    padding: 0 16px;
+    border-radius: 7px;
+    border: 1px solid #444444;
+    background-color: #333333;
+    color: #ffffff;
+    font-weight: bold;
+}
+QPushButton:hover { background-color: #444444; border-color: #666666; }
+QPushButton:pressed { background-color: #262626; }
+QPushButton:disabled { background-color: #1a1a1a; color: #666666; border-color: #2d2d2d; }
+QPushButton#PrimaryAction {
+    background-color: #76b900;
+    color: #000000;
+    border-color: #76b900;
+    min-height: 42px;
+    padding: 0 24px;
+}
+QPushButton#PrimaryAction:hover { background-color: #88d000; }
+QPushButton#SecondaryAction {
+    background-color: #9147ff;
+    color: #ffffff;
+    border-color: #9147ff;
+    min-height: 42px;
+    padding: 0 24px;
+}
+QPushButton#SecondaryAction:hover { background-color: #a66dff; border-color: #a66dff; }
+QCheckBox { spacing: 9px; color: #dddddd; }
+QCheckBox::indicator { width: 20px; height: 20px; }
+QSlider::groove:horizontal {
+    height: 6px;
     background: #1a1a1a;
-    width: 10px;
+    border: 1px solid #3d3d3d;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    width: 18px;
+    height: 18px;
+    margin: -6px 0;
+    background: #76b900;
+    border: 1px solid #76b900;
+    border-radius: 9px;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 9px;
 }
 QScrollBar::handle:vertical {
     background: #333333;
-    border-radius: 5px;
+    border-radius: 4px;
+    min-height: 40px;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
-}
-QPushButton#EjectButton {
-    background-color: #76b900; /* Reverted to Green */
-    color: #000000;
-    border: none;
-    border-radius: 4px;
-    padding: 10px 20px;
-    font-weight: bold;
-    font-size: 14px;
-}
-QPushButton#EjectButton:hover {
-    background-color: #88d000;
-}
-QPushButton#EjectButton:pressed {
-    background-color: #5c9100;
-}
-QPushButton#EjectButton:disabled {
-    background-color: #333333;
-    color: #666666;
 }
 QMenu {
     background-color: #1a1a1a;
@@ -428,7 +473,7 @@ QMenu::item {
 }
 QMenu::item:selected {
     background-color: #333333;
-    color: #9147ff; /* Changed to Purple */
+    color: #9147ff;
 }
 QMessageBox {
     background-color: #1a1a1a;
@@ -436,21 +481,12 @@ QMessageBox {
 QMessageBox QLabel {
     color: #ffffff;
 }
-QMessageBox QPushButton {
-    background-color: #333333;
-    color: #ffffff;
-    border: 1px solid #444444;
-    padding: 5px 15px;
-    min-width: 80px;
-}
-QMessageBox QPushButton:hover {
-    background-color: #444444;
-}
 """
 
 class MainWindow(QMainWindow):
     # Signal to update UI from background thread
     update_data_signal = Signal(list)
+    _refresh_done_signal = Signal(dict)
     _wake_done_signal = Signal(dict)
     # 注意：后台线程里**不能**用 QTimer.singleShot 回主线程——它依赖调用线程的
     # 事件循环，普通 threading.Thread 没有事件循环，回调永远不会触发
@@ -463,9 +499,10 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.78"
+        self.version = "1.3.84"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
-        self.resize(1100, 750)
+        self.resize(1220, 800)
+        self.setMinimumSize(1040, 680)
         self.setStyleSheet(NVIDIA_STYLE)
         
         # 提高进程关机优先级 (0x280 > 0x100)
@@ -495,6 +532,7 @@ class MainWindow(QMainWindow):
         
         # Connect signal
         self.update_data_signal.connect(self.handle_data_update)
+        self._refresh_done_signal.connect(self._on_refresh_done)
         self._wake_done_signal.connect(self._on_wake_complete)
         self._eject_done_signal.connect(self._on_eject_complete)
         self._spindown_done_signal.connect(self._on_spin_down_complete)
@@ -513,7 +551,7 @@ class MainWindow(QMainWindow):
         
         # Left Sidebar Area (Logo + List)
         self.sidebar_container = QWidget()
-        self.sidebar_container.setFixedWidth(280)
+        self.sidebar_container.setFixedWidth(340)
         self.sidebar_container.setStyleSheet("background-color: #1a1a1a; border-right: 1px solid #2d2d2d;")
         self.sidebar_layout = QVBoxLayout(self.sidebar_container)
         self.sidebar_layout.setContentsMargins(0, 0, 0, 0)
@@ -542,9 +580,29 @@ class MainWindow(QMainWindow):
         self.sidebar_layout.addWidget(self.logo_label)
 
         # Disk List
+        self.disk_list_title = QLabel("管理硬盘")
+        self.disk_list_title.setStyleSheet(
+            "color: #ffffff; font-size: 17px; font-weight: bold; padding: 4px 14px 0 14px;"
+        )
+        self.sidebar_layout.addWidget(self.disk_list_title)
+        self.disk_list_hint = QLabel("勾选“管理”后，程序才会读取 SMART、休眠、弹出或在关机时停转该硬盘。")
+        self.disk_list_hint.setWordWrap(True)
+        self.disk_list_hint.setStyleSheet(
+            "color: #aaaaaa; font-size: 13px; padding: 2px 14px 10px 14px;"
+        )
+        self.sidebar_layout.addWidget(self.disk_list_hint)
+
         self.sidebar = QListWidget()
         self.sidebar.setFrameShape(QFrame.NoFrame) # Remove border as container has it
+        self.sidebar.setSpacing(3)
+        self.sidebar.setStyleSheet("""
+            QListWidget { background: #1a1a1a; border: none; outline: none; }
+            QListWidget::item { border-radius: 5px; margin: 0 7px; }
+            QListWidget::item:selected { background: #303030; }
+            QListWidget::item:hover { background: #252525; }
+        """)
         self.sidebar.itemClicked.connect(self.on_disk_selected)
+        self._whitelist_checkboxes = {}
         # Give stretch to list so it takes available space
         self.sidebar_layout.addWidget(self.sidebar, 1)
 
@@ -556,8 +614,8 @@ class MainWindow(QMainWindow):
         self.settings_layout.setSpacing(8)
 
         # 1. Refresh Button (Green)
-        self.refresh_btn = QPushButton("刷新设备列表（有风险）")
-        self.refresh_btn.setToolTip("不建议使用：可能重置其他 USB 硬盘柜。请先关闭目标硬盘柜上的读写任务，再重启该硬盘柜。")
+        self.refresh_btn = QPushButton("刷新硬盘状态")
+        self.refresh_btn.setToolTip("重新读取已管理硬盘的状态，不重启硬盘柜或存储控制器。")
         self.refresh_btn.setObjectName("RefreshButton")
         self.refresh_btn.setFixedHeight(38)
         self.refresh_btn.setStyleSheet("""
@@ -573,9 +631,11 @@ class MainWindow(QMainWindow):
         """)
         self.refresh_btn.clicked.connect(self.on_refresh_clicked)
         self.settings_layout.addWidget(self.refresh_btn)
-        refresh_warning = QLabel("不建议刷新：请先关闭读写任务，\n再重启对应硬盘柜。")
-        refresh_warning.setWordWrap(True)
-        self.settings_layout.addWidget(refresh_warning)
+        self.refresh_warning = QLabel("如设备未出现，建议关闭读写任务后重启对应硬盘柜。")
+        self.refresh_warning.setWordWrap(True)
+        self.refresh_warning.setStyleSheet("color: #8f9bac; font-size: 12px;")
+        self.settings_layout.addWidget(self.refresh_warning)
+
 
         # 2. Check Update Button (Purple accent)
         self.check_update_btn = QPushButton("检查软件更新")
@@ -621,11 +681,11 @@ class MainWindow(QMainWindow):
         self.settings_layout.addWidget(self.autostart_checkbox)
 
         # 5. Shutdown Auto-Eject Checkbox — 驱动级功能：固定启用
-        self.shutdown_eject_checkbox = QCheckBox("关机/休眠时自动休眠硬盘（驱动级，固定开启）")
+        self.shutdown_eject_checkbox = QCheckBox("关机/休眠时自动停转白名单硬盘（固定开启）")
         self.shutdown_eject_checkbox.setStyleSheet("color: #888888; font-size: 12px; padding: 5px;")
         self.shutdown_eject_checkbox.setChecked(True)
         self.shutdown_eject_checkbox.setEnabled(False)
-        self.shutdown_eject_checkbox.setToolTip("系统关机或休眠时，自动向所有外置硬盘发送 SLEEP 停转保护。")
+        self.shutdown_eject_checkbox.setToolTip("系统关机时仅处理白名单外置硬盘；休眠事件遵循相同白名单限制。")
         self.settings_layout.addWidget(self.shutdown_eject_checkbox)
 
         # 6. Safe Removal Spin-Down Patch Checkbox — 驱动级功能：固定启用
@@ -854,14 +914,17 @@ class MainWindow(QMainWindow):
         scroll.setWidget(self.scroll_content)
         self.detail_layout.addWidget(scroll)
 
+        # Rebuild the screen into a clear desktop information architecture while
+        # retaining the established widgets and their signal connections.
+        self._apply_formal_layout(scroll)
+
         # Tray Icon Setup
         logging.info("正在设置系统托盘...")
         self.setup_tray()
 
         self.current_disk_serial = None # Track currently selected disk
 
-        # 开机恢复（兜底）：关机停转服务在关机时会把外置盘设为 Windows 离线
-        # （配合深睡消除关机卡顿），这里在监控启动前把盘恢复上线，保证盘符已回来。
+        # 开机恢复（兜底）：旧版本可能留下离线/隔离记录；当前关机路径只做深度休眠。
         try:
             from src.core.shutdown_service import bring_all_external_disks_online
             if not self.config_manager.config.get("eject_quarantine"):
@@ -881,42 +944,40 @@ class MainWindow(QMainWindow):
 
         # Windows 原生托盘弹出不由本程序接管；停转与弹出统一从 GUI 发起。
 
-        # 关机/休眠停转策略（对齐 Windows 内置盘做法：FLUSH CACHE + STANDBY IMMEDIATE，
-        # 不使用 ATA SLEEP，不长时间阻塞关机），同时负责不安全关机计数核对。
+        # 关机/休眠与界面的“立即休眠”使用同一深度休眠路径。
         self.shutdown_guard = ShutdownGuard(
             config_manager=self.config_manager,
             monitor_service=self.monitor_service,
         )
 
-        # 驱动级常驻：启动即注册开机自启动（--silent 静默运行），
-        # 并强制固化配置，确保关机/休眠保护与系统弹出停转始终生效。
+        # 正式版常驻设置：启动即注册开机自启动，并固化关机与弹出保护开关。
         try:
             if not self.config_manager.is_autostart_enabled():
                 if self.config_manager.set_autostart(True):
-                    logging.info("已自动注册开机自启动（驱动级常驻）")
+                    logging.info("已自动注册开机自启动")
             self.config_manager.set_shutdown_eject(True)
             self.config_manager.set_safe_remove_spindown(True)
-            logging.info("驱动级保护配置已固化：开机自启 + 关机休眠 + 弹出停转")
         except Exception as e:
-            logging.warning(f"驱动级常驻配置失败: {e}")
+            logging.warning(f"常驻保护配置失败: {e}")
 
-        # 关机停转服务（pre-shutdown）：在 Windows 关机流程的正确阶段
-        # （应用已退出、卷可卸载、断电之前）执行 锁卷→卸载卷→停转。
-        # GUI 只负责确保服务已安装且正在运行。
+        # 关机最终停转必须由 LocalSystem PRESHUTDOWN 服务完成。
+        # WM_QUERYENDSESSION 只负责冻结后台访问；此时 Windows 仍可能在应用退出后
+        # 刷新卷，若在这里直接 SLEEP，后续收尾会把硬盘重新唤醒。
         try:
+            import sys
             from src.core.shutdown_service import ensure_service_installed_and_running
-            self._shutdown_svc_available = ensure_service_installed_and_running(
-                exe_path=sys.executable
+            self._shutdown_svc_available = bool(
+                ensure_service_installed_and_running(sys.executable)
             )
-            logging.info(
-                f"关机停转服务: {'运行中' if self._shutdown_svc_available else '不可用，将降级为 QES 立即停转'}"
-            )
+            if self._shutdown_svc_available:
+                logging.info("关机停转服务已就绪（PRESHUTDOWN，临时离线后 SLEEP）")
+            else:
+                logging.warning("关机停转服务不可用，关机时将使用 GUI 兜底路径")
         except Exception as e:
             self._shutdown_svc_available = False
-            logging.warning(f"关机停转服务初始化失败: {e}")
+            logging.warning(f"注册关机停转服务失败，关机时将使用 GUI 兜底路径: {e}")
 
-        # 给关机停转服务（SYSTEM 会话）写共享磁盘清单：服务进程里 WMI 枚举不可靠
-        # （实测返回 0 个设备），所以由 GUI 把物理盘清单 + 休眠名单落盘，服务直接读。
+        # 保存物理盘与白名单快照，供日志核对和启动后的状态恢复使用。
         self._write_shutdown_disks_snapshot()
         self._svc_snapshot_timer = QTimer(self)
         self._svc_snapshot_timer.setInterval(60000)
@@ -926,8 +987,227 @@ class MainWindow(QMainWindow):
         self.status_label.setText("监控服务运行中 (系统日志实时监控)")
         logging.info("MainWindow 初始化完成")
 
+    def _apply_formal_layout(self, legacy_scroll):
+        """Arrange existing controls by task: select, inspect, act, configure."""
+        self.sidebar_container.setFixedWidth(330)
+        self.sidebar_container.setStyleSheet(
+            "background-color: #1a1a1a; border-right: 1px solid #2d2d2d;"
+        )
+        self.logo_label.setContentsMargins(0, 14, 0, 10)
+        self.logo_label.setMaximumHeight(92)
+        self.disk_list_title.setText("硬盘列表")
+        self.disk_list_title.setStyleSheet(
+            "color: #ffffff; font-size: 18px; font-weight: bold; padding: 8px 16px 2px 16px;"
+        )
+        self.disk_list_hint.setText("勾选硬盘前的“纳入管理”，程序才会读取状态或执行休眠、弹出。")
+        self.disk_list_hint.setStyleSheet(
+            "color: #aaaaaa; font-size: 13px; padding: 2px 16px 10px 16px;"
+        )
+        self.sidebar.setSpacing(4)
+        self.sidebar.setStyleSheet("""
+            QListWidget { background: #1a1a1a; border: none; outline: none; }
+            QListWidget::item { background: #262626; border: 1px solid #2d2d2d;
+                                border-radius: 6px; margin: 3px 8px; }
+            QListWidget::item:selected { background: #333333; border: 1px solid #9147ff; }
+            QListWidget::item:hover { background: #2d2d2d; }
+        """)
+
+        # Maintenance and protection controls belong to Settings, not the disk picker.
+        self.settings_container.hide()
+        legacy_scroll.hide()
+        while self.detail_layout.count():
+            self.detail_layout.takeAt(0)
+        self.detail_layout.setContentsMargins(28, 24, 28, 24)
+        self.detail_layout.setSpacing(16)
+
+        self.shutdown_notice = QFrame()
+        self.shutdown_notice.setObjectName("ShutdownNotice")
+        self.shutdown_notice.setStyleSheet("""
+            QFrame#ShutdownNotice { background: #2a2116; border: 1px solid #725124; border-radius: 8px; }
+            QLabel#NoticeTitle { color: #ffd18b; font-size: 14px; font-weight: bold; }
+            QLabel#NoticeText { color: #e0c49a; font-size: 13px; }
+        """)
+        notice_layout = QHBoxLayout(self.shutdown_notice)
+        notice_layout.setContentsMargins(16, 11, 16, 11)
+        notice_layout.setSpacing(14)
+        notice_mark = QLabel("!")
+        notice_mark.setAlignment(Qt.AlignCenter)
+        notice_mark.setFixedSize(30, 30)
+        notice_mark.setStyleSheet(
+            "background: #d9942b; color: #17110a; border-radius: 15px; font-size: 18px; font-weight: 700;"
+        )
+        notice_text_layout = QVBoxLayout()
+        notice_text_layout.setSpacing(2)
+        notice_title = QLabel("关机前，请先保存文件，等待传输完成")
+        notice_title.setObjectName("NoticeTitle")
+        notice_text = QLabel("① 保存正在编辑的文件，并关闭使用这些文件的软件。② 等待硬盘柜上的复制、移动、下载和备份完成，再点击 Windows“关机”。程序会向勾选“纳入管理”的硬盘发送休眠命令。")
+        notice_text.setObjectName("NoticeText")
+        notice_text.setWordWrap(True)
+        notice_text_layout.addWidget(notice_title)
+        notice_text_layout.addWidget(notice_text)
+        notice_layout.addWidget(notice_mark, 0, Qt.AlignVCenter)
+        notice_layout.addLayout(notice_text_layout, 1)
+        self.detail_layout.addWidget(self.shutdown_notice)
+
+        header_card = QFrame()
+        header_card.setObjectName("Card")
+        header_layout = QHBoxLayout(header_card)
+        header_layout.setContentsMargins(20, 16, 20, 16)
+        header_layout.setSpacing(18)
+        identity_layout = QVBoxLayout()
+        identity_layout.setSpacing(5)
+        self.title_label.setText("请选择一块硬盘")
+        self.title_label.setStyleSheet("")
+        self.status_label.setText("等待硬盘状态")
+        self.status_label.setStyleSheet("")
+        identity_layout.addWidget(self.title_label)
+        identity_layout.addWidget(self.status_label)
+        header_layout.addLayout(identity_layout, 1)
+
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(10)
+        self.spin_down_button.setText("立即休眠")
+        self.spin_down_button.setObjectName("SecondaryAction")
+        self.spin_down_button.setStyleSheet("")
+        self.spin_down_button.setFixedWidth(150)
+        self.eject_button.setText("停转并安全弹出")
+        self.eject_button.setObjectName("PrimaryAction")
+        self.eject_button.setStyleSheet("")
+        self.eject_button.setFixedWidth(190)
+        action_layout.addWidget(self.spin_down_button)
+        action_layout.addWidget(self.eject_button)
+        header_layout.addLayout(action_layout)
+        self.detail_layout.addWidget(header_card)
+
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setDocumentMode(True)
+
+        overview_tab = QWidget()
+        overview_tab_layout = QVBoxLayout(overview_tab)
+        overview_tab_layout.setContentsMargins(0, 14, 0, 0)
+        overview_scroll = QScrollArea()
+        overview_scroll.setWidgetResizable(True)
+        overview_scroll.setFrameShape(QFrame.NoFrame)
+        overview_scroll.setStyleSheet("background: transparent;")
+        overview_content = QWidget()
+        overview_content_layout = QVBoxLayout(overview_content)
+        overview_content_layout.setContentsMargins(0, 0, 6, 0)
+        overview_content_layout.setSpacing(14)
+        self.summary_card.setObjectName("Card")
+        self.summary_layout.setContentsMargins(18, 16, 18, 18)
+        self.summary_label.setStyleSheet("color: #76b900; font-size: 16px; font-weight: bold;")
+        self.summary_table.setFixedHeight(220)
+        overview_content_layout.addWidget(self.summary_card)
+        self.advice_card.setObjectName("Card")
+        self.advice_layout.setContentsMargins(18, 16, 18, 18)
+        self.advice_title.setStyleSheet("color: #76b900; font-size: 16px; font-weight: bold;")
+        self.advice_text.setStyleSheet("color: #ffffff; font-size: 14px; padding: 6px 2px;")
+        overview_content_layout.addWidget(self.advice_card)
+        overview_content_layout.addStretch()
+        overview_scroll.setWidget(overview_content)
+        overview_tab_layout.addWidget(overview_scroll)
+        self.main_tabs.addTab(overview_tab, "概览")
+
+        smart_tab = QWidget()
+        smart_tab_layout = QVBoxLayout(smart_tab)
+        smart_tab_layout.setContentsMargins(0, 14, 0, 0)
+        self.smart_card.setObjectName("Card")
+        self.smart_layout.setContentsMargins(18, 16, 18, 18)
+        self.smart_title.setStyleSheet("color: #76b900; font-size: 16px; font-weight: bold;")
+        self.table.setMinimumHeight(430)
+        smart_tab_layout.addWidget(self.smart_card)
+        self.main_tabs.addTab(smart_tab, "SMART 参数")
+
+        settings_tab = QWidget()
+        settings_tab_layout = QVBoxLayout(settings_tab)
+        settings_tab_layout.setContentsMargins(0, 14, 0, 0)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setStyleSheet("background: transparent;")
+        settings_content = QWidget()
+        settings_layout = QVBoxLayout(settings_content)
+        settings_layout.setContentsMargins(0, 0, 6, 0)
+        settings_layout.setSpacing(14)
+
+        monitor_card = QFrame()
+        monitor_card.setObjectName("Card")
+        monitor_layout = QVBoxLayout(monitor_card)
+        monitor_layout.setContentsMargins(18, 16, 18, 18)
+        monitor_layout.setSpacing(12)
+        monitor_title = QLabel("当前硬盘的监控设置")
+        monitor_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #76b900;")
+        monitor_help = QLabel("这些选项仅对左侧当前选中且已纳入管理的硬盘生效。")
+        monitor_help.setStyleSheet("color: #aaaaaa; font-size: 13px;")
+        monitor_layout.addWidget(monitor_title)
+        monitor_layout.addWidget(monitor_help)
+        for container in (self.interval_container, self.sleep_timer_container):
+            container.setStyleSheet("background: transparent;")
+            monitor_layout.addWidget(container)
+        self.interval_slider.setStyleSheet("")
+        self.sleep_timer_slider.setStyleSheet("""
+            QSlider::groove:horizontal { border: 1px solid #3d3d3d; height: 8px;
+                background: #1a1a1a; margin: 2px 0; border-radius: 4px; }
+            QSlider::handle:horizontal { background: #9147ff; border: 1px solid #9147ff;
+                width: 18px; height: 18px; margin: -7px 0; border-radius: 9px; }
+        """)
+        self.interval_label.setStyleSheet("color: #aaaaaa; font-size: 14px;")
+        self.sleep_timer_label.setStyleSheet("color: #aaaaaa; font-size: 14px;")
+        settings_layout.addWidget(monitor_card)
+
+        protection_card = QFrame()
+        protection_card.setObjectName("Card")
+        protection_layout = QVBoxLayout(protection_card)
+        protection_layout.setContentsMargins(18, 16, 18, 18)
+        protection_layout.setSpacing(10)
+        protection_title = QLabel("保护状态")
+        protection_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #76b900;")
+        protection_layout.addWidget(protection_title)
+        self.autostart_checkbox.setText("随 Windows 启动")
+        self.shutdown_eject_checkbox.setText("关机或系统休眠时，休眠已管理硬盘")
+        self.spindown_patch_checkbox.setText("安全弹出前先停转硬盘")
+        for checkbox in (self.autostart_checkbox, self.shutdown_eject_checkbox,
+                         self.spindown_patch_checkbox):
+            checkbox.setStyleSheet("color: #aaaaaa; font-size: 14px; padding: 3px;")
+            protection_layout.addWidget(checkbox)
+        self.windows_sleep_hint.setText(
+            "关机休眠采用与“立即休眠”相同的深度休眠命令。程序只处理左侧已纳入管理的硬盘。"
+        )
+        self.windows_sleep_hint.setStyleSheet(
+            "color: #999999; font-size: 13px; padding: 6px 2px;"
+        )
+        protection_layout.addWidget(self.windows_sleep_hint)
+        settings_layout.addWidget(protection_card)
+
+        maintenance_card = QFrame()
+        maintenance_card.setObjectName("Card")
+        maintenance_layout = QVBoxLayout(maintenance_card)
+        maintenance_layout.setContentsMargins(18, 16, 18, 18)
+        maintenance_layout.setSpacing(10)
+        maintenance_title = QLabel("应用维护")
+        maintenance_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #76b900;")
+        maintenance_layout.addWidget(maintenance_title)
+        maintenance_buttons = QHBoxLayout()
+        self.refresh_btn.setText("刷新硬盘状态")
+        self.refresh_btn.setStyleSheet("")
+        self.check_update_btn.setStyleSheet("")
+        self.export_logs_btn.setStyleSheet("")
+        for button in (self.refresh_btn, self.check_update_btn, self.export_logs_btn):
+            button.setFixedHeight(38)
+            maintenance_buttons.addWidget(button)
+        maintenance_layout.addLayout(maintenance_buttons)
+        self.refresh_warning.setStyleSheet("color: #999999; font-size: 12px;")
+        maintenance_layout.addWidget(self.refresh_warning)
+        settings_layout.addWidget(maintenance_card)
+        settings_layout.addStretch()
+        settings_scroll.setWidget(settings_content)
+        settings_tab_layout.addWidget(settings_scroll)
+        self.main_tabs.addTab(settings_tab, "设置")
+
+        self.detail_layout.addWidget(self.main_tabs, 1)
+
     def _write_shutdown_disks_snapshot(self):
-        """把物理盘清单与休眠名单写入 shutdown_disks.json，供关机停转服务读取。"""
+        """把物理盘清单与休眠名单写入共享快照，供日志核对使用。"""
         try:
             import json
             from src.utils.paths import get_base_path
@@ -937,14 +1217,18 @@ class MainWindow(QMainWindow):
                 sleeping = sorted(
                     getattr(self.monitor_service, 'sleeping_disks', set()) or set()
                 )
+            from src.core.disk_whitelist import disk_id
+            allowed = self.config_manager.get_managed_disk_whitelist()
             data = {
                 "written_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "sleeping": sleeping,
+                "managed_disk_whitelist": sorted(allowed),
                 "disks": [
                     {
                         "index": getattr(d, "index", None),
                         "model": getattr(d, "model", None) or "",
                         "serial_number": getattr(d, "serial_number", None) or "",
+                        "managed_id": disk_id(d),
                         "is_removable": bool(getattr(d, "is_removable", False)),
                         "pnp_id": getattr(d, "pnp_id", "") or "",
                     }
@@ -994,31 +1278,20 @@ class MainWindow(QMainWindow):
             selected_serial = current_item.data(Qt.UserRole).get("serial")
             
         self.sidebar.clear()
+        self._whitelist_checkboxes = {}
         for disk in data:
             model = disk.get("model", "Unknown")
             status = disk.get("status", "Unknown")
             is_removable = disk.get("is_removable", False)
             
-            # 简化显示，如果型号太长则截断
-            display_name = f"{model[:25]}..." if len(model) > 25 else model
-            display_text = f"{display_name} ({status})"
+            # 侧栏用两行大字显示，避免型号和状态挤在同一行。
+            display_name = f"{model[:30]}..." if len(model) > 30 else model
             
-            item = QListWidgetItem(display_text)
+            managed_id = disk.get("managed_id") or ""
+            from src.core.disk_whitelist import is_external_disk
+            item = QListWidgetItem()
             item.setData(Qt.UserRole, disk)
-            
-            # 创建一个小圆点图标来区分内外置
-            # 外置使用青色 (#00d4ff)，内置使用深灰色 (#555555)
-            dot_color = QColor("#00d4ff") if is_removable else QColor("#555555")
-            pixmap = QPixmap(12, 12)
-            pixmap.fill(Qt.transparent)
-            from PySide6.QtGui import QPainter, QBrush
-            painter = QPainter(pixmap)
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.setBrush(QBrush(dot_color))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(2, 2, 8, 8)
-            painter.end()
-            item.setIcon(QIcon(pixmap))
+            item.setSizeHint(QSize(310, 78))
             
             # 设置基本颜色（根据健康状态）
             if status == "Healthy":
@@ -1030,10 +1303,53 @@ class MainWindow(QMainWindow):
             else:
                 base_color = QColor("#ffffff")
                 
-            item.setForeground(base_color)
             item.setToolTip(f"{'外置/移动设备' if is_removable else '内置硬盘'} - {model}")
                 
             self.sidebar.addItem(item)
+
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(12, 8, 12, 8)
+            row_layout.setSpacing(12)
+
+            checkbox = QCheckBox("纳入管理")
+            eligible = bool(managed_id) and is_external_disk(disk)
+            checkbox.setEnabled(eligible)
+            checkbox.setChecked(eligible and
+                                managed_id in self.config_manager.get_managed_disk_whitelist())
+            checkbox.setText("✓ 已管理" if checkbox.isChecked() else "纳入管理")
+            checkbox.setMinimumWidth(98)
+            checkbox.setStyleSheet("""
+                QCheckBox { color: #dddddd; font-size: 13px; font-weight: bold; spacing: 7px; }
+                QCheckBox::indicator { width: 22px; height: 22px; }
+                QCheckBox::indicator:unchecked { background: #202020; border: 2px solid #888888; border-radius: 5px; }
+                QCheckBox::indicator:checked { background: #9147ff; border: 2px solid #b17aff; border-radius: 5px; }
+                QCheckBox:disabled { color: #666666; }
+                QCheckBox::indicator:disabled { background: #222222; border-color: #444444; }
+            """)
+            checkbox.setToolTip(
+                "勾选后才执行 SMART、休眠、弹出及关机停转；未勾选时仅显示设备信息。"
+                if eligible else "仅支持可识别的 USB/UASP 外置硬盘；序列号缺失或内置磁盘不能加入白名单。")
+
+            text_layout = QVBoxLayout()
+            text_layout.setContentsMargins(0, 0, 0, 0)
+            text_layout.setSpacing(2)
+            name_label = QLabel(display_name)
+            name_label.setStyleSheet("color: #ffffff; font-size: 16px; font-weight: bold;")
+            status_label = QLabel(status)
+            status_label.setStyleSheet(f"color: {base_color.name()}; font-size: 13px;")
+            text_layout.addWidget(name_label)
+            text_layout.addWidget(status_label)
+            row_layout.addWidget(checkbox, 0, Qt.AlignVCenter)
+            row_layout.addLayout(text_layout, 1)
+
+            checkbox.clicked.connect(
+                lambda checked, row=item, did=managed_id: self._on_whitelist_changed(row, did, checked))
+            name_label.mousePressEvent = lambda event, row=item: self._select_disk_row(row)
+            status_label.mousePressEvent = lambda event, row=item: self._select_disk_row(row)
+            self.sidebar.setItemWidget(item, row_widget)
+            if managed_id:
+                self._whitelist_checkboxes[managed_id] = checkbox
             
             # 恢复选中
             if selected_serial and disk.get("serial") == selected_serial:
@@ -1047,6 +1363,37 @@ class MainWindow(QMainWindow):
         if self.sidebar.currentItem():
             self.on_disk_selected(self.sidebar.currentItem())
 
+    def _select_disk_row(self, item):
+        self.sidebar.setCurrentItem(item)
+        self.on_disk_selected(item)
+
+    def _on_whitelist_changed(self, item, managed_id, checked):
+        if not managed_id:
+            return
+        disk = item.data(Qt.UserRole) or {}
+        from src.core.disk_whitelist import is_external_disk
+        if checked and not is_external_disk(disk):
+            checkbox = self._whitelist_checkboxes.get(managed_id)
+            if checkbox:
+                checkbox.setChecked(False)
+            return
+        self.sidebar.setCurrentItem(item)
+        self.config_manager.set_disk_managed(managed_id, checked)
+        checkbox = self._whitelist_checkboxes.get(managed_id)
+        if checkbox:
+            checkbox.setText("✓ 已管理" if checked else "纳入管理")
+        try:
+            from src.core.safe_shutdown import arm_whitelist
+            arm_whitelist(self.config_manager.get_managed_disk_whitelist())
+        except Exception:
+            logging.exception("更新关机白名单状态失败")
+        if hasattr(self, 'monitor_service'):
+            self.monitor_service.reset_unmanaged_idle_timers()
+            threading.Thread(target=self.monitor_service.check_all_smart,
+                             kwargs={'force': True}, daemon=True).start()
+        self._write_shutdown_disks_snapshot()
+        self.on_disk_selected(item)
+
     def on_interval_changed(self, value):
         minutes = value
         if minutes < 60:
@@ -1057,7 +1404,7 @@ class MainWindow(QMainWindow):
         self.interval_label.setText(f"SMART 检测频率: {text}/次")
         
     def on_interval_set(self):
-        if not self.current_disk_serial:
+        if not self.current_disk_serial or not getattr(self, "current_disk_managed", False):
             return
             
         minutes = self.interval_slider.value()
@@ -1077,7 +1424,8 @@ class MainWindow(QMainWindow):
         self.sleep_timer_label.setText(f"硬盘休眠时间: {text}")
         
     def on_sleep_timer_set(self):
-        if not self.current_disk_serial or not hasattr(self, 'current_disk_index'):
+        if (not self.current_disk_serial or not hasattr(self, 'current_disk_index')
+                or not getattr(self, "current_disk_managed", False)):
             return
             
         minutes = self.sleep_timer_slider.value()
@@ -1093,95 +1441,30 @@ class MainWindow(QMainWindow):
         self.sleep_timer_label.setStyleSheet("color: #9147ff; font-size: 13px; font-weight: bold;")
     @Slot()
     def on_refresh_clicked(self):
-        """处理刷新按钮点击：重新扫描硬件并更新列表"""
+        """Read-only refresh of allow-listed disks; never restart hardware nodes."""
         if self._eject_active is not None or self.monitor_service.eject_quarantine:
-            QMessageBox.warning(self, "不能扫描", "弹出事务或隔离状态尚未解除，不能深度扫描硬盘。")
+            QMessageBox.warning(self, "不能刷新", "弹出事务或隔离状态尚未解除。")
             return
-        # 增加提醒弹窗
-        reply = QMessageBox.warning(
-            self, 
-            "刷新设备列表有风险，不建议使用",
-            "此操作会执行全局硬件恢复，可能重启其他 USB 硬盘柜、父设备或存储控制器，"
-            "造成磁盘掉线、读写中断，甚至文件或目录损坏。\n\n"
-            "建议取消此操作：先关闭目标硬盘柜上的文件、下载、备份等读写任务，"
-            "确认写入完成后，再重启对应硬盘柜。\n\n"
-            "如仍要继续，请先关闭所有可能受影响硬盘上的读写任务。\n"
-            "是否仍然执行有风险的刷新？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply != QMessageBox.Yes:
-            return
-
         self._hardware_refresh_active = True
-        self.refresh_btn.setText("正在扫描硬件...")
+        self.refresh_btn.setText("正在刷新硬盘状态...")
         self.refresh_btn.setEnabled(False)
-        QApplication.processEvents()
-        
-        # 准备日志捕获
-        captured_logs = []
-        log_handler = ListHandler(captured_logs)
-        log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
-        root_logger = logging.getLogger()
-        root_logger.addHandler(log_handler)
-        # 确保日志级别足够低以捕获 INFO
-        original_level = root_logger.level
-        root_logger.setLevel(logging.INFO)
-        
-        has_issue = False
-        recovery_success = False
-        
-        # 获取扫描锁，防止手动刷新时后台扫描线程也在运行，导致日志交织
-        lock_acquired = False
-        if hasattr(self, 'monitor_service'):
-            lock_acquired = self.monitor_service.scan_lock.acquire(blocking=True)
-            
-        try:
-            # 1. 清除所有硬盘的休眠黑名单，允许重新检测
-            if hasattr(self, 'monitor_service'):
-                self.monitor_service.clear_disk_exclusions()
-            
-            # 2. 尝试重启处于“准备安全删除”状态的设备，以及其他异常状态设备
-            logging.info(">>> 开始设备恢复流程 <<<")
-            recovery_success = Win32API.force_recover_problem_devices()
-            logging.info(">>> 设备恢复流程结束 <<<")
-            
-            # 3. 强制系统重新扫描总线
-            logging.info(">>> 执行系统硬件重新扫描 <<<")
-            Win32API.rescan_hardware()
-            
-            # 4. 等待一下让系统识别
-            for _ in range(10): # Wait 1s
-                time.sleep(0.1)
-                QApplication.processEvents()
-            
-            # 5. 强制软件重新获取磁盘信息
-            if hasattr(self, 'monitor_service'):
-                # 注意：这里调用的是内部实现，因为我们已经持有了锁
-                self.monitor_service._check_all_smart_impl(force=True)
-                
-            # 检查是否有值得展示的日志
-            full_log = "\n".join(captured_logs)
-            if "ERROR" in full_log or "WARNING" in full_log or "发现异常设备" in full_log:
-                has_issue = True
-                
-        except Exception as e:
-            logging.error(f"刷新失败: {e}")
-            has_issue = True
-        finally:
-            if lock_acquired:
-                self.monitor_service.scan_lock.release()
-                
-            self._hardware_refresh_active = False
-            self.refresh_btn.setText("刷新设备列表（有风险）")
-            self.refresh_btn.setEnabled(True)
-            
-            root_logger.removeHandler(log_handler)
-            root_logger.setLevel(original_level)
-            
-            # 显示结果
-            self.show_refresh_result(has_issue, recovery_success, captured_logs)
+        def worker():
+            try:
+                self.monitor_service.check_all_smart(force=True)
+                self._refresh_done_signal.emit({'ok': True})
+            except Exception as exc:
+                logging.exception('白名单设备刷新失败')
+                self._refresh_done_signal.emit({'ok': False, 'error': str(exc)})
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_refresh_done(self, result):
+        self._hardware_refresh_active = False
+        self.refresh_btn.setText("刷新硬盘状态")
+        self.refresh_btn.setEnabled(True)
+        if result.get('ok'):
+            self.status_label.setText('已刷新管理硬盘的状态')
+        else:
+            QMessageBox.warning(self, '刷新失败', result.get('error', '未知错误'))
 
     def show_refresh_result(self, has_issue, recovery_success, logs):
         """显示刷新结果对话框"""
@@ -1346,33 +1629,28 @@ class MainWindow(QMainWindow):
 
                 if msg.message == WM_QUERYENDSESSION:
                     logging.info("收到系统关机信号 (WM_QUERYENDSESSION)")
-                    # 只冻结自身后台（不再访问硬盘），**不在 QES 阶段停转**。
-                    #
-                    # 原因（六轮实测）：QES 阶段应用还没退出，外置盘的卷仍被占用
-                    # （实测 FSCTL_LOCK_VOLUME error=5），卸载卷必然失败；
-                    # 此时停转必被关机后半程的卷 flush 重新转起来，断电时盘在转，
-                    # 不安全关机数白 +1。真正的停转交给关机停转服务在
-                    # SERVICE_CONTROL_PRESHUTDOWN 阶段做（应用已退出、卷可卸载、
-                    # 断电之前），那时停转才能保持到断电。
+                    # The service runs later, after application/volume handles
+                    # are gone.  Starting SLEEP here would allow a later Windows
+                    # flush to wake the disk again.
                     self.shutdown_guard.freeze_background_access()
-
                     try:
                         from src.core.shutdown_service import is_service_running
-                        svc_ok = is_service_running()
+                        svc_ok = bool(is_service_running())
                     except Exception:
                         svc_ok = False
                     if not svc_ok:
-                        # 服务不可用时的降级方案：QES 立即停转（可能被后续 flush 唤醒，成本 +1）
-                        logging.warning("[ShutdownGuard] 关机停转服务不可用，降级为 QES 立即停转")
+                        logging.warning(
+                            "关机停转服务未运行，使用 GUI 兜底停转；可能被后续系统收尾唤醒"
+                        )
                         self.shutdown_guard.start_shutdown_parking(
-                            self._cached_disks_snapshot(), event_type="关机"
+                            self._cached_disks_snapshot(), event_type="关机兜底"
                         )
                     return True, 1
 
                 elif msg.message == WM_ENDSESSION:
                     logging.info(f"系统会话结束 (WM_ENDSESSION, wParam={msg.wParam})")
                     if not msg.wParam:
-                        # wParam==0 表示会话并未真正结束（关机被取消），必须恢复后台服务，
+                        # wParam==0 表示会话并未真正结束（关机被取消），必须恢复后台监控，
                         # 否则监控服务会永久停摆。
                         logging.info("关机被取消，恢复后台监控与设备事件处理")
                         self.shutdown_guard.thaw_background_access()
@@ -1380,9 +1658,7 @@ class MainWindow(QMainWindow):
                 elif msg.message == WM_POWERBROADCAST:
                     if msg.wParam == PBT_APMSUSPEND:
                         logging.info("收到系统休眠信号 (PBT_APMSUSPEND)")
-                        # 系统休眠同样用 STANDBY IMMEDIATE（可恢复），
-                        # 绝不能用 SLEEP——那样系统唤醒后设备会有很长一段时间无法响应。
-                        self.shutdown_guard.freeze_background_access()
+                        # 系统休眠使用与“立即休眠”相同的白名单路径。
                         self.shutdown_guard.start_shutdown_parking(
                             self._cached_disks_snapshot(), event_type="系统休眠"
                         )
@@ -1402,30 +1678,13 @@ class MainWindow(QMainWindow):
         return super().nativeEvent(eventType, message)
 
     def prepare_disks_for_shutdown(self, event_type="关机", budget_seconds=4.0):
-        """关机/系统休眠停转：对齐 Windows 内置硬盘的处理方式。
-
-        新策略（取代旧的 “SLEEP + 阻塞 20 秒等待停转”）：
-          1. 冻结后台访问（监控服务 + 设备事件补丁），避免把刚停转的盘再次唤醒；
-          2. 每块外置盘：刷卷缓存 → ATA FLUSH CACHE(0xE7) → ATA STANDBY IMMEDIATE(0xE0)；
-          3. 并发执行，总耗时不超过 budget_seconds（默认 4 秒），不长时间阻塞关机；
-          4. 在 WM_QUERYENDSESSION 与 WM_ENDSESSION 各跑一次，让断电前最后一次
-             接触硬盘的操作是一次已完成的 STANDBY IMMEDIATE。
-
-        旧的 SLEEP(0xE6) 是深睡，必须复位才能唤醒；关机后续的 I/O 会挂在它上面，
-        触发控制器复位把盘重新转起来，断电时磁头紧急回收 → SMART C0 不安全关机数 +1。
-        """
+        """Compatibility entry for the allow-listed deep-sleep shutdown path."""
         try:
             cached = self._cached_disks_snapshot()
             if not cached:
-                # 关机阶段不做在线扫描（会唤醒硬盘），只提示并放弃
                 logging.warning("[ShutdownGuard] 缺少物理盘缓存，跳过关机停转以避免扫描唤醒硬盘")
                 return
-
-            self.shutdown_guard.prepare_all_disks(
-                cached,
-                event_type=event_type,
-                budget_seconds=budget_seconds,
-            )
+            self.shutdown_guard.start_shutdown_parking(cached, event_type=event_type)
         except Exception as e:
             logging.error(f"{event_type}停转保护执行异常: {e}")
 
@@ -1445,9 +1704,13 @@ class MainWindow(QMainWindow):
         if not item:
             self.spin_down_button.setEnabled(False)
             self.eject_button.setEnabled(False)
+            self.current_disk_managed = False
             return
         
         disk = item.data(Qt.UserRole)
+        from src.core.disk_whitelist import is_external_disk
+        is_managed = (is_external_disk(disk) and
+                      disk.get("managed_id") in self.config_manager.get_managed_disk_whitelist())
         self.title_label.setText(disk.get("model", "未知型号"))
         
         status = disk.get("status", "")
@@ -1455,23 +1718,26 @@ class MainWindow(QMainWindow):
         
         if status == "Sleeping":
             self.spin_down_button.setText("唤醒并解除黑名单")
-            self.spin_down_button.setEnabled(True)
+            self.spin_down_button.setEnabled(is_managed)
         else:
             self.spin_down_button.setText("深度休眠")
-            self.spin_down_button.setEnabled(True)
+            self.spin_down_button.setEnabled(is_managed)
 
         # 弹出按钮只按“是否外置/移动设备”判断，不依赖休眠状态：
         # 软件对休眠状态的识别可能滞后，休眠中的移动盘也应允许直接弹出。
-        if is_removable:
+        if is_external_disk(disk) and is_managed:
             self.eject_button.setEnabled(True)
             self.eject_button.setToolTip("安全弹出并停止该外置硬盘（休眠中的硬盘也可直接弹出）")
         else:
             self.eject_button.setEnabled(False)
-            self.eject_button.setToolTip("内置硬盘不支持安全弹出")
+            self.eject_button.setToolTip("请先将硬盘加入管理白名单" if not is_managed else "内置硬盘不支持安全弹出")
             
         self.current_disk_index = disk.get("index")
         self.current_disk_serial = disk.get("serial")
         self.current_disk_model = disk.get("model")
+        self.current_disk_managed = is_managed
+        self.interval_slider.setEnabled(is_managed)
+        self.sleep_timer_slider.setEnabled(is_managed)
 
         # Load interval config
         interval_sec = self.config_manager.get_disk_interval(self.current_disk_serial)
@@ -1591,6 +1857,8 @@ class MainWindow(QMainWindow):
     def on_spin_down_clicked(self):
         if self._eject_active is not None or self.monitor_service.eject_quarantine:
             return
+        if not getattr(self, 'current_disk_managed', False):
+            return
         if not hasattr(self, 'current_disk_index'):
             return
 
@@ -1658,11 +1926,14 @@ class MainWindow(QMainWindow):
                 self.monitor_service.mark_disk_awake(serial)
             QMessageBox.warning(self, "深度休眠失败", message)
             self.spin_down_button.setText("深度休眠")
-            self.spin_down_button.setEnabled(True)
+            self.spin_down_button.setEnabled(getattr(self, 'current_disk_managed', False))
             self.status_label.setText("深度休眠失败")
 
     def on_eject_clicked(self):
         if self._eject_active is not None or not hasattr(self, 'current_disk_index'):
+            return
+        if not getattr(self, 'current_disk_managed', False):
+            QMessageBox.warning(self, '白名单限制', '请先勾选该硬盘名前的白名单框。')
             return
         disk = next((d for d in self.monitor_service.cached_disks
                      if d.index == self.current_disk_index), None)
@@ -1694,6 +1965,10 @@ class MainWindow(QMainWindow):
         wait_for_native_cancel()
 
     def _start_eject(self, identity):
+        from src.core.disk_whitelist import disk_id
+        if disk_id(identity) not in self.config_manager.get_managed_disk_whitelist():
+            self.show_notification("白名单限制", "未勾选的硬盘不会执行弹出操作。")
+            return
         if self._eject_active is not None or self._hardware_refresh_active:
             self.show_notification("暂不能弹出", "另一项磁盘操作尚未完成。")
             return
@@ -1738,8 +2013,8 @@ class MainWindow(QMainWindow):
             if isolated:
                 message += "\n磁盘保持隔离，停转/弹出状态未完全确认。请勿重复读盘或直接拔盘。"
             self.status_label.setText(message)
-            self.eject_button.setEnabled(not isolated)
-            self.spin_down_button.setEnabled(not isolated)
+            self.eject_button.setEnabled(not isolated and getattr(self, 'current_disk_managed', False))
+            self.spin_down_button.setEnabled(not isolated and getattr(self, 'current_disk_managed', False))
             if result.get("source") == "windows_tray":
                 self.show_notification("弹出未完成", message)
             else:
@@ -1838,6 +2113,14 @@ class MainWindow(QMainWindow):
         try:
             if self.monitor_service.removal_pending.is_set():
                 raise RuntimeError("正在执行安全弹出，取消唤醒")
+            from src.core.disk_whitelist import disk_id, is_external_disk
+            from src.core.device_manager import DeviceManager
+            disk = next((d for d in self.monitor_service.cached_disks
+                         if d.index == disk_index and d.serial_number == serial), None)
+            if (disk is None or not is_external_disk(disk) or
+                    disk_id(disk) not in self.config_manager.get_managed_disk_whitelist() or
+                    not DeviceManager.is_managed_disk(disk_index)):
+                raise RuntimeError("硬盘已不在当前管理白名单中，取消唤醒")
             from src.hal.asm_commander import ASMCommander
 
             data = None
@@ -1882,7 +2165,7 @@ class MainWindow(QMainWindow):
         if not success:
             # 唤醒失败：保持“休眠”状态，允许稍后重试或直接弹出
             self.spin_down_button.setText("唤醒并解除黑名单")
-            self.spin_down_button.setEnabled(True)
+            self.spin_down_button.setEnabled(getattr(self, 'current_disk_managed', False))
             self.status_label.setText("唤醒失败，硬盘未响应")
             QMessageBox.warning(
                 self,
@@ -1911,7 +2194,7 @@ class MainWindow(QMainWindow):
             self.handle_data_update(updated_disks)
 
         self.spin_down_button.setText("深度休眠")
-        self.spin_down_button.setEnabled(True)
+        self.spin_down_button.setEnabled(getattr(self, 'current_disk_managed', False))
         self.status_label.setText("就绪")
 
         threading.Thread(
