@@ -244,12 +244,27 @@ class ReportDialog(QDialog):
                 "请改用「仅导出到本地」保存日志包。",
             )
             return
-        desc, ok = QInputDialog.getMultiLineText(
-            self, "上传日志报告", "请简单描述遇到的问题（可留空）："
-        )
-        if not ok:
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("上传日志报告")
+        dialog.setLabelText("请简单描述遇到的问题（可留空）：")
+        dialog.setOption(QInputDialog.UsePlainTextEditForTextInput, True)
+        dialog.setOkButtonText("上传")
+        dialog.setCancelButtonText("取消")
+        dialog.setStyleSheet("""
+            QInputDialog { background-color: #1a1a1a; color: #ffffff; }
+            QLabel { color: #ffffff; }
+            QPlainTextEdit, QTextEdit, QLineEdit {
+                background-color: #262626; color: #ffffff;
+                border: 1px solid #555555; border-radius: 4px;
+                padding: 8px; font-size: 14px;
+                selection-background-color: #9147ff;
+                selection-color: #ffffff;
+            }
+        """)
+        dialog.resize(520, 280)
+        if dialog.exec() != QDialog.Accepted:
             return
-        desc = (desc or "").strip()[:500]
+        desc = dialog.textValue().strip()[:500]
 
         self.send_btn.setEnabled(False)
         self.send_btn.setText("正在上传...")
@@ -278,33 +293,10 @@ class ReportDialog(QDialog):
         self.send_btn.setText("一键上传服务器 (推荐)")
 
         if result.get("ok"):
-            cfg = self._server_cfg or {}
-            browse = (cfg.get("browse_url") or "").strip()
-            dl = (cfg.get("download_url") or "").strip()
-            token = cfg.get("token") or ""
-            box = QMessageBox(self)
-            box.setWindowTitle("上传成功")
-            lines = [
-                "日志报告已上传到服务器固定目录。",
-                "",
-                "● 随时调取（浏览器打开，按版本/时间分类）：",
-            ]
-            if browse:
-                lines.append(f"  {browse}?key={token}")
-            lines.append("")
-            lines.append("● 本地调试直接下载：")
-            if dl:
-                lines.append(f"  {dl}?file=<文件名>&key={token}")
-            lines += [
-                "",
-                "报告超过 7 天自动标记为「过期」，低于最新版本标记为「旧版本」。",
-            ]
-            box.setText("\n".join(lines))
-            open_btn = box.addButton("打开日志页面", QMessageBox.ActionRole)
-            box.addButton("确定", QMessageBox.AcceptRole)
-            box.exec()
-            if browse and box.clickedButton() == open_btn:
-                webbrowser.open(f"{browse}?key={token}")
+            QMessageBox.information(
+                self, "上传成功",
+                "日志已上传成功，可用于排查问题。\n请将问题发生的时间和操作步骤告知技术支持。"
+            )
             self.accept()
         else:
             box = QMessageBox(self)
@@ -499,7 +491,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.84"
+        self.version = "1.3.87"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1220, 800)
         self.setMinimumSize(1040, 680)
@@ -1942,6 +1934,7 @@ class MainWindow(QMainWindow):
             return
         identity = {"index": disk.index, "model": disk.model,
                     "serial": disk.serial_number, "pnp_id": disk.pnp_id,
+                    "is_removable": disk.is_removable,
                     "ui_serial": self.current_disk_serial, "source": "gui"}
         if QMessageBox.question(self, "停转并安全弹出",
                 f"确定要停转并安全弹出磁盘 {disk.index} 吗？\n全部关联卷将被锁定、卸载并离线。",

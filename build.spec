@@ -15,11 +15,21 @@ current_dir = os.path.abspath(os.getcwd())
 
 block_cipher = None
 
+# Release builds must include the upload-only client configuration.
+# The administrator's report_server.json must never be distributed.
+import json
+with open('report_client.json', encoding='utf-8') as config_file:
+    client_config = json.load(config_file)
+if not client_config.get('upload_url') or not client_config.get('token'):
+    raise RuntimeError('Missing upload-only report client configuration')
+if set(client_config) - {'upload_url', 'token'}:
+    raise RuntimeError('Client report configuration contains non-client fields')
+
 a = Analysis(
     ['main.py'],
     pathex=[current_dir],
     binaries=[],
-    datas=[('assets', 'assets'), ('src', 'src')],
+    datas=[('assets', 'assets'), ('src', 'src'), ('report_client.json', '.')],
     hiddenimports=[
         'src',
         'src.ui',
@@ -70,7 +80,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Stormforge_DiskManager_v1.3.84',
+    name='Stormforge_DiskManager_v1.3.87',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -92,5 +102,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='Stormforge_DiskManager_v1.3.84',
+    name='Stormforge_DiskManager_v1.3.87',
 )

@@ -263,6 +263,7 @@ class MonitorService(threading.Thread):
                     "pnp_id": disk.pnp_id or "", "managed_id": managed_id,
                     "temp": "N/A",
                     "status": "Sleeping",
+                    "is_removable": disk.is_removable,
                     "reallocated": "N/A",
                     "pending": "N/A",
                     "attributes": []

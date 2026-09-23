@@ -7,9 +7,9 @@
 
 **方式一：直接下载成品 (推荐)**
 1.  访问本项目的 [Gitee 发行版页面 (Releases)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)。
-2.  下载 `Stormforge_DiskManager_v1.3.84.zip`。
+2.  下载 `Stormforge_DiskManager_v1.3.87.zip`。
 3.  完整解压到内置硬盘的固定目录，保留 `_internal` 文件夹。
-4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.84.exe`，勾选需要“纳入管理”的硬盘。
+4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.87.exe`，勾选需要“纳入管理”的硬盘。
 
 v1.3.84 恢复“缓存刷新 → 临时离线 → ATA SLEEP”的关机流程；离线失败仍尝试停转。本次用户实机关机流程验证正常，其他硬盘柜仍需核对兼容性。关机前保存文件，等待复制、移动、下载和备份完成。
 

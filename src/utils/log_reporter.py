@@ -6,7 +6,7 @@ import json
 import traceback
 from datetime import datetime
 from urllib.parse import quote
-from src.utils.paths import get_base_path
+from src.utils.paths import get_base_path, get_resource_path
 
 # ============================================================
 # 日志报告云端方案（技术原则见 docs/TECH_NOTES_弹出休眠机制.md §8.39）
@@ -24,6 +24,9 @@ def load_report_server_config():
     """读取程序目录下的 report_server.json（云端地址与密钥，不随源码公开）。"""
     try:
         path = os.path.join(get_base_path(), SERVER_CONFIG_FILE)
+        if not os.path.isfile(path):
+            # Bundled client configuration contains an upload-only credential.
+            path = get_resource_path("report_client.json")
         with open(path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         upload_url = (cfg.get("upload_url") or "").strip()

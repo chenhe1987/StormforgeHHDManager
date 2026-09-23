@@ -100,3 +100,4 @@ release/
 # 云端日志服务器相关（私有，绝不公开：地址/密钥/服务端源码在本地 venv/私有资料/）
 server/
 report_server.json
+report_client.json

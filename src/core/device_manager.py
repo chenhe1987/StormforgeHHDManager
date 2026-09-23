@@ -198,7 +198,7 @@ class DeviceManager:
         from src.core.eject_service import execute_eject
         from src.hal.win32_api import SafeRemovalPatcher
         identity = dict(index=disk.index, model=disk.model, serial=disk.serial_number,
-                        pnp_id=disk.pnp_id, ui_serial=serial)
+                        pnp_id=disk.pnp_id, is_removable=disk.is_removable, ui_serial=serial)
         monitor_service.removal_pending.set()
         patcher = SafeRemovalPatcher()
         try:
