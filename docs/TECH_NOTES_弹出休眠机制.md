@@ -372,27 +372,87 @@ Windows **从不对内置盘发 SLEEP**，断电时盘已停转、磁头已卸�
 - **访问控制**：上传/浏览/下载共用同一密钥（请求头 / `?key=` 参数），
   错误密钥一律 403；单包上限 50MB、索引最多 500 条。
 
-### 8.40 弹出场景铁律（QUERYREMOVE 深睡停转 = 用户验证过的方案）
+### 8.40 弹出场景铁律（v1.3.72 验证过的弹出停转方案）
 
-> 弹出停转方案以**用户验证过的行为为准**：QUERYREMOVE 阶段发送
-> **ATA SLEEP(0xE6) 深睡**，让盘在移除前彻底停转（可恢复的 STANDBY
-> 会被移除流程的 I/O 再次带转，实测「弹出成功但没停转」）。
+> 弹出停转方案以 **v1.3.72 验证过的行为为准**（用户明确指定），不得再改动其核心逻辑。
 
-1. **弹出 ≠ 关机/休眠按钮，但停转命令相同（深睡）**：
-   QUERYREMOVE（devicetype=HANDLE，设备移除前）同步发送 `sleep_only()`
-   （SLEEP 0xE6，不 FLUSH CACHE——Windows 弹出流程已 flush 卷），
-   成功后标记盘为休眠（sleeping_disks），再释放句柄允许移除。
-2. **句柄释放顺序不可颠倒**：先 SLEEP、后释放句柄；先释放会导致
-   后续 I/O 报 1117。
-3. **保护性措施（不改变上述验证行为）**：
-   - 收到 `DEVICEQUERYREMOVEFAILED(0x8002)` 时恢复监控状态并清空去重标记，
-     保证可以再次弹出；盘保持深睡（黑名单语义）。
-   - REMOVECOMPLETE 补发 SLEEP 时**跳过仍有挂载卷的盘**（避免误深睡
-     正常服役的盘与内部盘；内部盘也不注册句柄通知）。
-   - GUI「安全弹出设备」按钮在请求设备移除前**先释放卷锁句柄**
-     （持锁会被卷管理器否决）；ReFS 卷不支持锁定（LOCK error=5）时
-     直接 DISMOUNT，与系统托盘同款行为。
-4. 关机深度休眠策略（§8.38）与「深度休眠」按钮不受本条影响。
+1. **GUI「安全弹出设备」按钮（v1.3.72 原样）**：
+   ① 弹出前先发 **FLUSH CACHE + SLEEP(0xE6) 深睡**（`cmd.sleep()`），磁头归位+停转；
+   ② Shell Eject（Windows 原生路径）；
+   ③ 锁定/卸载卷（ReFS 不支持锁定时直接 DISMOUNT；锁失败不中断流程）；
+   ④ PnP 设备节点移除。成功提示含「硬盘已停转」；
+   移除失败但已停转时明确提示「硬盘已成功停转，可稍后通过系统托盘完成弹出」。
+2. **补丁 QUERYREMOVE（v1.3.72 原样）**：同步发送 `sleep_only()`（SLEEP 0xE6）
+   + 标记休眠（sleeping_disks）+ 释放句柄；先 SLEEP、后释放，顺序不可颠倒。
+3. **补丁 REMOVECOMPLETE 补发 SLEEP（v1.3.72 原样 + 保护项）**：对剩余已注册
+   外置盘补发 SLEEP；仅增加「有挂载卷的盘跳过」与「内部盘不注册句柄通知」
+   两个防误伤保护（不改变被弹出盘的停转行为）。
+4. 收到 `DEVICEQUERYREMOVEFAILED(0x8002)` 时恢复监控状态并清空去重标记
+   （新增保护项，保证可以再次弹出）。
+5. 关机深度休眠策略（§8.38）与「深度休眠」按钮不受本条影响。
+
+### 8.41 弹出场景铁律（v1.3.88 验证过的方案 —— GUI「停转并安全弹出」当前生效）
+
+> 2026-09-25 实机双盘验收通过（记录见本节末）。**本节描述当前代码的真实行为**，
+> 与 §8.40 不同：GUI 按钮走 `src/core/eject_protocol.py` 事务
+> （预检 → 隔离卷 → 离线 → FLUSH → SLEEP → PnP 移除），**不调用 Shell Eject，
+> 也不是"先深睡再锁卷"**。§8.40 的托盘接管补丁当前没有调用点（`_register_spindown_patcher`
+> 无调用、`spindown_patcher` 从未赋值、日志里没有 `[NativeEject] registered`），
+> 属死代码，**不要据 §8.40 推断现行行为**。
+
+**事务顺序（不可颠倒）**
+
+1. `inventory()` 预检：盘符/物理盘号/桥序列号/USB 总线 + 卷清单（卷枚举容错，见第 4 条）。
+2. `validate()`：仅允许"在线、非启动/系统盘、有介质（Size≠0）"的白名单 USB 盘；
+   核对句柄序列号与 PnP；确认弹出桥只对应目标盘。
+3. 开物理盘句柄 → 逐个开卷句柄 → **隔离卷**：
+   - 普通卷：`FSCTL_LOCK_VOLUME` → `FlushFileBuffers` → `FSCTL_DISMOUNT_VOLUME`；
+   - **ReFS/exFAT 等不支持锁卷的卷**：LOCK 返回 5 → **跳过锁定，直接 `FSCTL_DISMOUNT_VOLUME`**
+     （Windows 资源管理器弹出同款），并**跳过后续 flush/dismount**（已卸载，重复调用会失败并中止事务）；
+   - **无分区表（RAW）的盘**：没有卷，直接进入下一步（整盘弹出）。
+4. 置 OFFLINE（Persist=0）并读回属性确认（`offline_verified`）。
+5. 用预开句柄发 ATA FLUSH CACHE (E7)，SCSI status 必须为 0。
+6. 关全部卷句柄 → **先落日志 `sleep_dispatch`** → 只发一次 ATA SLEEP (E6)。
+7. 关物理盘句柄 → `CM_Request_Device_EjectW` 请求一次（禁止回退 Hub/子树）。
+8. 结果以 PnP 返回值 + 事件序列判定；E6 之后**不再** TUR/SMART/读盘验证。
+
+**为什么 ReFS 必须跳过锁定（实测，禁止回退）**
+
+- 本机 E:（ReFS）对 `FSCTL_LOCK_VOLUME` **恒返回 ERROR_ACCESS_DENIED(5)**；
+- GUI 完全退出、只剩关机服务时**同样返回 5**；Restart Manager 查不到占用者；
+  句柄审计确认本程序自身持有 0 个句柄 ⇒ **不是占用问题**，是文件系统语义；
+- 旧实现 `win32_api.py::prepare_volume_for_safe_removal` 早已记录同一结论
+  （"实测 ReFS 卷锁定恒返回 5，而 DISMOUNT 可成功"）。
+
+⇒ **任何"把 LOCK error 5 当致命错误直接中止"的写法都是 bug**
+（v1.3.78～v1.3.87 就是这么让 E: 永远弹不出去的）。
+fail-closed 的边界只有一个：**DISMOUNT 也失败**时立即中止，不发 SLEEP、不离线，
+并把占用诊断写进提示。
+
+**无分区表（RAW）盘必须能弹**
+
+`Get-Partition` 对 RAW 盘会报错；预检若不做容错，整块盘永远弹不出去
+（本机磁盘 3 = `A000BBBBAAAA` 16 TB）。判定依据是 `Get-Disk` 的 `PartitionStyle=RAW`
+且卷数为 0 ⇒ "没有卷需要隔离"，整盘停转 + 弹出，并记 `volume_less_disk` 事件。
+**有分区表却枚举不到卷仍然 fail closed**，并把卷枚举错误原样带进提示。
+
+**提示必须可读（禁止只回一个 error=5）**
+
+失败文案必须含：卷标识 + 文件系统 + 错误码中文解释 + 占用者（Restart Manager）
++ **本程序自身持有该盘句柄数量** + 处理建议。实现：`src/utils/volume_diag.py`。
+
+**开关**：`app_config.json` → `eject_dismount_without_lock`（默认 `true`）。
+置 `false` 会退回"锁卷失败即停止"（ReFS 盘将再次弹不出去），仅排查时使用。
+
+#### 实测验收记录（2026-09-25 23:06，v1.3.88，本机 ASMT105x 双盘）
+
+| 盘 | 形态 | 关键事件序列 | 结果 |
+| --- | --- | --- | --- |
+| 磁盘 4 / E: | GPT + ReFS，1 卷 | LOCK error=5 → `volume_dismounted_without_lock` → 跳过 flush/dismount → `offline_verified` → E7(0.0s) → E6(1.98s, scsi_status=0) → PnP `cr=0 veto=0` | `ejected_sleep_accepted`，约 4.6s |
+| 磁盘 3 | RAW，0 分区 | `volume_less_disk` → `offline_verified` → E7(1.47s) → E6(0.86s) → PnP `cr=0` | `ejected_sleep_accepted`，约 4.4s |
+
+日志位置：`operations.log` 的 `[EjectTransaction] disk=4/3 event=...` 序列。
+`physical_stop_verified` 恒为 false 是设计（不做事后探测，避免把刚停转的盘唤醒）。
 
 ### 8.37 计数成本实测（2026-09-19）
 
@@ -528,11 +588,13 @@ Windows **从不对内置盘发 SLEEP**，断电时盘已停转、磁头已卸�
 
 ## 12. 打包注意事项
 
-- build.spec：COLLECT name='疾风知硬盘柜管理_v1.3.72'，uac_admin=True
-- 打包命令：python -m PyInstaller --noconfirm --clean --distpath dist --workpath build build.spec
-- 打包前必须结束运行中的程序实例（否则 app.log 被锁无法删除 dist）
-- 旧 dist 有 app.log/operations.log 锁定时，先 taskkill 再删
-- 打包后 fc /N 对比源码与 _internal 确认一致
+- build.spec：COLLECT name='Stormforge_DiskManager_v1.3.88'，uac_admin=True
+- 打包命令：python -m PyInstaller build.spec --noconfirm --distpath dist --workpath build
+- 打包前必须结束运行中的 GUI 实例（否则 exe/app.log 被锁）；**关机服务占用旧版本目录
+  不影响构建新版本**（新版本首次启动时会自动把关机停转服务的 binPath 重指到新 exe）
+- 版本号变更要同时改 build.spec 的两处 name（EXE 与 COLLECT）
+- 打包后核对：`pyi-archive_viewer -l -r -b <exe>` 应能看到 `src.utils.volume_diag`、
+  `src.hal.eject_backend`、`src.core.eject_protocol`；`_internal\src` 与源码哈希一致
 
 ---
 
@@ -547,6 +609,18 @@ Windows **从不对内置盘发 SLEEP**，断电时盘已停转、磁头已卸�
 7. 不要用关键字参数调 ctypes WinDLL 函数
 8. QUERYREMOVE 必须：反查磁盘 → SLEEP → 释放句柄
 9. 关机休眠：cached_disks + 无条件执行 + 跳过已休眠盘
+10. **不要把 `FSCTL_LOCK_VOLUME` 的 error 5 当致命错误**（ReFS/exFAT 恒返回 5，
+    与占用无关；见 §8.41 实测）。v1.3.78～v1.3.87 回退过这一点，结果两个盘都弹不出去。
+11. **不要删掉"锁卷失败 → 直接 DISMOUNT"的回退**；可中止的边界只有"DISMOUNT 也失败"。
+12. **不要给 `eject_backend.inventory()` 的 `Get-Partition` 去掉 try/catch**
+    （RAW 盘会再次整块弹不出去）。`volume_query_error` 必须随快照返回。
+13. **不要对已直卸（`volume_dismounted_without_lock`）的句柄再 flush/dismount**
+    （卷已卸载，调用失败会中止整个事务；见 `volume_flush_skipped`/`volume_dismount_skipped`）。
+14. **弹出失败提示不得只回 error 码**，必须带占用诊断（卷/文件系统/占用者/自身句柄/建议），
+    实现见 `src/utils/volume_diag.py`；`eject_dismount_without_lock` 默认必须为 true。
+15. **不要用全表跨进程句柄扫描做默认诊断**：`DeviceIoControl` 撞到不响应设备会挂住
+    （实测 5 分钟不出结果）。默认只做"自身句柄 + Restart Manager"，跨进程扫描放在
+    `include_others=True` / `--scan-others` 手动入口。
 
 
 ---

@@ -8,6 +8,14 @@ from src.hal.eject_backend import inventory, WindowsBackend
 from src.core.disk_whitelist import disk_id, is_external_disk
 
 
+def _allow_dismount_without_lock(monitor):
+    """ReFS/exFAT 不支持锁卷时是否允许跳过锁定直接卸载（默认允许）。"""
+    try:
+        return bool(monitor.config_manager.get_eject_dismount_without_lock())
+    except Exception:
+        return True
+
+
 def execute_eject(monitor, identity, progress=None):
     index, pnp = identity["index"], identity["pnp_id"]
     result = Outcome()
@@ -35,6 +43,7 @@ def execute_eject(monitor, identity, progress=None):
                 monitor.quarantine_eject(pnp)
         backend = WindowsBackend(snapshot, identity["serial"], record,
                                  owner_pid=os.getpid(), expected_pnp=pnp)
+        backend.allow_dismount_without_lock = _allow_dismount_without_lock(monitor)
         result = run(backend)
         if result.ejected:
             monitor.mark_disk_ejected(identity.get("ui_serial") or identity["serial"], index)

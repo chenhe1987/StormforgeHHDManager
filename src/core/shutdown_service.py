@@ -101,6 +101,7 @@ def _park_all_disks(cached=None):
     sleeping = set(snap.get("sleeping") or [])
     targets = []
     seen = set()
+    already_asleep = 0
     for disk in snap.get("disks", []):
         idx = disk.get("index")
         if (not isinstance(idx, int) or idx < 0 or idx in seen or
@@ -110,7 +111,21 @@ def _park_all_disks(cached=None):
         seen.add(idx)
         if disk.get("serial_number") not in sleeping:
             targets.append(disk)
+        else:
+            already_asleep += 1
     if not targets:
+        # 绝不能静默返回：日志必须能回答"为什么这次关机什么都没停转"。
+        total = len(snap.get("disks", []))
+        if not snap:
+            reason = "共享清单不存在或为空（GUI 未落盘 shutdown_disks.json）"
+        elif not allowed:
+            reason = "白名单为空：没有任何硬盘被勾选「纳入管理」"
+        elif already_asleep:
+            reason = "命中的白名单外置盘都已标记休眠，无需重复发命令"
+        else:
+            reason = ("共享清单里没有白名单外置盘（%d 个设备均不匹配；"
+                      "常见原因：硬盘柜未上电/未被枚举，或盘已掉线）" % total)
+        logging.warning("[Svc] 关机停转未命中任何目标: %s", reason)
         return 0
     # Only metadata mapping, once, before any disk is put to sleep.
     mapping = Win32API.get_volume_disk_mapping() or {}

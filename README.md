@@ -7,11 +7,16 @@
 
 **方式一：直接下载成品 (推荐)**
 1.  访问本项目的 [Gitee 发行版页面 (Releases)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)。
-2.  下载 `Stormforge_DiskManager_v1.3.87.zip`。
+2.  下载 `Stormforge_DiskManager_v1.3.88.zip`。
 3.  完整解压到内置硬盘的固定目录，保留 `_internal` 文件夹。
-4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.87.exe`，勾选需要“纳入管理”的硬盘。
+4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.88.exe`，勾选需要“纳入管理”的硬盘。
 
-v1.3.84 恢复“缓存刷新 → 临时离线 → ATA SLEEP”的关机流程；离线失败仍尝试停转。本次用户实机关机流程验证正常，其他硬盘柜仍需核对兼容性。关机前保存文件，等待复制、移动、下载和备份完成。
+v1.3.88 修复了外置盘弹不出去的问题：ReFS/exFAT 卷不支持 `FSCTL_LOCK_VOLUME`（恒返回
+`error=5`，与占用无关），现在按 Windows 资源管理器的方式跳过锁定直接卸载卷；无分区表（RAW）
+的盘也支持整盘停转弹出；弹出失败不再只回一个 `error=5`，而是给出卷/文件系统/占用者/本程序
+自身句柄的完整说明。本机 ASMT105x 双盘实机验收通过（磁盘 4 ReFS + 磁盘 3 RAW，
+`ejected_sleep_accepted`、PnP `cr=0`）。技术原则见
+`docs/TECH_NOTES_弹出休眠机制.md` §8.41。
 
 **方式二：源码运行**
 ```bash
@@ -181,6 +186,27 @@ python main.py
 ---
 
 ## 5. 版本历史 (Version History)
+
+### v1.3.88
+- **修复：外置盘弹不出去（ReFS/exFAT 锁卷失败被当成致命错误）**:
+  - `FSCTL_LOCK_VOLUME` 对 ReFS/exFAT 卷恒返回 `ERROR_ACCESS_DENIED(5)`，与是否被占用无关
+    （实测：GUI 完全退出、只剩关机服务时同样返回 5；Restart Manager 查不到占用者；
+    本程序自身持有该盘句柄 0 个）。
+  - v1.3.78～v1.3.87 把 error 5 一律当致命错误，导致 E:（ReFS）永远弹不出去；
+    现在对 ReFS/exFAT 跳过锁定、直接 `FSCTL_DISMOUNT_VOLUME`（与 Windows 资源管理器同款），
+    **卸载失败仍然立即中止**（不发 SLEEP、不离线）。
+  - 新增开关 `eject_dismount_without_lock`（默认 true）。
+- **新增：无分区表（RAW）硬盘整盘直接弹出**:
+  - 旧预检里 `Get-Partition` 对 RAW 盘直接抛异常，整块盘永远弹不出去；
+    现在 `PartitionStyle=RAW` 且无卷 → 判定"没有卷需要隔离"，整盘停转 + 弹出
+    （记 `volume_less_disk`）；有分区表却枚举不到卷仍 fail closed。
+- **提示可读化**：新增 `src/utils/volume_diag.py`，失败时给出卷/文件系统/错误码中文解释/
+  占用者（Restart Manager）/本程序自身持有句柄数/处理建议，不再只回一个 `error=5`。
+- **关机停转不再静默空转**：没有命中目标时写明原因（清单为空/白名单为空/盘都已休眠/
+  清单里没有白名单外置盘）。
+- 实机验收（本机 ASMT105x 双盘）：磁盘 4（GPT+ReFS）与磁盘 3（RAW）均
+  `ejected_sleep_accepted` + PnP `cr=0 veto=0`。技术原则见
+  `docs/TECH_NOTES_弹出休眠机制.md` §8.41 与修改红线第 10–15 条。
 
 ### v1.3.74
 - **关机保护策略定稿（PRESHUTDOWN 服务 + 无条件深度休眠）**:

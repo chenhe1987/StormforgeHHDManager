@@ -2,10 +2,12 @@
 import ctypes as C
 from ctypes import wintypes as W
 import json
+import logging
 import re
 import subprocess
 import time
 from src.hal.win32_api import Win32API, SCSI_PASS_THROUGH_DIRECT
+from src.utils import volume_diag
 
 def inventory(letter=None, disk_index=None):
     # No user text is interpolated except a validated single ASCII letter.
@@ -16,15 +18,33 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $part = Get-Partition -DriveLetter 'LETTER'
 $disk = Get-Disk -Number $part.DiskNumber
-$vols = @(Get-Partition -DiskNumber $disk.Number | Get-Volume -ErrorAction Stop |
-    Select-Object -Property UniqueId,Path,DriveLetter,FileSystemType)
+# 无分区表的盘（RAW）Get-Partition 会直接报错，这不是失败：
+# 没有卷需要隔离，允许走"整盘直接停转+弹出"。真正的卷枚举错误写进 volume_query_error。
+$vols = @()
+$volumeError = ''
+try {
+    $parts = @(Get-Partition -DiskNumber $disk.Number -ErrorAction Stop)
+} catch {
+    $parts = @()
+    $volumeError = $_.Exception.Message
+}
+if ($parts.Count -gt 0) {
+    try {
+        $vols = @($parts | Get-Volume -ErrorAction Stop |
+            Select-Object -Property UniqueId,Path,DriveLetter,FileSystemType)
+    } catch {
+        $vols = @()
+        $volumeError = $_.Exception.Message
+    }
+}
 $physical = @(Get-CimInstance Win32_DiskDrive | Select-Object Index,PNPDeviceID,SerialNumber,Size)
 $managers = @(Get-CimInstance Win32_Process | Where-Object {
     $_.Name -like '*硬盘柜管理*' -and $_.CommandLine -notlike '*--shutdown-service*'
 } | Select-Object ProcessId,Name,CommandLine)
 [ordered]@{
- disk = ($disk | Select-Object Number,FriendlyName,SerialNumber,BusType,IsBoot,IsSystem,IsOffline,Size)
+ disk = ($disk | Select-Object Number,FriendlyName,SerialNumber,BusType,IsBoot,IsSystem,IsOffline,Size,PartitionStyle,NumberOfPartitions)
  volumes = $vols
+ volume_query_error = $volumeError
  physical = $physical
  managers = $managers
  pagefiles = @(Get-CimInstance Win32_PageFileUsage | Select-Object Name)
@@ -72,6 +92,38 @@ class WindowsBackend:
         self.cfg.CM_Request_Device_EjectW.restype = W.ULONG
         self.owned = set()
         self.volumes = []
+        # 句柄 -> 卷路径、卷路径 -> (盘符, 文件系统)：失败时用来生成可读提示。
+        self._handle_volume = {}
+        self.volume_meta = {}
+        self._predismounted = set()
+        # 无分区表（RAW）的盘没有卷需要隔离，标记后按整盘直接弹出。
+        self.volume_less = False
+        # ReFS/exFAT 等不支持 FSCTL_LOCK_VOLUME；True 时按 Windows 资源管理器
+        # 的做法跳过锁定、直接卸载卷（由 eject_service 从配置注入）。
+        self.allow_dismount_without_lock = True
+        for vol in (snapshot or {}).get("volumes") or []:
+            path = str(vol.get("Path") or vol.get("UniqueId") or "").rstrip("\\")
+            if not path:
+                continue
+            self.volume_meta[path] = {
+                "drive_letter": str(vol.get("DriveLetter") or "").strip().rstrip(":"),
+                "filesystem": str(vol.get("FileSystemType")
+                                  or vol.get("FileSystem") or "").strip().upper(),
+            }
+
+    def _meta_for(self, handle):
+        return self.volume_meta.get(self._handle_volume.get(handle, ""), {})
+
+    def _volume_label(self, handle):
+        name = self._handle_volume.get(handle, "")
+        meta = self.volume_meta.get(name, {})
+        return volume_diag.volume_label(name, meta.get("drive_letter"), self.index)
+
+    def _diagnose(self, handle):
+        name = self._handle_volume.get(handle, "")
+        meta = self.volume_meta.get(name, {})
+        return volume_diag.diagnose_volume_isolation(
+            name, meta.get("drive_letter"), meta.get("filesystem"), self.index)
 
     def validate(self):
         s, d = self.snapshot, self.snapshot["disk"]
@@ -86,7 +138,19 @@ class WindowsBackend:
             raise RuntimeError("Exit the existing GUI through its tray menu first: "
                                + str([p["ProcessId"] for p in s["managers"]]))
         if not s["volumes"]:
-            raise RuntimeError("No volumes enumerated; cannot prove complete isolation")
+            # 无分区表（RAW）的盘：没有任何卷需要隔离，允许整盘直接停转 + 弹出。
+            # 有分区表却枚举不到卷，说明隔离无法证明，依旧 fail closed。
+            style = str(d.get("PartitionStyle") or "").upper()
+            if style != "RAW":
+                detail = str(s.get("volume_query_error") or "").strip()
+                raise RuntimeError(
+                    "No volumes enumerated; cannot prove complete isolation"
+                    + ("（卷枚举错误：%s）" % detail if detail else ""))
+            self.volume_less = True
+            self.record("volume_less_disk", {
+                "disk": int(d["Number"]), "partition_style": style,
+                "size": int(d["Size"]),
+                "note": "该盘无分区表（RAW），没有卷需要锁定/卸载，整盘直接停转并弹出"})
         roots = []
         for vol in s["volumes"]:
             path = vol.get("Path") or vol.get("UniqueId") or ""
@@ -113,6 +177,7 @@ class WindowsBackend:
         if members != [self.index]:
             raise RuntimeError("Bridge affects multiple disks: " + str(members))
         self.record("validated", {"disk": d, "volumes": self.volumes,
+                                  "volume_less": self.volume_less,
                                   "eject_target": self.target["instance_id"]})
 
     def ioctl(self, handle, code, source=None, destination=None):
@@ -141,7 +206,13 @@ class WindowsBackend:
             raise RuntimeError("Device number changed after inventory")
 
     def open_disk(self):
-        h = self.open(f"\\\\.\\PhysicalDrive{self.index}")
+        path = f"\\\\.\\PhysicalDrive{self.index}"
+        try:
+            h = self.open(path)
+        except OSError as exc:
+            raise RuntimeError(volume_diag.format_stage_failure(
+                f"打开物理盘 {path} 句柄", "", getattr(exc, "winerror", None),
+                hint="确认程序以管理员身份运行；该盘若被其他程序独占，请先关闭后重试。"))
         try:
             self.check_number(h)
             # Query the cached storage descriptor, checking identity again on the
@@ -162,23 +233,88 @@ class WindowsBackend:
             raise
 
     def open_volume(self, name):
-        h = self.open(name)
+        try:
+            h = self.open(name)
+        except OSError as exc:
+            meta = self.volume_meta.get(str(name).rstrip("\\"), {})
+            raise RuntimeError(volume_diag.format_stage_failure(
+                "打开卷 %s 句柄" % volume_diag.volume_label(
+                    name, meta.get("drive_letter"), self.index),
+                "", getattr(exc, "winerror", None),
+                hint="关闭占用该卷的程序（资源管理器窗口、杀毒/索引服务等）后重试。"))
         try:
             self.check_number(h)
+            self._handle_volume[h] = str(name).rstrip("\\")
             return h
         except Exception:
             self.close(h)
             raise
 
     def lock(self, h):
-        self.ioctl(h, 0x90018)
+        """独占锁定卷；ReFS/exFAT 等不支持锁定的文件系统走直卸回退。"""
+        meta = self._meta_for(h)
+        filesystem = meta.get("filesystem", "")
+        try:
+            self.ioctl(h, 0x90018)
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror == 5 and not volume_diag.filesystem_supports_lock(filesystem):
+                if not self.allow_dismount_without_lock:
+                    diagnostic = self._diagnose(h)
+                    self.record("volume_lock_unsupported", {
+                        "volume": self._volume_label(h), "filesystem": filesystem,
+                        "winerror": winerror, "fallback": "disabled"})
+                    raise RuntimeError(volume_diag.format_lock_failure(
+                        diagnostic, winerror, None, filesystem)
+                        + "\n该文件系统不支持锁卷，直卸回退当前被配置关闭"
+                          "（eject_dismount_without_lock=false）。")
+                self._dismount_without_lock(h, filesystem, winerror)
+                return
+            diagnostic = self._diagnose(h)
+            self.record("volume_lock_failed", {
+                "volume": self._volume_label(h), "filesystem": filesystem,
+                "winerror": winerror, "occupiers": diagnostic.get("occupiers"),
+                "self_handles": len(diagnostic.get("self_handles") or [])})
+            raise RuntimeError(volume_diag.format_lock_failure(
+                diagnostic, winerror, None, filesystem))
         self.record("volume_locked", {})
 
+    def _dismount_without_lock(self, h, filesystem, lock_error):
+        """ReFS/exFAT：跳过锁定直接卸载（Windows 资源管理器弹出同款做法）。
+
+        占用诊断只在卸载也失败时做：成功路径上做全表句柄扫描会白白拖慢弹出。
+        """
+        label = self._volume_label(h)
+        try:
+            self.ioctl(h, 0x90020)
+        except OSError as exc:
+            dismount_error = getattr(exc, "winerror", None)
+            diagnostic = self._diagnose(h)
+            self.record("volume_isolation_failed", {
+                "volume": label, "filesystem": filesystem,
+                "lock_winerror": lock_error, "dismount_winerror": dismount_error})
+            raise RuntimeError(volume_diag.format_lock_failure(
+                diagnostic, lock_error, dismount_error, filesystem))
+        self._predismounted.add(h)
+        note = volume_diag.format_lock_unsupported(
+            {"label": label, "filesystem": filesystem}, filesystem, True)
+        logging.warning("[Eject] %s", note)
+        self.record("volume_dismounted_without_lock", {
+            "volume": label, "filesystem": filesystem,
+            "lock_winerror": lock_error, "note": note})
+
     def flush_volume(self, h):
+        if h in self._predismounted:
+            # 已直卸的卷不能再 FlushFileBuffers：卷已卸载，调用只会失败并中止事务。
+            self.record("volume_flush_skipped", {"volume": self._volume_label(h)})
+            return
         if not self.k.FlushFileBuffers(h):
             raise C.WinError(C.get_last_error())
 
     def dismount(self, h):
+        if h in self._predismounted:
+            self.record("volume_dismount_skipped", {"volume": self._volume_label(h)})
+            return
         self.ioctl(h, 0x90020)
         self.record("volume_dismounted", {})
 

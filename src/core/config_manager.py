@@ -44,7 +44,10 @@ class ConfigManager:
             "managed_disk_whitelist": [],
             "autostart": False,
             "shutdown_eject": True,
-            "safe_remove_spindown": True
+            "safe_remove_spindown": True,
+            # ReFS/exFAT 等文件系统不支持 FSCTL_LOCK_VOLUME：True 时按 Windows
+            # 资源管理器弹出的做法跳过锁定、直接卸载卷（否则弹出直接失败）。
+            "eject_dismount_without_lock": True
         }
         if not os.path.exists(self.filename):
             return default_config
@@ -122,6 +125,14 @@ class ConfigManager:
 
     def get_managed_disk_whitelist(self):
         return set(self.config.get("managed_disk_whitelist", []) or [])
+
+    def get_eject_dismount_without_lock(self):
+        """ReFS/exFAT 不支持锁卷时，是否允许跳过锁定直接卸载卷。"""
+        return bool(self.config.get("eject_dismount_without_lock", True))
+
+    def set_eject_dismount_without_lock(self, enabled):
+        self.config["eject_dismount_without_lock"] = bool(enabled)
+        self.save_config()
 
     def set_disk_managed(self, disk_id, managed):
         ids = self.get_managed_disk_whitelist()

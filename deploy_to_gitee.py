@@ -8,24 +8,43 @@ from pathlib import Path
 
 
 def ensure_release_zip(release_tag):
-    dist_zip = Path(f"dist/疾风知硬盘柜管理_{release_tag}.zip")
-    src_dir = Path(f"dist/疾风知硬盘柜管理_{release_tag}")
+    """定位/生成发布 ZIP。
 
-    if dist_zip.exists():
-        print(f"✅ ZIP 包已存在: {dist_zip.resolve()}")
-        return dist_zip
+    命名沿革：v1.3.77 起构建产物是 Stormforge_DiskManager_<tag>（英文名，dist/release 两处），
+    更早是「疾风知硬盘柜管理_<tag>」；这里按优先级查找，找不到再从目录压缩。
+    """
+    for candidate in (
+        Path(f"release/Stormforge_DiskManager_{release_tag}.zip"),
+        Path(f"dist/Stormforge_DiskManager_{release_tag}.zip"),
+        Path(f"dist/疾风知硬盘柜管理_{release_tag}.zip"),
+    ):
+        if candidate.exists():
+            print(f"✅ ZIP 包已存在: {candidate.resolve()}")
+            return candidate
 
-    if not src_dir.exists():
-        print(f"⚠️ 找不到构建目录: {src_dir}，无法打包。")
-        return None
-
-    print(f"正在压缩 {dist_zip}...")
     import shutil
+    import zipfile
 
-    dist_zip.parent.mkdir(parents=True, exist_ok=True)
-    shutil.make_archive(str(dist_zip.with_suffix("")), "zip", str(src_dir))
-    print(f"✅ ZIP 包已生成: {dist_zip.resolve()}")
-    return dist_zip
+    for src_dir in (
+        Path(f"release/Stormforge_DiskManager_{release_tag}"),
+        Path(f"dist/Stormforge_DiskManager_{release_tag}"),
+        Path(f"dist/疾风知硬盘柜管理_{release_tag}"),
+    ):
+        if not src_dir.exists():
+            continue
+        target = src_dir.parent / f"{src_dir.name}.zip"
+        print(f"正在压缩 {target}...")
+        # 保留顶层目录（与 zip_release.py 一致），解压即得完整可运行目录。
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, _dirs, files in os.walk(src_dir):
+                for name in files:
+                    path = os.path.join(root, name)
+                    zipf.write(path, os.path.relpath(path, src_dir.parent))
+        print(f"✅ ZIP 包已生成: {target.resolve()}")
+        return target
+
+    print(f"⚠️ 找不到 {release_tag} 的构建目录或 ZIP，跳过附件上传。")
+    return None
 
 
 def upload_release_asset(owner, repo, release_id, token, zip_path):
@@ -214,6 +233,40 @@ def main():
 
     # --- 更新日志配置 (Changelog Configuration) ---
     changelogs = {
+        "v1.3.88": {
+            "name": "v1.3.88 Release - 修复外置盘弹不出去（ReFS 锁卷 error=5）与无分区表盘支持",
+            "body": """## v1.3.88 更新日志
+
+### 修复
+1. **[修复] 外置盘弹不出去（ReFS/exFAT 卷锁卷失败被当成致命错误）**
+   - `FSCTL_LOCK_VOLUME` 对 ReFS/exFAT 卷恒返回 `ERROR_ACCESS_DENIED(5)`，**与是否被占用无关**：
+     实测 GUI 完全退出、只剩关机服务时同样返回 5，Restart Manager 查不到占用者，
+     本程序自身持有该盘句柄 0 个。
+   - v1.3.78～v1.3.87 把 error 5 一律当致命错误，导致 ReFS 盘（本机 E:）永远弹不出去。
+     现在对 ReFS/exFAT 跳过锁定、直接 `FSCTL_DISMOUNT_VOLUME`（与 Windows 资源管理器弹出同款），
+     **卸载失败仍然立即中止**（不发 SLEEP、不离线）。新增开关
+     `eject_dismount_without_lock`（默认 true）。
+2. **[修复] 无分区表（RAW）硬盘弹不出去**
+   - 旧预检里 `Get-Partition` 对 RAW 盘直接抛异常，整块盘永远弹不出去。
+     现在 `PartitionStyle=RAW` 且无卷 → "没有卷需要隔离"，整盘停转 + 弹出
+     （事件 `volume_less_disk`）；有分区表却枚举不到卷仍然 fail closed。
+3. **[修复] 关机停转静默空转**
+   - 没有命中目标时不再只留一行 `总耗时 0.000s`，而是写明原因
+     （共享清单为空 / 白名单为空 / 命中的盘都已休眠 / 清单里没有白名单外置盘）。
+
+### 优化
+4. **[优化] 弹出失败提示可读化**
+   - 不再只回一个 `error=5`：新增 `src/utils/volume_diag.py`，给出
+     卷标识 + 文件系统 + 错误码中文解释 + 占用者（Restart Manager）
+     + **本程序自身持有该盘句柄数量** + 处理建议；打开物理盘/打开卷/锁定卷分阶段报错。
+
+### 验证
+- 本机 ASMT105x 双盘实机验收通过：磁盘 4（GPT + ReFS，1 卷）与磁盘 3（RAW，0 分区）
+  均 `ejected_sleep_accepted` + PnP `cr=0 veto=0`，耗时约 4.6s / 4.4s。
+- 新增 `tools/test_eject_diagnostics.py`（21 项，含真 `WindowsBackend` + IOCTL 打桩的
+  完整事务测试）；新增手动诊断工具 `tools/volume_occupancy_probe.py`。
+- 技术原则固化：`docs/TECH_NOTES_弹出休眠机制.md` §8.41 + 修改红线第 10–15 条。"""
+        },
         "v1.3.59": {
             "name": "v1.3.59 Release - 修复关机前硬盘被再次唤醒",
             "body": """## v1.3.59 更新日志

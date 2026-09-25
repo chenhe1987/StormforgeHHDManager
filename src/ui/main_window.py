@@ -1982,7 +1982,11 @@ class MainWindow(QMainWindow):
     def _on_eject_progress(self, event):
         labels = {"volume_locked": "卷已锁定", "disk_offline": "磁盘已离线",
                   "sleep_dispatch": "正在发送 SLEEP 停转命令",
-                  "pnp_request": "等待 Windows 完成安全弹出（请勿重复操作）"}
+                  "pnp_request": "等待 Windows 完成安全弹出（请勿重复操作）",
+                  "volume_dismounted_without_lock": "该文件系统不支持锁卷，已直接卸载卷",
+                  "volume_lock_failed": "锁定卷被拒绝，正在诊断占用者",
+                  "volume_isolation_failed": "卷无法锁定也无法卸载",
+                  "volume_less_disk": "该盘无分区表（RAW），直接整盘停转并弹出"}
         if event in labels:
             self.status_label.setText(labels[event])
 
