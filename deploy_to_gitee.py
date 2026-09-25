@@ -209,13 +209,22 @@ def main():
         # 为了安全，我们最好把 origin 还原为不带 token 的
         if token:
             run_command(f"git remote set-url origin {git_url}")
+            # 注意：git push -u <带token的URL> 还会把该 URL 写进 branch.master.remote，
+            # 不还原的话 token 会明文留在 .git/config 里（v1.3.88 部署时踩到过）。
+            run_command("git config branch.master.remote origin")
+            run_command("git config branch.master.merge refs/heads/master")
+            leaked = run_command("git config --get branch.master.remote", check=False) or ""
+            if "oauth2" in leaked or token in leaked:
+                print("⚠️ branch.master.remote 仍带着凭据，请手动执行: git config branch.master.remote origin")
+            else:
+                print("✅ 已确认 .git/config 未残留凭据")
             
-    # 推送 Tag
+    # 推送 Tag（用带凭据的 URL 推，避免 origin 未存凭据时静默失败）
     print(f"正在推送 Tag {release_tag}...")
     run_command(f"git tag {release_tag} -m \"Release {release_tag}\"", check=False) # Create if not exists
-    tag_result = run_command(f"git push origin {release_tag}", check=False)
-    if tag_result:
-        print(f"✅ Tag {release_tag} 推送成功！")
+    tag_result = run_command(f"git push {auth_git_url} {release_tag}", check=False)
+    if tag_result is not None:
+        print(f"✅ Tag {release_tag} 推送完成（或已存在）。")
     else:
         print(f"⚠️ Tag {release_tag} 推送失败 (可能已存在)。")
 
