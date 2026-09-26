@@ -376,6 +376,9 @@ class MonitorService(threading.Thread):
                                 disk_info["model"] = real_model
                                 if real_serial and len(real_serial) > 5:
                                     disk_info["serial"] = real_serial
+                                    # 能读出真实序列号 = 这块盘现在就在位：
+                                    # 解除可能残留的"已弹出/休眠"屏蔽（见方法说明）。
+                                    self._heal_serial_exclusion(real_serial, disk)
 
                                 # 自动重命名逻辑
                                 try:
@@ -554,6 +557,12 @@ class MonitorService(threading.Thread):
             serial = d.get("serial")
             index = d.get("index")
             if serial and serial in self.ejected_disks:
+                # 这条分支必须留日志：它曾经把"换到别的盘位、已重新读到"的行静默丢掉
+                # （v1.3.90 的"刚插入能看到、一两秒后又消失"）。
+                logging.info(
+                    f"DEBUG: 合并时丢弃已弹出硬盘的记录: {d.get('model')} "
+                    f"(index={index}, serial={serial})"
+                )
                 continue
             if cached_serials or cached_indexes:
                 serial_known = bool(serial) and serial in cached_serials
@@ -582,6 +591,37 @@ class MonitorService(threading.Thread):
             merged.append(u)
 
         return merged
+
+    def _heal_serial_exclusion(self, real_serial, disk):
+        """读到了真实序列号 → 这块盘现在就在位 → 解除它的"已弹出/休眠"屏蔽。
+
+        为什么必须在这里解除：`ejected_disks` 是按**序列号字符串**记的，
+        而 mark_disk_ejected 会把**真实 ATA 序列号**也写进去。用户把盘从 A 盘位
+        拔下插到 B 盘位时，B 盘位的桥接序列号与黑名单里的不同（所以一开始能显示），
+        但读出来的真实序列号相同 → 列表里这一行的 serial 正好命中黑名单 →
+        `_merge_ui_data` 在下一轮又把它当"已弹出的盘"丢掉。
+        表现就是"刚插入能看到、一两秒后又消失"（v1.3.90 实机复现）。
+
+        反之，真正被弹出且已不在总线上的盘不会被读到，也就不会被误解除。
+        """
+        if not real_serial:
+            return False
+        healed = False
+        if real_serial in self.ejected_disks:
+            self.ejected_disks.discard(real_serial)
+            healed = True
+        if real_serial in self.sleeping_disks:
+            self.sleeping_disks.discard(real_serial)
+            try:
+                if self.config_manager:
+                    self.config_manager.remove_sleeping_disk(real_serial)
+            except Exception as exc:
+                logging.warning("清除休眠名单失败 %s: %s", real_serial, exc)
+            healed = True
+        if healed:
+            logging.info("[Heal] 硬盘 %s 的真实序列号 %s 在位 → 解除已弹出/休眠屏蔽",
+                         getattr(disk, "index", "?"), real_serial)
+        return healed
 
     def _serials_for(self, serial, disk_index=None):
         """收集一个盘位对应的所有序列号。

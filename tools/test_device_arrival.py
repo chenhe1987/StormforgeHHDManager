@@ -346,5 +346,86 @@ class IntervalConfigTests(unittest.TestCase):
         self.assertEqual(calls, [], "间隔为 0 时不应因为 now-last>=0 而每次重新枚举")
 
 
+class MovedDiskTests(unittest.TestCase):
+    """弹出后换到**另一个盘位**再插入：桥接序列号变了，但真实序列号没变。
+
+    v1.3.90 实测现象：刚插入能看到（占位行用的是新盘位的桥接序列号），
+    读出真实序列号后行里 serial 命中"已弹出"黑名单 → 下一轮合并把它丢掉 → 消失。
+    """
+
+    ATA_SERIAL = "YC20160507A000000221"      # 用户日志里的真实序列号
+    BRIDGE_BAY6 = "2740BBBBAAAA"             # 弹出时所在盘位（盘位6）
+    BRIDGE_BAY5 = "1740BBBBAAAA"             # 移入盘位（盘位5）
+
+    def _monitor_with_row(self, serial_for_row):
+        target = new_disk(index=5, serial=self.BRIDGE_BAY5, model="ShineDisk M667 64G")
+        m = make_monitor([target])
+        m.last_ui_data = [{
+            "index": 5, "serial": serial_for_row, "model": "ShineDisk M667 64G",
+            "status": "Healthy", "temp": "35C", "pending": "0", "reallocated": "0",
+            "pnp_id": target.pnp_id, "managed_id": disk_id(target),
+            "is_removable": True, "interface": "SCSI", "attributes": [7]}]
+        m.ejected_disks = {self.ATA_SERIAL, self.BRIDGE_BAY6}
+        return m, target
+
+    def test_row_whose_serial_is_blacklisted_would_be_dropped(self):
+        """记录这个陷阱本身：真实序列号命中黑名单时，合并会丢掉这一行。"""
+        m, _ = self._monitor_with_row(self.ATA_SERIAL)
+        merged = m._merge_ui_data(m.last_ui_data, [])
+        self.assertEqual(merged, [], "这正是 v1.3.90 消失的直接原因")
+
+    def test_reading_real_serial_heals_the_blacklist(self):
+        """读到真实序列号 = 盘在位 → 解除屏蔽 → 这一行不再被丢。"""
+        m, target = self._monitor_with_row(self.ATA_SERIAL)
+        healed = m._heal_serial_exclusion(self.ATA_SERIAL, target)
+        self.assertTrue(healed)
+        self.assertNotIn(self.ATA_SERIAL, m.ejected_disks)
+        merged = m._merge_ui_data(m.last_ui_data, [])
+        self.assertEqual([r.get("serial") for r in merged], [self.ATA_SERIAL])
+
+    def test_genuinely_ejected_disk_stays_hidden(self):
+        """真正被弹出的盘不会出现在枚举里，也就不会被误解除。"""
+        m, target = self._monitor_with_row(self.ATA_SERIAL)
+        m.next_disks = []                       # 盘不在总线上
+        result = m.rescan_devices(reason="WM_DEVICECHANGE:0x0007")
+        self.assertEqual(result["healed"], [])
+        self.assertIn(self.ATA_SERIAL, m.ejected_disks)
+
+    def test_full_scan_clears_blacklist_when_disk_is_readable(self):
+        """端到端：SMART 检测读到真实序列号时就地解除屏蔽，行保留。"""
+        target = new_disk(index=5, serial=self.BRIDGE_BAY5, model="ShineDisk M667 64G")
+        config = FakeConfig(whitelist={disk_id(target)})
+        m = make_monitor([target], whitelist={disk_id(target)}, config=config)
+        m.ejected_disks = {self.ATA_SERIAL, self.BRIDGE_BAY6}
+        m.last_ui_data = [{"index": 5, "serial": self.ATA_SERIAL,
+                           "model": "ShineDisk M667 64G", "status": "Healthy",
+                           "temp": "35C", "pending": "0", "reallocated": "0",
+                           "pnp_id": target.pnp_id, "managed_id": disk_id(target),
+                           "is_removable": True, "interface": "SCSI", "attributes": [7]}]
+
+        class FakeCommand:
+            def __init__(self, *args, **kwargs):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def identify_device(self):
+                return b"identify"
+            def get_smart_data(self):
+                return b"smart"
+            @staticmethod
+            def parse_identify_data(data):
+                return ("ShineDisk M667 64G", MovedDiskTests.ATA_SERIAL)
+
+        with patch("src.core.monitor_service.ASMCommander", FakeCommand), \
+             patch("src.core.monitor_service.SmartParser.parse_512", return_value=[1, 2]):
+            m._check_all_smart_impl(force=False, target_disks=None)
+        self.assertNotIn(self.ATA_SERIAL, m.ejected_disks,
+                         "读到真实序列号后必须解除屏蔽，否则这一行下一轮就被丢掉")
+        serials = [r.get("serial") for r in m.pushed[-1]]
+        self.assertIn(self.ATA_SERIAL, serials)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
