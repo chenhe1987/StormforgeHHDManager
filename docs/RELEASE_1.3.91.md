@@ -1,10 +1,45 @@
 # Release 1.3.91
 
-主题：**修复"弹出后换到另一个盘位插入 → 先能看到、随后又消失"**
+主题：**热插拔即时发现（新插入 / 换盘的硬盘立刻显示）+ 两处回归修复**
 
-> v1.3.90 未发布到 Gitee（流程是"实机验证通过后再上传"）。本版是它的修正版，请用 v1.3.91。
+> 距上一个公开版本 **v1.3.88**。v1.3.89 / v1.3.90 为内部迭代（未发布），本版是它们的修正版。
+> Gitee 与 GitHub 同步发布。
 
-## 现象与日志证据（用户实测 v1.3.90）
+---
+
+## 本版包含（相对 v1.3.88）
+
+### 新增：热插拔即时发现
+
+- **事件驱动**：`DBT_DEVICEARRIVAL` / `DBT_DEVICEREMOVECOMPLETE` / `DBT_DEVNODES_CHANGED`
+  → 去抖 1.5 秒后立即重扫（USB 硬盘柜上电会连发一串事件，合并成一次）。
+  **只加副作用，返回值语义不变**（QUERYREMOVE 仍必须返回 1 才允许移除）。
+- **列表增量补行**：已有行原样保留（SMART 数据不丢），只给列表里没有的盘位补占位行，绝不整表重建。
+- **盘位指纹** `(pnp_id, 序列号, 型号)` 识别**同一盘位换盘**：桥接柜的序列号按盘位固定
+  （换盘不变），只能靠型号变化看出来。识别到就丢旧行 + 清该盘位的检测时间
+  （否则新盘会沿用上一块盘的到期时间，最长几小时不被读取），新盘 1~2 秒内出现真实型号。
+- **兜底轮询** `device_inventory_interval_seconds`（默认 120 秒，可配，0 = 只靠事件），
+  兜住"广播丢失 / 事件被事务跳过 / 多盘位柜不发广播"的情况。
+- 实测：一次全量枚举 0.44 秒、8 次枚举后进程句柄增量 **0**、无磁盘 I/O；
+  与弹出事务串行化（`scan_lock` + `removal_pending`），**不会**导致其他盘"被占用而弹不出去"。
+
+### 修复
+
+1. **弹出后换到另一个盘位插入 → 先能看到、随后又消失**
+   - `ejected_disks` 是按序列号字符串记的，而弹出时会写入**真实 ATA 序列号**。换盘位后新盘位的
+     桥接序列号不同（所以先显示），但读出的真实序列号与黑名单相同 → 下一轮合并把该行丢掉。
+   - 现在**读到真实序列号即视为该盘在位并解除屏蔽**（真正被弹出的盘不在总线上、读不出来，
+     不会被误解除）；并给"合并时丢弃已弹出记录"的分支补了日志。
+2. **已管理盘 SMART 信息被冲成"待检测"**（v1.3.89 引入的回归）
+   - 原因：重扫时用 `(index, serial)` 精确匹配"沿用旧行"后整表替换列表，而 UI 行的 `serial`
+     是 SATA IDENTIFY 的**真实序列号**、设备缓存里是**桥接序列号** → 匹配必然失败 → 全表变占位行。
+   - 现在只增量补行；回归测试 `test_smart_row_survives_when_ui_serial_is_ata_serial`。
+3. **关机停转未命中目标时静默空转**（无目标时只留一行 `总耗时 0.000s`）
+   - 现在写明原因（共享清单为空 / 白名单为空 / 命中的盘都已休眠 / 清单里没有白名单外置盘）。
+
+---
+
+## 问题 1 的实机日志证据（v1.3.90）
 
 用户在盘位 6 弹出 `ShineDisk M667 64G`，然后把它插到盘位 5：
 
@@ -15,39 +50,19 @@
 | 12:36:32 | `SATA 识别到真实型号: ShineDisk M667 64G` → 行里 `serial` = `YC20160507A000000221` | 该值正好命中黑名单 |
 | 12:36:34 | `合并后 5 条` | **消失** ✗ |
 
-## 根因
-
-`ejected_disks` 是按**序列号字符串**记的，而 `mark_disk_ejected()` 把**真实 ATA 序列号**
-也写了进去（`_serials_for()` 同时收集桥接序列号和 UI 行的真实序列号，这是为了防止弹出时
-后台还去访问该盘，本身是对的）。
-
-换盘位后：
-- 新盘位的**桥接序列号**与黑名单里的不同 → `_filter_excluded_disks` 不过滤 → 占位行先显示出来；
-- 但 SMART 检测读出的**真实序列号**与黑名单里的**相同**（同一块物理盘）→ 行里的 `serial`
-  变成真实序列号 → `_merge_ui_data()` 的 `if serial in self.ejected_disks: continue`
-  在下一轮把这一行丢掉 → 消失。
-
-`_heal_reappeared_devices()` 只按"枚举里出现的序列号"解除屏蔽，而枚举里只有**桥接**序列号，
-解除不到真实序列号这一条。
-
-## 修复
-
-1. **读到真实序列号 = 这块盘现在就在位** → 立即调用新增的 `_heal_serial_exclusion()`
-   解除它的"已弹出/休眠"屏蔽（并同步清理持久化的 `sleeping_disks`）。
-   真正被弹出的盘不在总线上、读不出序列号，因此不会被误解除。
-   位置：`monitor_service._check_all_smart_impl()` 的 SATA IDENTIFY 分支。
-2. **`_merge_ui_data` 丢弃"已弹出"记录时补日志**
-   （`DEBUG: 合并时丢弃已弹出硬盘的记录: ... (index=..., serial=...)`）——
-   这次就是因为该分支静默丢行，只能靠条数从 6 变 5 才发现。
+修复位置：`monitor_service._check_all_smart_impl()` 的 SATA IDENTIFY 分支调用新增的
+`_heal_serial_exclusion()`。
 
 ## 测试
 
-`tools/test_device_arrival.py` 扩到 **20 项**，新增 `MovedDiskTests`（用日志里的真实序列号）：
+- 新增 `tools/test_device_arrival.py`（**20 项**）：事件触发集合过滤（QUERYREMOVE 系列不触发）、
+  事件风暴去抖、新盘进列表、拔出盘消失、事务/关机期间跳过重扫且不枚举、重新插入解除隔离、
+  **休眠盘绝不发 IDENTIFY**、换盘指纹识别 + 清检测时间、真实/桥接序列号回归、
+  移动盘位后不被误丢（`MovedDiskTests` 用日志里的真实序列号）、
+  以及端到端验证（打桩 IDENTIFY/SMART 走完整检测路径）。
+- 既有 `tools/test_eject_diagnostics.py`（21）与 `tools/test_eject_sleep_protocol.py`（9）全绿。
 
-- `test_row_whose_serial_is_blacklisted_would_be_dropped` —— 固化这个陷阱本身（复现 v1.3.90 的消失）
-- `test_reading_real_serial_heals_the_blacklist` —— 读到真实序列号后解除屏蔽、行保留
-- `test_genuinely_ejected_disk_stays_hidden` —— 真被弹出（不在总线上）的盘不会被误解除
-- `test_full_scan_clears_blacklist_when_disk_is_readable` —— 端到端：走完整的
-  `_check_all_smart_impl`（打桩 IDENTIFY/SMART），验证屏蔽被解除且行被推送
+## 上一个公开版本 v1.3.88 的内容
 
-全量 86 项：本次相关 20 + 21 + 9 全绿；其余 6 项为历史失败（早前已用干净 worktree 做 A/B 确认）。
+修复了 ReFS/exFAT 卷弹不出去（`FSCTL_LOCK_VOLUME` 恒返回 `ERROR_ACCESS_DENIED(5)`，**与是否被占用无关**）
+与无分区表（RAW）盘整盘弹出，并让弹出失败提示给出占用诊断（卷/文件系统/占用者/本程序自身句柄/建议）。

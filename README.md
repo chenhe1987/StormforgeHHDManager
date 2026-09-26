@@ -1,12 +1,19 @@
 # 疾风知硬盘柜管理程序 (JiFengZhi HDD Manager)
 
 [![Gitee Release](https://img.shields.io/badge/Gitee-Download-red)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)
+[![GitHub Release](https://img.shields.io/badge/GitHub-Download-blue)](https://github.com/chenhe1987/StormforgeHHDManager/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## 📥 下载与安装 (Download & Install)
 
 **方式一：直接下载成品 (推荐)**
-1.  访问本项目的 [Gitee 发行版页面 (Releases)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)。
+
+两个站点同步发布，内容一致，就近选择：
+
+- Gitee（主站）：<https://gitee.com/stormforge/JiFengZhiHDDManager/releases>
+- GitHub（镜像）：<https://github.com/chenhe1987/StormforgeHHDManager/releases>
+
+1.  打开上面任一发行版页面（Releases）。
 2.  下载 `Stormforge_DiskManager_v1.3.91.zip`。
 3.  完整解压到内置硬盘的固定目录，保留 `_internal` 文件夹。
 4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.91.exe`，勾选需要“纳入管理”的硬盘。
