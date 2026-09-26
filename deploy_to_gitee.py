@@ -6,6 +6,13 @@ import subprocess
 import re
 from pathlib import Path
 
+# Windows 控制台默认 GBK，直接打印 ✅/✗ 会 UnicodeEncodeError，先把输出改成 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def ensure_release_zip(release_tag):
     """定位/生成发布 ZIP。
