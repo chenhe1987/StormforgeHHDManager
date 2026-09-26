@@ -495,7 +495,7 @@ class MainWindow(QMainWindow):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.89"
+        self.version = "1.3.90"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1220, 800)
         self.setMinimumSize(1040, 680)

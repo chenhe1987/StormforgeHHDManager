@@ -626,15 +626,23 @@ fail-closed 的边界只有一个：**DISMOUNT 也失败**时立即中止，不�
 17. **不要把 `device_change_needs_rescan` 的触发集合扩大到 QUERYREMOVE(0x8001) 系列**：
     那些分支的**返回值语义**不允许改动（QUERYREMOVE 必须返回 1 才允许移除），重扫只能
     作为副作用挂在 0x8000/0x8004/0x0007 上。
-18. **新出现的盘必须走"完整列表重建"**（`rescan_devices` → `_rows_for_devices_without_probe`）：
+18. **新出现的盘必须走"完整列表重建"**（`rescan_devices` → `_placeholder_rows`）：
     定时路径对非白名单盘 `continue`、`_merge_ui_data` 只从 updates 追加新条目，
     用它显示新盘会永远显示不出来（v1.3.87~v1.3.88 的实际表现）。
     重建列表时**不要**顺便跑 SMART（会把空闲停转的盘反复唤醒）：已知盘沿用旧行、
     新盘给占位行，检测交给按盘调度。
+20. **列表只能增量补行，绝不能整表替换**：UI 行的 `serial` 可能是 SATA IDENTIFY 的真实
+    序列号，设备缓存里是桥接序列号 —— 用 `(index, serial)` 精确匹配再整表重建，
+    会把已管理盘的 SMART 数据冲成"待检测"（v1.3.89 实测发生的回归，
+    见 `test_smart_row_survives_when_ui_serial_is_ata_serial`）。
+21. **桥接柜换盘必须靠"盘位指纹"识别**：序列号是按盘位分配的（换盘不变），
+    只有 `(pnp_id, serial, model)` 的型号变化能看出来。指纹变化时除了丢旧行，
+    还必须 `disk_last_check_times.pop(桥接序列号)`，否则新盘会沿用上一块盘的到期时间。
+22. **解除"已弹出/隔离"屏蔽要在过滤之前**完成，否则刚重新插入的盘这一轮不会出现在列表里。
 19. **`device_inventory_interval_seconds = 0` 的语义是"只靠设备事件"**，
     不要在 `_get_cached_or_scan_disks_locked` 里写成 `now - last >= 0`（恒真 = 每次都重新枚举）。
 
-### 17. 设备热插拔即时发现（2026-09-26 修复，v1.3.89）
+### 17. 设备热插拔即时发现（2026-09-26，v1.3.89 引入 / v1.3.90 修正）
 
 ### 问题（用户现象：程序启动后再插入硬盘，软件不显示）
 
@@ -660,13 +668,19 @@ fail-closed 的边界只有一个：**DISMOUNT 也失败**时立即中止，不�
    调 `MonitorService.rescan_devices(reason)`。**只加副作用，返回值语义不变**
    （§15 红线 12/13 与第 17 条）。
 2. `MonitorService.rescan_devices()`：`scan_lock` 下强制重新枚举（元数据，见下）→
-   记录 diff（新增/移除/解除屏蔽）→ 用设备缓存**重建完整列表**并推送。
-   关键：**重建列表时不发任何 SMART/IDENTIFY**（`_rows_for_devices_without_probe`）——
+   记录 diff（新增/移除/换盘盘位/解除屏蔽）→ **增量补行**：
+   已有行原样保留（`_merge_ui_data` 原生语义，SMART 数据不能丢），只给列表里没有的盘位
+   追加占位行；绝不整表重建。
+   **重建/补行时不发任何 SMART/IDENTIFY**（`_placeholder_rows`）——
    0x0007 是"任何设备变化"都会发的通知，若每次事件都跑一遍 SMART 检测，会把空闲停转
-   但未标记休眠的盘反复唤醒。已知盘直接沿用上一次的行（保留温度/健康数据），
-   新盘给占位行（白名单盘="待检测"，非白名单="未加入白名单（不管理）"），
-   真实 SMART 数据由正常的按盘调度在下一轮补上（新盘 `disk_last_check_times` 为空 = 立即到期）。
+   但未标记休眠的盘反复唤醒。真实 SMART 数据由正常的按盘调度在下一轮补上
+   （新盘 `disk_last_check_times` 为空 = 立即到期）。
    `removal_pending` / `shutdown_mode` / 未运行时直接跳过（弹出与关机事务自动让路）。
+
+   **换盘识别（v1.3.90 补）**：桥接柜的序列号是按盘位分配的，同一盘位换盘后 pnp_id 与
+   序列号都不变，只能靠 `_sync_device_fingerprints()` 的 `(pnp_id, serial, model)` 型号
+   变化识别。指纹变化时：丢掉该盘位旧行 + `disk_last_check_times.pop(桥接序列号)`
+   （否则新盘沿用上一块盘的到期时间，最长几小时不被检测）。
 3. 兜底轮询 `device_inventory_interval_seconds`（默认 120 秒，0 = 只靠事件）：
    兜住"广播丢失 / 事件被事务跳过 / 多盘位柜与网络盘不发广播"的情况。
    为什么 §15 的 0x0007 不能单独承担：它是**任何设备变化**都会发的通知，只能当触发器。

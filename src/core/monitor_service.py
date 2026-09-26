@@ -61,6 +61,11 @@ class MonitorService(threading.Thread):
         self._idle_tracker = {}  # {disk_index: {last_r, last_w, idle_since_ts, timeout_mins}}
         self._idle_last_check = 0
 
+        # 盘位指纹 {(index): (pnp_id, serial, model)}：识别"同一盘位换了盘"。
+        # 桥接柜的序列号是按盘位固定的（换盘不变），只能靠型号变化判断。
+        self._device_fingerprints = {}
+        self._pending_bay_changes = set()
+
     @staticmethod
     def _started_soon_after_boot(tolerance_seconds=600):
         """判断本进程是否在系统开机后不久启动（开机自启场景）。
@@ -184,6 +189,7 @@ class MonitorService(threading.Thread):
                 allowlist=self.config_manager.get_managed_disk_whitelist())
             self.last_inventory_scan_time = now
             logging.info(f"更新物理磁盘缓存: {len(self.cached_disks)} 个设备")
+            self._sync_device_fingerprints()
         else:
             logging.info(f"复用物理磁盘缓存: {len(self.cached_disks)} 个设备")
 
@@ -688,6 +694,31 @@ class MonitorService(threading.Thread):
                    if (getattr(d, "index", None), getattr(d, "serial_number", None)) not in new]
         return added, removed
 
+    def _sync_device_fingerprints(self):
+        """用最近一次枚举更新"盘位指纹"，记录指纹变化的盘位。
+
+        桥接柜（ASMT / D4 DAS 等）的序列号是**按盘位**分配的：同一盘位换盘后
+        pnp_id/序列号都不变，只有型号会从"空盘位占位名"或上一块盘的型号变成新盘型号。
+        所以换盘/空盘位插入只能靠 (pnp_id, serial, model) 的变化识别。
+        """
+        current = {}
+        for disk in self.cached_disks:
+            index = getattr(disk, "index", None)
+            if index is None:
+                continue
+            current[index] = (getattr(disk, "pnp_id", "") or "",
+                              getattr(disk, "serial_number", "") or "",
+                              (getattr(disk, "model", "") or "").strip().upper())
+        changed = {index for index, fingerprint in current.items()
+                   if index in self._device_fingerprints
+                   and self._device_fingerprints[index] != fingerprint}
+        self._device_fingerprints = current
+        if changed:
+            self._pending_bay_changes |= changed
+            logging.info("[Device] 盘位指纹变化（换盘/空盘位插入）: %s",
+                         sorted(changed))
+        return changed
+
     def _heal_reappeared_devices(self, disks):
         """同 pnp_id 的盘重新出现 → 解除"已弹出/隔离"屏蔽。
 
@@ -711,26 +742,24 @@ class MonitorService(threading.Thread):
                 healed.append("%s（解除已弹出标记）" % serial)
         return healed
 
-    def _rows_for_devices_without_probe(self, disks, previous):
-        """只用设备缓存构建完整列表：**不发任何 SMART/IDENTIFY**（热插拔事件路径专用）。
+    def _placeholder_rows(self, disks):
+        """给"列表里还没有行"的设备造一行占位（**不发任何 SMART/IDENTIFY**）。
 
         0x0007 是"任何设备变化"都会发的通知，如果每次事件都跑一遍 SMART 检测，
-        会把空闲停转但未标记休眠的盘反复唤醒。这里改为：
-        - 已知盘直接沿用上一次的行（保留温度/健康数据，零磁盘访问）；
-        - 新盘给一行占位（白名单盘给"待检测"，由正常的按盘调度在下一轮立刻补上，
-          因为新盘的 disk_last_check_times 为空 = 立即到期）。
+        会把空闲停转但未标记休眠的盘反复唤醒。所以：
+        - 列表里已有的行**原样保留**（`_merge_ui_data` 负责沿用，SMART 数据不会丢）；
+        - 只有列表里没有的盘位才补占位行，白名单盘给"待检测"、其余给"未加入白名单"，
+          真实数据由正常的按盘调度补上（新盘 `disk_last_check_times` 为空 = 立即到期）。
+
+        注意：**绝不能**用 `(index, serial)` 精确匹配去"沿用"旧行再整表替换——UI 行的
+        serial 可能是 SATA IDENTIFY 得到的真实序列号，而设备缓存里是桥接序列号
+        （见 `_merge_ui_data` 的说明）。v1.3.89 就是这么把已管理盘的 SMART 冲成
+        "待检测"的。
         """
-        known = {(row.get("index"), row.get("serial")): row
-                 for row in (previous or [])}
         whitelist = self.config_manager.get_managed_disk_whitelist()
         rows = []
         for disk in disks:
             serial = getattr(disk, "serial_number", None)
-            index = getattr(disk, "index", None)
-            old = known.get((index, serial))
-            if old is not None:
-                rows.append(old)
-                continue
             pnp = getattr(disk, "pnp_id", "") or ""
             removable = bool(getattr(disk, "is_removable", False))
             interface = getattr(disk, "interface_type", "Unknown") or "Unknown"
@@ -746,7 +775,8 @@ class MonitorService(threading.Thread):
             else:
                 status = "未加入白名单（不管理）"
             rows.append({
-                "index": index, "model": getattr(disk, "model", "Unknown"),
+                "index": getattr(disk, "index", None),
+                "model": getattr(disk, "model", "Unknown"),
                 "serial": serial, "pnp_id": pnp, "managed_id": managed_id,
                 "is_removable": removable, "interface": interface,
                 "status": status, "temp": "N/A",
@@ -777,26 +807,48 @@ class MonitorService(threading.Thread):
         with self.scan_lock:                       # RLock：内部再取锁是安全的
             before = list(self.cached_disks)
             self.last_inventory_scan_time = 0      # 强制下一次调用真的去枚举
-            disks = self._get_cached_or_scan_disks(force=True)
+            self._get_cached_or_scan_disks(force=True)   # 强制枚举（副作用：刷新 cached_disks）
             after = list(self.cached_disks)
             added, removed = self._device_diff(before, after)
+            self._sync_device_fingerprints()
+            changed = sorted(self._pending_bay_changes)
+            self._pending_bay_changes.clear()
             healed = self._heal_reappeared_devices(after)
-            if added or removed or healed:
+            # 解除屏蔽之后再过滤：刚"重新插入后恢复"的盘这一轮就要出现在列表里
+            disks = self._filter_excluded_disks(self.cached_disks)
+
+            # 增量补行，绝不整表重建：
+            # ① 换盘的盘位先丢掉旧行（同一盘位换了盘，旧行的型号/健康数据都不再有效）；
+            base = list(self.last_ui_data)
+            if changed:
+                base = [r for r in base if r.get("index") not in set(changed)]
+                for disk in disks:
+                    if getattr(disk, "index", None) in set(changed):
+                        # 调度按桥接序列号记时间，而序列号是按盘位固定的：
+                        # 不清掉就会沿用上一块盘的到期时间，新盘可能几小时内都不被检测。
+                        self.disk_last_check_times.pop(getattr(disk, "serial_number", None), None)
+            # ② 其余已存在的行原样保留（SMART 数据不能丢）；
+            # ③ 只给"列表里没有的盘位"补占位行。
+            known_indexes = {r.get("index") for r in base}
+            missing = [d for d in disks
+                       if getattr(d, "index", None) not in known_indexes]
+            rows = self._merge_ui_data(base, self._placeholder_rows(missing))
+
+            if added or removed or healed or changed or missing:
                 logging.info(
-                    "[Rescan] reason=%s 新增=[%s] 移除=[%s] 解除屏蔽=[%s]",
+                    "[Rescan] reason=%s 新增=[%s] 移除=[%s] 换盘盘位=%s 解除屏蔽=[%s] 补行=%s",
                     reason,
                     ", ".join(self._describe(d) for d in added) or "-",
                     ", ".join(self._describe(d) for d in removed) or "-",
-                    ", ".join(healed) or "-")
+                    changed or "-",
+                    ", ".join(healed) or "-",
+                    [getattr(d, "index", None) for d in missing] or "-")
             else:
                 logging.info("[Rescan] reason=%s 设备清单无变化（%d 个）", reason, len(after))
-            # 用设备缓存重建**完整**列表（含"未加入白名单（不管理）"的新盘），零磁盘访问：
-            # 新盘的 SMART 数据由正常的按盘调度在下一轮补上（新盘立即到期）。
-            rows = self._rows_for_devices_without_probe(after, self.last_ui_data)
             self.last_ui_data = rows
             if self.callback_update_ui:
                 self.callback_update_ui(rows)
-        return {"added": len(added), "removed": len(removed),
+        return {"added": len(added), "removed": len(removed), "changed_bays": changed,
                 "healed": healed, "total": len(disks), "rows": len(rows)}
 
     def pause_for_removal(self, disk_index):

@@ -7,6 +7,7 @@
 """
 import sys
 import threading
+import time
 from pathlib import Path
 import unittest
 from types import SimpleNamespace
@@ -96,11 +97,14 @@ def make_monitor(disks, whitelist=(), sleeping=(), config=None):
     m.callback_update_ui = m.pushed.append
     m.enumerations = []
     m.next_disks = None
+    m._device_fingerprints = {}
+    m._pending_bay_changes = set()
 
     def fake_get(force=False):
         m.enumerations.append(bool(force))
         if m.next_disks is not None:
             m.cached_disks = list(m.next_disks)
+        m._sync_device_fingerprints()      # 真实现里在枚举后调用（见 _get_cached_or_scan_disks_locked）
         return m._filter_excluded_disks(m.cached_disks)
 
     m._get_cached_or_scan_disks = fake_get
@@ -256,6 +260,65 @@ class RescanTests(unittest.TestCase):
         self.assertEqual(row["temp"], "41C")
         self.assertEqual(row["status"], "Warning")
         self.assertEqual(row["attributes"], [1, 2, 3])
+
+    def test_smart_row_survives_when_ui_serial_is_ata_serial(self):
+        """回归（v1.3.89 的 bug）：UI 行的 serial 是 SATA IDENTIFY 的真实序列号，
+        设备缓存里是桥接序列号 —— 用 (index, serial) 精确匹配会失配，
+        整表被占位行替换，已管理盘的 SMART 数据被冲成"待检测"。"""
+        target = new_disk()                      # 缓存 serial = 桥接序列号 3740BBBBAAAA
+        m = make_monitor([target], whitelist={disk_id(target)},
+                         config=FakeConfig(whitelist={disk_id(target)}))
+        m.last_ui_data = [{"index": 3, "serial": "Z1F0REALATASERIAL",   # 真实序列号
+                           "model": "HGST HUS728T8TALE6L4", "status": "Healthy",
+                           "temp": "38C", "pending": "0", "reallocated": "0",
+                           "pnp_id": target.pnp_id, "managed_id": disk_id(target),
+                           "is_removable": True, "interface": "SCSI",
+                           "attributes": [9, 9, 9]}]
+        m.next_disks = [target]
+        m.rescan_devices(reason="WM_DEVICECHANGE:0x0007")
+        row = next(r for r in m.pushed[-1] if r.get("index") == 3)
+        self.assertEqual(row["status"], "Healthy")     # 不能变成"待检测"
+        self.assertEqual(row["temp"], "38C")
+        self.assertEqual(row["attributes"], [9, 9, 9])
+
+    def test_bay_swap_is_detected_by_model_fingerprint(self):
+        """同一盘位换盘：序列号按盘位固定（不变），只能靠型号指纹识别。"""
+        empty = new_disk(index=5, serial="1740BBBBAAAA",
+                         model="Stormfor D4 DAS USB Device")
+        inserted = new_disk(index=5, serial="1740BBBBAAAA",
+                            model="HGST HUS728T8TALE6L4")
+        m = make_monitor([empty])
+        m.next_disks = [empty]
+        m.rescan_devices(reason="baseline")
+        self.assertEqual(next(r for r in m.pushed[-1] if r.get("index") == 5)["model"],
+                         "Stormfor D4 DAS USB Device")
+
+        m.disk_last_check_times["1740BBBBAAAA"] = time.time()   # 上一块盘的检测时间
+        m.next_disks = [inserted]
+        result = m.rescan_devices(reason="WM_DEVICECHANGE:0x0007")
+        self.assertEqual(result["changed_bays"], [5])
+        # 盘位序列号不变 → 按索引/序列号的 diff 是空的，必须靠指纹才能发现
+        self.assertEqual((result["added"], result["removed"]), (0, 0))
+        self.assertNotIn("1740BBBBAAAA", m.disk_last_check_times,
+                         "换盘后必须清掉检测时间，否则新盘沿用旧盘的到期时间不被检测")
+        self.assertEqual(next(r for r in m.pushed[-1] if r.get("index") == 5)["model"],
+                         "HGST HUS728T8TALE6L4")
+
+    def test_unchanged_bay_keeps_its_row(self):
+        """没有换盘的盘位不能被指纹逻辑误伤。"""
+        target = new_disk()
+        m = make_monitor([target])
+        m.next_disks = [target]
+        m.rescan_devices(reason="baseline")
+        m.last_ui_data[0]["status"] = "Healthy"
+        m.last_ui_data[0]["temp"] = "40C"
+        m.disk_last_check_times[NEW_SN] = 1234567890.0
+        m.next_disks = [target]
+        result = m.rescan_devices(reason="WM_DEVICECHANGE:0x0007")
+        self.assertEqual(result["changed_bays"], [])
+        self.assertEqual(m.last_ui_data[0]["temp"], "40C")
+        self.assertEqual(m.last_ui_data[0]["status"], "Healthy")
+        self.assertEqual(m.disk_last_check_times.get(NEW_SN), 1234567890.0)
 
 
 class IntervalConfigTests(unittest.TestCase):
