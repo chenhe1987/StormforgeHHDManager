@@ -7,16 +7,16 @@
 
 **方式一：直接下载成品 (推荐)**
 1.  访问本项目的 [Gitee 发行版页面 (Releases)](https://gitee.com/stormforge/JiFengZhiHDDManager/releases)。
-2.  下载 `Stormforge_DiskManager_v1.3.88.zip`。
+2.  下载 `Stormforge_DiskManager_v1.3.89.zip`。
 3.  完整解压到内置硬盘的固定目录，保留 `_internal` 文件夹。
-4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.88.exe`，勾选需要“纳入管理”的硬盘。
+4.  退出旧版，右键以**管理员身份运行** `Stormforge_DiskManager_v1.3.89.exe`，勾选需要“纳入管理”的硬盘。
 
-v1.3.88 修复了外置盘弹不出去的问题：ReFS/exFAT 卷不支持 `FSCTL_LOCK_VOLUME`（恒返回
-`error=5`，与占用无关），现在按 Windows 资源管理器的方式跳过锁定直接卸载卷；无分区表（RAW）
-的盘也支持整盘停转弹出；弹出失败不再只回一个 `error=5`，而是给出卷/文件系统/占用者/本程序
-自身句柄的完整说明。本机 ASMT105x 双盘实机验收通过（磁盘 4 ReFS + 磁盘 3 RAW，
-`ejected_sleep_accepted`、PnP `cr=0`）。技术原则见
-`docs/TECH_NOTES_弹出休眠机制.md` §8.41。
+v1.3.89 修复"程序启动后再插入硬盘，软件不显示"：设备到达/移除/设备树变化事件会去抖
+1.5 秒后立即重扫，并把**完整**列表推给界面（此前列表只在启动或手动刷新时重建，新插入且
+未勾选"纳入管理"的盘永远不显示）；另加 120 秒兜底轮询
+（`device_inventory_interval_seconds` 可配，0 = 只靠事件）。实测一次全量枚举 0.44 秒、
+零句柄残留、无磁盘 I/O，不会造成其他盘"被占用而弹不出去"。技术原则见
+`docs/TECH_NOTES_弹出休眠机制.md` §17 与修改红线 16–19 条。
 
 **方式二：源码运行**
 ```bash
@@ -186,6 +186,21 @@ python main.py
 ---
 
 ## 5. 版本历史 (Version History)
+
+### v1.3.89
+- **修复：程序启动后新插入硬盘不显示（热插拔即时发现）**:
+  - 缺陷 1：物理盘清单只在超过 300 秒后才重新枚举，且 `WM_DEVICECHANGE` 分支不使缓存失效
+    → 插入后最长 5 分钟才被发现。
+  - 缺陷 2（主因）：侧栏完整列表只在启动 / 手动刷新（`target_disks=None`）时生成；
+    每 10 秒的定时路径对非白名单盘直接 `continue`，`_merge_ui_data` 只从增量追加新条目
+    → **新插入且未勾选"纳入管理"的盘永远进不了侧栏**。
+  - 现在：`DBT_DEVICEARRIVAL` / `DBT_DEVICEREMOVECOMPLETE` / `DBT_DEVNODES_CHANGED`
+    去抖 1.5 秒后立即重扫，并用设备缓存**重建完整列表**（重建时不发 SMART，避免把空闲
+    停转的盘唤醒）；新增 `device_inventory_interval_seconds` 兜底轮询
+    （默认 120 秒，0 = 只靠事件）。返回值语义不变（QUERYREMOVE 仍返回 1）。
+  - 屏蔽自愈：同 pnp_id 的盘重新出现时自动解除"已弹出/隔离"，无需重启程序。
+  - 实测：一次全量枚举 0.44 秒、零句柄残留、无磁盘 I/O；与弹出事务串行化，
+    **不会**导致其他盘"被占用而弹不出去"。技术原则见 §17 与修改红线 16–19 条。
 
 ### v1.3.88
 - **修复：外置盘弹不出去（ReFS/exFAT 锁卷失败被当成致命错误）**:

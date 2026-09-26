@@ -621,6 +621,70 @@ fail-closed 的边界只有一个：**DISMOUNT 也失败**时立即中止，不�
 15. **不要用全表跨进程句柄扫描做默认诊断**：`DeviceIoControl` 撞到不响应设备会挂住
     （实测 5 分钟不出结果）。默认只做"自身句柄 + Restart Manager"，跨进程扫描放在
     `include_others=True` / `--scan-others` 手动入口。
+16. **不要删掉 `WM_DEVICECHANGE` → 去抖重扫**（`MainWindow._schedule_device_rescan` /
+    `MonitorService.rescan_devices`）：热插拔可见性完全依赖它。
+17. **不要把 `device_change_needs_rescan` 的触发集合扩大到 QUERYREMOVE(0x8001) 系列**：
+    那些分支的**返回值语义**不允许改动（QUERYREMOVE 必须返回 1 才允许移除），重扫只能
+    作为副作用挂在 0x8000/0x8004/0x0007 上。
+18. **新出现的盘必须走"完整列表重建"**（`rescan_devices` → `_rows_for_devices_without_probe`）：
+    定时路径对非白名单盘 `continue`、`_merge_ui_data` 只从 updates 追加新条目，
+    用它显示新盘会永远显示不出来（v1.3.87~v1.3.88 的实际表现）。
+    重建列表时**不要**顺便跑 SMART（会把空闲停转的盘反复唤醒）：已知盘沿用旧行、
+    新盘给占位行，检测交给按盘调度。
+19. **`device_inventory_interval_seconds = 0` 的语义是"只靠设备事件"**，
+    不要在 `_get_cached_or_scan_disks_locked` 里写成 `now - last >= 0`（恒真 = 每次都重新枚举）。
+
+### 17. 设备热插拔即时发现（2026-09-26 修复，v1.3.89）
+
+### 问题（用户现象：程序启动后再插入硬盘，软件不显示）
+
+两个独立缺陷叠加：
+
+1. **发现慢**：物理盘清单只在 `now - last_inventory_scan_time >= device_inventory_interval`
+   时重新枚举（原值 300 秒），而 `WM_DEVICECHANGE` 分支只是 `return super().nativeEvent(...)`，
+   不使缓存失效 → 插入后最长 5 分钟才"看见"。
+2. **看见了也不显示（主因）**：侧栏完整列表只在 `target_disks is None` 的全量路径生成
+   （含"未加入白名单（不管理）"行）；每 10 秒的定时路径
+   （`check_disks_schedule → check_specific_disks → check_all_smart(target_disks=...)`）
+   对非白名单盘直接 `continue`，随后 `_merge_ui_data` 只从 `updates` 追加新条目
+   → **新插入、尚未勾选"纳入管理"的盘永远进不了侧栏**，只有重启或点"刷新硬盘状态"才出现。
+
+实测对照（同代码、无硬件）：定时路径推送 0 条且不含新盘；全量路径推送 1 条、状态
+"未加入白名单（不管理）"。
+
+### 方案（已实现）
+
+1. `MainWindow.nativeEvent` 的 `WM_DEVICECHANGE` 分支：`wParam ∈ {0x8000 DBT_DEVICEARRIVAL,
+   0x8004 DBT_DEVICEREMOVECOMPLETE, 0x0007 DBT_DEVNODES_CHANGED}` → 1500 ms 单次定时器
+   **去抖**（重复 `start()` 重新计时，USB 柜上电的事件风暴合并成一次），到点在工作线程里
+   调 `MonitorService.rescan_devices(reason)`。**只加副作用，返回值语义不变**
+   （§15 红线 12/13 与第 17 条）。
+2. `MonitorService.rescan_devices()`：`scan_lock` 下强制重新枚举（元数据，见下）→
+   记录 diff（新增/移除/解除屏蔽）→ 用设备缓存**重建完整列表**并推送。
+   关键：**重建列表时不发任何 SMART/IDENTIFY**（`_rows_for_devices_without_probe`）——
+   0x0007 是"任何设备变化"都会发的通知，若每次事件都跑一遍 SMART 检测，会把空闲停转
+   但未标记休眠的盘反复唤醒。已知盘直接沿用上一次的行（保留温度/健康数据），
+   新盘给占位行（白名单盘="待检测"，非白名单="未加入白名单（不管理）"），
+   真实 SMART 数据由正常的按盘调度在下一轮补上（新盘 `disk_last_check_times` 为空 = 立即到期）。
+   `removal_pending` / `shutdown_mode` / 未运行时直接跳过（弹出与关机事务自动让路）。
+3. 兜底轮询 `device_inventory_interval_seconds`（默认 120 秒，0 = 只靠事件）：
+   兜住"广播丢失 / 事件被事务跳过 / 多盘位柜与网络盘不发广播"的情况。
+   为什么 §15 的 0x0007 不能单独承担：它是**任何设备变化**都会发的通知，只能当触发器。
+4. `_heal_reappeared_devices()`：同 pnp_id 的盘在**新鲜枚举里再次出现**时，解除
+   `ejected_disks` / `eject_quarantine`（这正是提示文案承诺的"请重新连接设备后恢复"）。
+   仅在枚举到该设备时解除，避免误放行。
+
+### 实测数据（枚举开销，2026-09-26）
+
+| 指标 | 实测 |
+| --- | --- |
+| 一次全量枚举（7 个盘） | **0.44 秒**（连续 8 次：0.437~0.468） |
+| 8 次枚举后的进程句柄增量 | **0**（268 → 268，不残留任何设备/卷句柄） |
+| 磁盘 I/O | 无（WMI `Win32_DiskDrive` + PnP 父链 + `desiredAccess=0` 的卷号映射句柄） |
+| 与弹出事务的关系 | 串行化：`execute_eject` 先拿 `scan_lock` + 置 `removal_pending`，重扫自动跳过 |
+
+结论：轮询/重扫**不会**造成"其他盘被占用而弹不出去"——占用需要常驻句柄，这里没有；
+历史上真正的自占用来源是 `SafeRemovalPatcher` 的常驻 `\\.\PhysicalDriveN` 句柄（红线第 3 条）。
 
 
 ---

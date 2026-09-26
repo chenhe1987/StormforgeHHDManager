@@ -49,7 +49,11 @@ class MonitorService(threading.Thread):
         self.cached_disks = []
         self.last_ui_data = []  # 最近一次推送给 UI 的完整列表（部分盘扫描时用于合并）
         self.last_inventory_scan_time = 0
-        self.device_inventory_interval = 300
+        # 兜底轮询间隔（秒，0 = 只靠设备到达事件）。见 config_manager。
+        try:
+            self.device_inventory_interval = self.config_manager.get_device_inventory_interval()
+        except Exception:
+            self.device_inventory_interval = 120
         self.scan_lock = threading.RLock()
         self.removal_pending = threading.Event()
         self.eject_quarantine = set(self.config_manager.config.get("eject_quarantine", []))
@@ -171,7 +175,11 @@ class MonitorService(threading.Thread):
             logging.info("关机静默模式下复用现有磁盘缓存，不再重新枚举")
             return self._filter_excluded_disks(self.cached_disks)
 
-        if force or not self.cached_disks or now - self.last_inventory_scan_time >= self.device_inventory_interval:
+        # device_inventory_interval 为 0 时表示只靠设备到达事件触发重扫，
+        # 不能写成"每次都重新枚举"（now - last >= 0 恒真）。
+        due = (self.device_inventory_interval > 0 and
+               now - self.last_inventory_scan_time >= self.device_inventory_interval)
+        if force or not self.cached_disks or due:
             self.cached_disks = DeviceManager.get_physical_disks(
                 allowlist=self.config_manager.get_managed_disk_whitelist())
             self.last_inventory_scan_time = now
@@ -658,6 +666,138 @@ class MonitorService(threading.Thread):
         if self.config_manager:
             self.config_manager.set_sleeping_disks([])
         self.last_inventory_scan_time = 0
+
+    # ------------------------------------------------- 热插拔即时发现（v1.3.89）
+
+    @staticmethod
+    def _device_keys(disks):
+        return {(getattr(d, "index", None), getattr(d, "serial_number", None))
+                for d in disks}
+
+    @staticmethod
+    def _describe(disk):
+        return "%s(%s) index=%s" % (getattr(disk, "model", "?"),
+                                    getattr(disk, "serial_number", "?"),
+                                    getattr(disk, "index", "?"))
+
+    def _device_diff(self, before, after):
+        old, new = self._device_keys(before), self._device_keys(after)
+        added = [d for d in after
+                 if (getattr(d, "index", None), getattr(d, "serial_number", None)) not in old]
+        removed = [d for d in before
+                   if (getattr(d, "index", None), getattr(d, "serial_number", None)) not in new]
+        return added, removed
+
+    def _heal_reappeared_devices(self, disks):
+        """同 pnp_id 的盘重新出现 → 解除"已弹出/隔离"屏蔽。
+
+        这正是提示文案承诺的"请重新连接设备后恢复"：设备物理上已经回来了，
+        继续屏蔽只会让用户看不到这块盘。只在**新鲜枚举到**该设备时才解除。
+        """
+        healed = []
+        for disk in disks:
+            pnp = (getattr(disk, "pnp_id", "") or "").upper()
+            serial = getattr(disk, "serial_number", None)
+            if pnp and pnp in self.eject_quarantine:
+                self.eject_quarantine.discard(pnp)
+                try:
+                    self.config_manager.config["eject_quarantine"] = sorted(self.eject_quarantine)
+                    self.config_manager.save_config()
+                except Exception as exc:
+                    logging.warning("保存隔离名单失败: %s", exc)
+                healed.append("%s（解除隔离）" % pnp)
+            if serial and serial in self.ejected_disks:
+                self.ejected_disks.discard(serial)
+                healed.append("%s（解除已弹出标记）" % serial)
+        return healed
+
+    def _rows_for_devices_without_probe(self, disks, previous):
+        """只用设备缓存构建完整列表：**不发任何 SMART/IDENTIFY**（热插拔事件路径专用）。
+
+        0x0007 是"任何设备变化"都会发的通知，如果每次事件都跑一遍 SMART 检测，
+        会把空闲停转但未标记休眠的盘反复唤醒。这里改为：
+        - 已知盘直接沿用上一次的行（保留温度/健康数据，零磁盘访问）；
+        - 新盘给一行占位（白名单盘给"待检测"，由正常的按盘调度在下一轮立刻补上，
+          因为新盘的 disk_last_check_times 为空 = 立即到期）。
+        """
+        known = {(row.get("index"), row.get("serial")): row
+                 for row in (previous or [])}
+        whitelist = self.config_manager.get_managed_disk_whitelist()
+        rows = []
+        for disk in disks:
+            serial = getattr(disk, "serial_number", None)
+            index = getattr(disk, "index", None)
+            old = known.get((index, serial))
+            if old is not None:
+                rows.append(old)
+                continue
+            pnp = getattr(disk, "pnp_id", "") or ""
+            removable = bool(getattr(disk, "is_removable", False))
+            interface = getattr(disk, "interface_type", "Unknown") or "Unknown"
+            if interface == "IDE" and (removable or "USB" in pnp.upper()):
+                interface = "USB (SATA)"
+            elif "USB" in interface.upper():
+                interface = "USB"
+            managed_id = disk_id(disk)
+            if serial and serial in self.sleeping_disks:
+                status = "Sleeping"
+            elif managed_id and managed_id in whitelist:
+                status = "待检测"
+            else:
+                status = "未加入白名单（不管理）"
+            rows.append({
+                "index": index, "model": getattr(disk, "model", "Unknown"),
+                "serial": serial, "pnp_id": pnp, "managed_id": managed_id,
+                "is_removable": removable, "interface": interface,
+                "status": status, "temp": "N/A",
+                "reallocated": "N/A", "pending": "N/A", "attributes": [],
+            })
+        return rows
+
+    def rescan_devices(self, reason="device_change"):
+        """设备到达/移除后立即重扫，并把**完整**列表推给 UI。
+
+        为什么必须"全量"：定时检测走 check_specific_disks(target_disks=...)，
+        非白名单盘在那条路径里被 continue 跳过，而完整列表（含"未加入白名单
+        （不管理）"行）只在 target_disks=None 时生成 → 新插入且还未勾选
+        "纳入管理"的盘永远进不了侧栏，只能重启或手动刷新。
+
+        枚举只读元数据（WMI/PnP/卷号映射），不发 ATA 命令、不唤醒休眠盘；
+        句柄即用即关（实测 8 次枚举进程句柄增量 0）。
+        """
+        if not getattr(self, "running", False):
+            return {"skipped": "not_running"}
+        if self.shutdown_mode:
+            logging.info("[Rescan] 关机静默模式，跳过设备重扫: reason=%s", reason)
+            return {"skipped": "shutdown_mode"}
+        if self.removal_pending.is_set():
+            logging.info("[Rescan] 弹出/移除事务进行中，跳过设备重扫: reason=%s", reason)
+            return {"skipped": "removal_pending"}
+
+        with self.scan_lock:                       # RLock：内部再取锁是安全的
+            before = list(self.cached_disks)
+            self.last_inventory_scan_time = 0      # 强制下一次调用真的去枚举
+            disks = self._get_cached_or_scan_disks(force=True)
+            after = list(self.cached_disks)
+            added, removed = self._device_diff(before, after)
+            healed = self._heal_reappeared_devices(after)
+            if added or removed or healed:
+                logging.info(
+                    "[Rescan] reason=%s 新增=[%s] 移除=[%s] 解除屏蔽=[%s]",
+                    reason,
+                    ", ".join(self._describe(d) for d in added) or "-",
+                    ", ".join(self._describe(d) for d in removed) or "-",
+                    ", ".join(healed) or "-")
+            else:
+                logging.info("[Rescan] reason=%s 设备清单无变化（%d 个）", reason, len(after))
+            # 用设备缓存重建**完整**列表（含"未加入白名单（不管理）"的新盘），零磁盘访问：
+            # 新盘的 SMART 数据由正常的按盘调度在下一轮补上（新盘立即到期）。
+            rows = self._rows_for_devices_without_probe(after, self.last_ui_data)
+            self.last_ui_data = rows
+            if self.callback_update_ui:
+                self.callback_update_ui(rows)
+        return {"added": len(added), "removed": len(removed),
+                "healed": healed, "total": len(disks), "rows": len(rows)}
 
     def pause_for_removal(self, disk_index):
         """系统即将移除设备，立即释放该盘所有资源"""

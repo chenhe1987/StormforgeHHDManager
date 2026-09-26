@@ -80,7 +80,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='Stormforge_DiskManager_v1.3.88',
+    name='Stormforge_DiskManager_v1.3.89',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -102,5 +102,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='Stormforge_DiskManager_v1.3.88',
+    name='Stormforge_DiskManager_v1.3.89',
 )

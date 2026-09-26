@@ -47,7 +47,11 @@ class ConfigManager:
             "safe_remove_spindown": True,
             # ReFS/exFAT 等文件系统不支持 FSCTL_LOCK_VOLUME：True 时按 Windows
             # 资源管理器弹出的做法跳过锁定、直接卸载卷（否则弹出直接失败）。
-            "eject_dismount_without_lock": True
+            "eject_dismount_without_lock": True,
+            # 物理盘清单的兜底轮询间隔（秒）。设备到达事件会立即触发重扫，
+            # 这个轮询只用于兜住"广播丢失/被事务跳过"的情况；0 = 只靠事件。
+            # 实测一次全量枚举约 0.44 秒、零句柄泄漏、无磁盘 I/O。
+            "device_inventory_interval_seconds": 120
         }
         if not os.path.exists(self.filename):
             return default_config
@@ -132,6 +136,18 @@ class ConfigManager:
 
     def set_eject_dismount_without_lock(self, enabled):
         self.config["eject_dismount_without_lock"] = bool(enabled)
+        self.save_config()
+
+    def get_device_inventory_interval(self, default=120):
+        """物理盘清单兜底轮询间隔（秒）。0 表示只靠设备事件，不做轮询。"""
+        try:
+            value = int(self.config.get("device_inventory_interval_seconds", default))
+        except (TypeError, ValueError):
+            return default
+        return max(0, value)
+
+    def set_device_inventory_interval(self, seconds):
+        self.config["device_inventory_interval_seconds"] = max(0, int(seconds))
         self.save_config()
 
     def set_disk_managed(self, disk_id, managed):

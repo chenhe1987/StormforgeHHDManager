@@ -487,11 +487,15 @@ class MainWindow(QMainWindow):
     _spindown_done_signal = Signal(dict)
     _eject_progress_signal = Signal(str)
 
+    # WM_DEVICECHANGE 的 wParam：设备到达 / 移除完成 / 设备树变化 → 需要重扫
+    DEVICE_CHANGE_TRIGGERS = (0x8000, 0x8004, 0x0007)
+    DEVICE_CHANGE_DEBOUNCE_MS = 1500
+
     def __init__(self, silent_mode=False):
         logging.info("正在初始化 MainWindow...")
         super().__init__()
         self._silent_mode = silent_mode
-        self.version = "1.3.87"
+        self.version = "1.3.89"
         self.setWindowTitle(f"疾风知硬盘柜管理程序 v{self.version}")
         self.resize(1220, 800)
         self.setMinimumSize(1040, 680)
@@ -531,6 +535,14 @@ class MainWindow(QMainWindow):
         self._eject_progress_signal.connect(self._on_eject_progress)
         self._eject_active = None
         self._hardware_refresh_active = False
+
+        # 热插拔：设备到达/移除/设备树变化后去抖重扫（USB 硬盘柜上电会连发一串事件）。
+        # 单次触发 + 重复 start() 重新计时 = 去抖；真正的重扫在工作线程里做。
+        self._pending_device_change = 0
+        self._device_change_timer = QTimer(self)
+        self._device_change_timer.setSingleShot(True)
+        self._device_change_timer.setInterval(self.DEVICE_CHANGE_DEBOUNCE_MS)
+        self._device_change_timer.timeout.connect(self._on_device_change_settled)
         
         # UI Setup
         central_widget = QWidget()
@@ -1663,11 +1675,58 @@ class MainWindow(QMainWindow):
                 elif msg.message == WM_DEVICECHANGE:
                     # TRUE allows removal; BCAST_QUERY_DENY defers the request
                     # until the shared offline/SLEEP/eject transaction can run.
+                    # 设备到达/移除/树变化 → 去抖后立即重扫（v1.3.89 热插拔即时发现）。
+                    # 只加副作用：返回值语义保持原样（QUERYREMOVE 必须返回 1 才允许移除）。
+                    try:
+                        if self.device_change_needs_rescan(msg.wParam):
+                            self._schedule_device_rescan(msg.wParam)
+                    except Exception as e:
+                        logging.warning(f"处理设备变化事件失败: {e}")
                     return super().nativeEvent(eventType, message)
         except Exception as e:
             logging.error(f"nativeEvent error: {e}")
 
         return super().nativeEvent(eventType, message)
+
+    @classmethod
+    def device_change_needs_rescan(cls, wparam):
+        """该 WM_DEVICECHANGE 的 wParam 是否需要触发重扫。
+
+        0x8000 DBT_DEVICEARRIVAL（新设备到位）、0x8004 DBT_DEVICEREMOVECOMPLETE（已移除）、
+        0x0007 DBT_DEVNODES_CHANGED（设备树变化；TECH_NOTES §15 实测本机热插拔最先收到的
+        就是它，且"任何设备变化"都会发 → 只能当触发器，必须重新枚举比对）。
+        其余（如 0x8001 QUERYREMOVE）不触发：它们的返回值语义不允许改动。
+        """
+        try:
+            return int(wparam or 0) in cls.DEVICE_CHANGE_TRIGGERS
+        except (TypeError, ValueError):
+            return False
+
+    def _schedule_device_rescan(self, wparam):
+        try:
+            self._pending_device_change = int(wparam or 0)
+        except (TypeError, ValueError):
+            self._pending_device_change = 0
+        timer = getattr(self, "_device_change_timer", None)
+        if timer is None:
+            return
+        timer.start()      # 重复 start() 会重新计时 → 事件风暴合并成一次重扫
+
+    def _on_device_change_settled(self):
+        wparam = getattr(self, "_pending_device_change", 0)
+        self._pending_device_change = 0
+        service = getattr(self, "monitor_service", None)
+        if service is None:
+            return
+        reason = "WM_DEVICECHANGE:0x%04X" % wparam
+
+        def worker():
+            try:
+                result = service.rescan_devices(reason=reason)
+                logging.info(f"设备变化重扫结果: {result}")
+            except Exception:
+                logging.exception("设备变化重扫失败")
+        threading.Thread(target=worker, daemon=True).start()
 
     def prepare_disks_for_shutdown(self, event_type="关机", budget_seconds=4.0):
         """Compatibility entry for the allow-listed deep-sleep shutdown path."""
